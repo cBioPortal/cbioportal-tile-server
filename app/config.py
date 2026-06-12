@@ -63,6 +63,7 @@ class Settings:
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )
+    wsi_study_mapping_table: str = field(default_factory=lambda: _env_str("WSI_STUDY_MAPPING_TABLE"))
 
     # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
@@ -178,6 +179,15 @@ class Settings:
     databricks_warehouse_id: str = field(
         default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
     )
+    use_canonical_association_table: bool = field(
+        default_factory=lambda: _env_bool("USE_CANONICAL_ASSOCIATION_TABLE", True)
+    )
+    allow_legacy_association_fallback: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_LEGACY_ASSOCIATION_FALLBACK", True)
+    )
+
+    # Metadata cache
+    patient_cache_ttl: int = field(default_factory=lambda: _env_int("PATIENT_CACHE_TTL", 86_400))
 
     # Block cache
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
@@ -190,6 +200,17 @@ class Settings:
     # Test-only local slide fixtures
     test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
     test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
+
+    # Annotation API
+    annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
+    annotation_db_path: str = field(
+        default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db")
+    )
+    keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
+    annotation_auth_enabled: bool = field(
+        default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True)
+    )
+    oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
 
     # CORS
     cors_origins: list[str] = field(
