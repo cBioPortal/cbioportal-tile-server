@@ -1,0 +1,28 @@
+resources:
+  postgres_projects:
+    annotations:
+      project_id: ${var.project_id}
+      display_name: ${var.project_display_name}
+      enable_pg_native_login: false
+      pg_version: 16
+      custom_tags:
+        - key: application
+          value: cbioportal-tile-server
+        - key: component
+          value: annotations
+        - key: environment
+          value: ${bundle.target}
+
+  postgres_branches:
+    annotations_branch:
+      branch_id: ${var.branch_id}
+      parent: projects/${var.project_id}
+      no_expiry: true
+
+  postgres_endpoints:
+    annotations_rw:
+      endpoint_id: ${var.endpoint_id}
+      parent: projects/${var.project_id}/branches/${var.branch_id}
+      endpoint_type: ENDPOINT_TYPE_READ_WRITE
+      autoscaling_limit_min_cu: 0.5
+      autoscaling_limit_max_cu: 2.0
