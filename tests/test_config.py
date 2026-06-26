@@ -20,7 +20,8 @@ def make_settings(**env):
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
                                    "CORS_", "CACHE_", "PATIENT_", "WSI_",
-                                   "IMAGE_", "SLIDE_S3_"))}
+                                   "IMAGE_", "SLIDE_S3_", "ANNOTATION_",
+                                   "KEYCLOAK_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -126,6 +127,30 @@ class TestOtherSettings:
     def test_databricks_warehouse_id_from_env(self):
         s = make_settings(DATABRICKS_WAREHOUSE_ID="wh-test-123")
         assert s.databricks_warehouse_id == "wh-test-123"
+
+    def test_use_canonical_association_table_defaults_true(self):
+        s = make_settings()
+        assert s.use_canonical_association_table is True
+
+    def test_use_canonical_association_table_can_be_disabled(self):
+        s = make_settings(USE_CANONICAL_ASSOCIATION_TABLE="false")
+        assert s.use_canonical_association_table is False
+
+    def test_allow_legacy_association_fallback_defaults_false(self):
+        s = make_settings()
+        assert s.allow_legacy_association_fallback is False
+
+    def test_allow_legacy_association_fallback_can_be_disabled(self):
+        s = make_settings(ALLOW_LEGACY_ASSOCIATION_FALLBACK="false")
+        assert s.allow_legacy_association_fallback is False
+
+    def test_allow_legacy_association_fallback_can_be_enabled(self):
+        s = make_settings(ALLOW_LEGACY_ASSOCIATION_FALLBACK="true")
+        assert s.allow_legacy_association_fallback is True
+
+    def test_annotation_database_url_from_env(self):
+        s = make_settings(ANNOTATION_DATABASE_URL="postgresql://user:pass@host/db")
+        assert s.annotation_database_url == "postgresql://user:pass@host/db"
 
     def test_cors_origins_parsed(self):
         s = make_settings(CORS_ORIGINS="https://a.example.com,https://b.example.com")

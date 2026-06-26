@@ -51,7 +51,11 @@ services:
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
 
+      # ── OncoKB — register at oncokb.org/account/settings to get a token ──
+      ONCOKB_API_TOKEN: ${ONCOKB_API_TOKEN:-}
+
       # ── Annotation API ────────────────────────────────────────────────────
+      ANNOTATION_DATABASE_URL: ${ANNOTATION_DATABASE_URL:-}
       ANNOTATION_DB_PATH: /data/annotations.db
       KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
       ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}

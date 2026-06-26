@@ -84,6 +84,15 @@ def main(argv: list[str] | None = None) -> None:
         "WSI_STAIN_CLASSIFICATION_TABLE=cdsi_dev.wsi_test.slide_stain_classification",
         "THUMBNAIL_ARTIFACT_ROOT_URI=s3://mskmind-bkt/wsi-thumbnails-dev/masters",
         "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json",
+        "ANNOTATION_DB_PATH=/data/annotations.db",
+        "# Optional: point annotations at Lakebase/Postgres instead of local SQLite.",
+        "# ANNOTATION_DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>?sslmode=require",
+        "ANNOTATION_AUTH_ENABLED=true",
+        "KEYCLOAK_JWKS_URL=",
+        "",
+        "# ── OncoKB ────────────────────────────────────────────────────────",
+        "# Register at https://www.oncokb.org/account/settings to obtain a token.",
+        "ONCOKB_API_TOKEN=",
     ]
     output = args.output.expanduser().resolve()
     _write_secure(output, "\n".join(lines) + "\n")
