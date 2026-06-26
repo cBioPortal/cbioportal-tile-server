@@ -12,6 +12,9 @@ resources:
           value: annotations
         - key: environment
           value: ${bundle.target}
+      permissions:
+        - level: CAN_MANAGE
+          service_principal_name: ${var.service_principal_name}
 
   postgres_branches:
     annotations_branch:

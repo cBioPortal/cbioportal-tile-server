@@ -306,3 +306,9 @@ The repository must provide the `DOCKER_HUB_USERNAME` and
 digest printed by the workflow (`@sha256:...`), not a mutable tag.  The
 workflow does not publish from pull requests or expose registry credentials to
 fork builds.
+
+## Databricks bundles
+
+- Root [databricks.yml](databricks.yml) manages the nightly WSI summary pipeline job.
+- [databricks/lakebase/README.md](databricks/lakebase/README.md) documents the
+  separate Lakebase bundle used to provision annotation storage.

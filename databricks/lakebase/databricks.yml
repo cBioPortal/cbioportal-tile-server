@@ -19,7 +19,6 @@ variables:
     default: primary
   service_principal_name:
     description: Databricks service principal that should manage the project.
-    default: ""
 
 targets:
   dev:
