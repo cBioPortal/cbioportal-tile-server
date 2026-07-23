@@ -381,6 +381,8 @@ async def list_annotations(
     study_id: str = Query(..., description="cBioPortal study ID"),
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:
+    if user.get("study_id") and user["study_id"] != study_id:
+        raise HTTPException(status_code=403, detail="Token study scope does not match request")
     user_sub: str = user["sub"]
     user_groups: set[str] = set(user["groups"])
     if _storage_kind() == "postgres":
@@ -395,6 +397,8 @@ async def create_annotation(
     data: AnnotationIn,
     user: dict = Depends(require_user),
 ) -> AnnotationOut:
+    if user.get("study_id") and user["study_id"] != data.study_id:
+        raise HTTPException(status_code=403, detail="Token study scope does not match request")
     if _storage_kind() == "postgres":
         row = await _create_postgres(data, user["sub"])
     else:
@@ -415,6 +419,8 @@ async def update_annotation(
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
+    if user.get("study_id") and user["study_id"] != existing["study_id"]:
+        raise HTTPException(status_code=403, detail="Token study scope does not match annotation")
     if existing["created_by"] != user["sub"]:
         raise HTTPException(status_code=403, detail="Only the creator may update this annotation")
     if existing["version"] != data.version:
@@ -463,6 +469,8 @@ async def delete_annotation(
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
+    if user.get("study_id") and user["study_id"] != existing["study_id"]:
+        raise HTTPException(status_code=403, detail="Token study scope does not match annotation")
     if existing["created_by"] != user["sub"]:
         raise HTTPException(status_code=403, detail="Only the creator may delete this annotation")
 

@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 import httpx
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 
@@ -47,6 +47,7 @@ def validate_wsi_token(
     audience: str,
     max_ttl: int = 300,
     expected_study_id: str | None = None,
+    required_scopes: set[str] | None = None,
 ) -> dict:
     validate_wsi_auth_configuration(secret, audience, max_ttl)
     parts = token.split(".")
@@ -68,7 +69,9 @@ def validate_wsi_token(
     if not hmac.compare_digest(expected, _b64decode(encoded_signature)):
         raise InvalidWsiToken("invalid token signature")
     now = int(time.time())
-    if payload.get("aud") != audience or payload.get("scope") != "wsi:read":
+    scopes = set(str(payload.get("scope", "")).split())
+    required = required_scopes or {"wsi:read"}
+    if payload.get("aud") != audience or not required.issubset(scopes):
         raise InvalidWsiToken("invalid token audience or scope")
     if not isinstance(payload.get("sub"), str) or not payload["sub"]:
         raise InvalidWsiToken("invalid token subject")
@@ -76,19 +79,19 @@ def validate_wsi_token(
         raise InvalidWsiToken("invalid token study")
     if expected_study_id is not None and payload["study_id"] != expected_study_id:
         raise InvalidWsiToken("token study scope does not match request")
-    if payload.get("wsi_auth_version") != 2:
-        raise InvalidWsiToken("unsupported WSI authorization contract")
-    if not isinstance(payload.get("image_id"), str) or not payload["image_id"].strip():
-        raise InvalidWsiToken("invalid token image")
-    for claim in ("tile_source_sha256", "thumbnail_source_sha256"):
-        value = payload.get(claim)
-        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise InvalidWsiToken("invalid token source binding")
-    for claim in ("thumbnail_width", "thumbnail_height"):
-        value = payload.get(claim)
-        if type(value) is not int or value <= 0 or value > 8192:
-            raise InvalidWsiToken("invalid token thumbnail dimensions")
-    if type(payload.get("exp")) is not int or payload["exp"] <= now:
+    if "wsi:read" in required:
+        if payload.get("wsi_auth_version") != 2:
+            raise InvalidWsiToken("unsupported WSI authorization contract")
+        if not isinstance(payload.get("image_id"), str) or not payload["image_id"].strip():
+            raise InvalidWsiToken("invalid token image")
+        for claim in ("tile_source_sha256", "thumbnail_source_sha256"):
+            value = payload.get(claim)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise InvalidWsiToken("invalid token source binding")
+        for claim in ("thumbnail_width", "thumbnail_height"):
+            value = payload.get(claim)
+            if type(value) is not int or value <= 0 or value > 8192:
+                raise InvalidWsiToken("invalid token thumbnail dimensions")
     if type(payload.get("exp")) is not int or payload["exp"] <= now:
         raise InvalidWsiToken("expired token")
     if type(payload.get("iat")) is not int or payload["iat"] > now + 60:
@@ -129,6 +132,7 @@ async def _get_jwks() -> dict[str, Any]:
 
 
 async def require_user(
+    request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict[str, Any]:
     """Return the authenticated Keycloak subject and groups for annotations."""
@@ -140,6 +144,23 @@ async def require_user(
             detail="Missing Authorization header",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    required_scopes = {"annotations:read"}
+    if request.method in {"POST", "PUT", "DELETE"}:
+        required_scopes.add("annotations:write")
+    try:
+        capability = validate_wsi_token(
+            creds.credentials,
+            settings.wsi_auth_secret,
+            settings.wsi_auth_audience,
+            required_scopes=required_scopes,
+        )
+        return {
+            "sub": capability["sub"],
+            "groups": [],
+            "study_id": capability["study_id"],
+        }
+    except InvalidWsiToken:
+        pass
     try:
         payload = jwt.decode(
             creds.credentials,
@@ -156,4 +177,4 @@ async def require_user(
     sub: str = payload.get("sub", "")
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing 'sub' claim")
-    return {"sub": sub, "groups": payload.get("groups", [])}
+    return {"sub": sub, "groups": payload.get("groups", []), "study_id": None}

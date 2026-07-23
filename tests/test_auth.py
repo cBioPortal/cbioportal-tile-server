@@ -142,3 +142,30 @@ def test_token_lifetime_cannot_exceed_configured_limit():
             "cbioportal-wsi",
             max_ttl=10,
         )
+
+
+def test_annotation_capability_requires_both_annotation_scopes():
+    secret = "s" * 32
+    claims = {
+        "sub": "u",
+        "study_id": "coad_msk_2025",
+        "aud": "cbioportal-wsi",
+        "scope": "annotations:read annotations:write",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 300,
+    }
+    value = validate_wsi_token(
+        make_token(secret, **claims),
+        secret,
+        "cbioportal-wsi",
+        required_scopes={"annotations:read", "annotations:write"},
+    )
+    assert value["study_id"] == "coad_msk_2025"
+
+    with pytest.raises(InvalidWsiToken):
+        validate_wsi_token(
+            make_token(secret, **{**claims, "scope": "annotations:read"}),
+            secret,
+            "cbioportal-wsi",
+            required_scopes={"annotations:read", "annotations:write"},
+        )
