@@ -8,6 +8,7 @@ WORKDIR /app
 # libopenslide-dev is NOT required — tiffslide is pure Python.
 # We only need the compression libs used by tifffile/Pillow.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     libjpeg-turbo-progs \
     libzstd-dev \
     curl \
@@ -31,12 +32,6 @@ USER appuser
 
 EXPOSE 8080
 
-# workers = 2*CPU+1 is a common heuristic; tune MAX_OPEN_SLIDES to match
-# available RAM (each open SVS ≈ 50–200 MB).
-CMD ["gunicorn", "app.main:app", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--bind", "0.0.0.0:8080", \
-     "--workers", "4", \
-     "--preload", \
-     "--timeout", "120", \
-     "--log-level", "info"]
+# Memory-bound defaults for a 4 GiB pod. Increase only after measuring RSS
+# under representative slide load.
+CMD ["gunicorn", "-c", "python:app.gunicorn_conf", "app.main:app"]

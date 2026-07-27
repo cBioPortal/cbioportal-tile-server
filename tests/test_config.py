@@ -18,7 +18,8 @@ def make_settings(**env):
     clean = {k: v for k, v in os.environ.items()
              if not k.startswith(("AWS_", "DATABRICKS_", "REDIS", "TILE_",
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
-                                   "CORS_", "PATIENT_"))}
+                                   "THUMBNAIL_", "METADATA_", "PATH_",
+                                   "CORS_", "PATIENT_", "WSI_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -62,6 +63,36 @@ class TestS3EnvVars:
 
 
 class TestOtherSettings:
+    def test_max_decode_pixels_default(self):
+        s = make_settings()
+        assert s.max_decode_pixels == 4_194_304
+
+    def test_thumbnail_cache_ttl_default(self):
+        s = make_settings()
+        assert s.thumbnail_cache_ttl == 86_400
+
+    def test_metadata_cache_ttl_default(self):
+        s = make_settings()
+        assert s.metadata_cache_ttl == 86_400
+
+    def test_max_image_operations_default(self):
+        s = make_settings()
+        assert s.max_image_operations == 2
+
+    def test_path_cache_capacity_default(self):
+        s = make_settings()
+        assert s.path_cache_capacity == 4_096
+
+    def test_test_slide_map_defaults_empty(self):
+        s = make_settings()
+        assert s.test_slide_map == {}
+
+    def test_test_slide_map_reads_json_file(self, tmp_path):
+        map_file = tmp_path / "slide-map.json"
+        map_file.write_text('{"slide-a":"/app/testdata/slide-a.svs"}')
+        s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
+        assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
+
     def test_databricks_warehouse_id_from_env(self):
         s = make_settings(DATABRICKS_WAREHOUSE_ID="wh-test-123")
         assert s.databricks_warehouse_id == "wh-test-123"

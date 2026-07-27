@@ -25,10 +25,6 @@ class TestNoRedisMode:
         with patch.object(cache_module, "_redis", None):
             assert await cache_module.get_thumbnail("123", 256, 256) is None
 
-    async def test_get_patient_returns_none(self):
-        with patch.object(cache_module, "_redis", None):
-            assert await cache_module.get_patient("P-0001") is None
-
     async def test_get_metadata_returns_none(self):
         with patch.object(cache_module, "_redis", None):
             assert await cache_module.get_metadata("123") is None
@@ -69,33 +65,30 @@ class TestKeyFormats:
             await cache_module.get_metadata("1492807")
         r.get.assert_called_once_with("meta:1492807")
 
-    async def test_patient_key(self):
-        r = _make_redis()
-        mock_settings = AsyncMock()
-        mock_settings.patient_cache_ttl = 86400
-        with (
-            patch.object(cache_module, "_redis", r),
-            patch("app.cache.settings", mock_settings),
-        ):
-            await cache_module.get_patient("P-0001")
-        r.get.assert_called_once_with("patient:P-0001")
-
 
 # ---------------------------------------------------------------------------
 # TTL behaviour
 # ---------------------------------------------------------------------------
 
 class TestTtlBehaviour:
-    async def test_metadata_stored_without_ttl(self):
-        """Slide metadata is immutable — must use SET, not SETEX."""
+    async def test_thumbnail_cache_uses_configured_ttl(self, monkeypatch):
         r = _make_redis()
+        monkeypatch.setattr(cache_module.settings, "thumbnail_cache_ttl", 3600)
+        with patch.object(cache_module, "_redis", r):
+            await cache_module.set_thumbnail("123", 256, 128, b"thumb")
+        r.setex.assert_called_once_with("thumbnail:123:256:128", 3600, b"thumb")
+
+    async def test_metadata_cache_uses_configured_ttl(self, monkeypatch):
+        r = _make_redis()
+        monkeypatch.setattr(cache_module.settings, "metadata_cache_ttl", 7200)
         with patch.object(cache_module, "_redis", r):
             await cache_module.set_metadata("123", {"key": "value"})
-        r.set.assert_called_once()
-        r.setex.assert_not_called()
+        r.setex.assert_called_once()
+        args = r.setex.call_args[0]
+        assert args[0] == "meta:123"
+        assert args[1] == 7200
 
     async def test_raw_cache_uses_setex(self):
-        """Generic raw cache (search results) must expire."""
         r = _make_redis()
         with patch.object(cache_module, "_redis", r):
             await cache_module.set_raw("search:foo", [{"id": "1"}], ttl=300)

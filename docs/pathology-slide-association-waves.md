@@ -81,13 +81,13 @@ Verified on July 19, 2026:
 - Point all tile-server association reads at the shared Databricks dataset.
 - Retire legacy WSI sample clinical attributes and timepoint columns from
   study files before reloads.
-- Add patient-level cache invalidation tied to targeted backfills.
+- Add targeted hierarchy snapshot invalidation tied to backfills.
   Status on July 17, 2026: tile-server Redis patient cache eviction is now
   available through `app.cache.delete_patient(...)` and the operational helper
   `tools/invalidate_patient_cache.py`.
 - Study refresh tools now support `--invalidate-patient-cache` so a targeted
-  regenerate-and-reload workflow can evict stale `/patient/{patient_id}`
-  payloads for the study cohort in the same run:
+  regenerate-and-reload workflow can refresh stale hierarchy rows for the study
+  cohort in the same run:
   - `tools/generate_wsi_clinical_attrs.py`
   - `tools/generate_wsi_timepoint_clinical_attrs.py`
   - `tools/generate_resource_patient.py`
@@ -108,7 +108,7 @@ Verified on July 19, 2026:
 
 - Build validation harnesses comparing:
   - canonical Databricks associations
-  - tile-server `/patient/{patient_id}` payloads
+  - backend `/api/wsi/hierarchy/{study_id}/{patient_id}` payloads
   - ClickHouse aggregates
   Status on July 17, 2026: a canonical-vs-legacy Databricks comparison helper
   now exists at `tools/validate_canonical_associations.py`. Validation against

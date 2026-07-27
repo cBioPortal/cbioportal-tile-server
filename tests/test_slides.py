@@ -1,10 +1,11 @@
-"""Tests for S3 location routing logic in app/slides.py."""
+"""Tests for slide location routing logic in app.slide_store."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.slides import _resolve_s3_location
+from app.slide_store import open_slide, resolve_s3_location
 
 
 def _settings(
@@ -22,8 +23,8 @@ def _settings(
 
 
 def resolve(slide_id, **kwargs):
-    with patch("app.slides.settings", _settings(**kwargs)):
-        return _resolve_s3_location(slide_id)
+    with patch("app.slide_store.settings", _settings(**kwargs)):
+        return resolve_s3_location(slide_id)
 
 
 class TestValidS3Uris:
@@ -74,3 +75,26 @@ class TestInvalidSlideIds:
     def test_s3_no_key_raises(self):
         with pytest.raises(FileNotFoundError):
             resolve("s3://bucket-only")
+
+
+class TestLocalSlidePaths:
+    def test_absolute_path_opens_without_s3(self, tmp_path):
+        slide_path = tmp_path / "slide.svs"
+        slide_path.write_bytes(b"fake")
+        with patch("app.slide_store.TiffSlide", return_value=MagicMock()) as mock_slide:
+            slide, fileobj = open_slide(str(slide_path), logger=MagicMock())
+        assert slide is mock_slide.return_value
+        assert fileobj is None
+
+    def test_file_uri_opens_without_s3(self, tmp_path):
+        slide_path = tmp_path / "slide.svs"
+        slide_path.write_bytes(b"fake")
+        with patch("app.slide_store.TiffSlide", return_value=MagicMock()) as mock_slide:
+            slide, fileobj = open_slide(f"file://{slide_path}", logger=MagicMock())
+        assert slide is mock_slide.return_value
+        assert fileobj is None
+
+    def test_missing_local_path_raises(self):
+        missing = Path("/tmp/definitely-missing-slide.svs")
+        with pytest.raises(FileNotFoundError):
+            open_slide(str(missing), logger=MagicMock())

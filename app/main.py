@@ -14,6 +14,7 @@ CDN or nginx proxy_cache can absorb the bulk of repeat requests.
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 
 # Ensure app.* loggers emit to stderr alongside uvicorn's own loggers.
@@ -28,9 +29,17 @@ from . import cache as tile_cache
 from . import meta
 from .auth import InvalidWsiToken, validate_wsi_token
 from .config import settings
-from .meta import get_patient_hierarchy, get_slide_dbmeta, search_suggestions
+from .metrics import (
+    CACHE_MISS_LEADERS,
+    COALESCED_CACHE_MISS_REQUESTS,
+    DECODE_SOURCE_PIXELS,
+    OVERSIZED_DECODE_REJECTIONS,
+    metrics_payload,
+    track_image_operation,
+)
+from .meta import get_slide_dbmeta, search_suggestions
 from .slides import SlideCache
-from .tiles import get_thumbnail_bytes, get_tile_bytes, max_zoom, slide_metadata
+from .tiles import OverviewTooLarge, get_thumbnail_bytes, get_tile_bytes, render_tile_image, slide_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +49,52 @@ logger = logging.getLogger(__name__)
 
 _slides: SlideCache | None = None
 # In-process cache: image_id → s3 URI (populated on first open, survives across requests)
-_path_cache: dict[str, str] = {}
+_path_cache: OrderedDict[str, str] = OrderedDict()
+_image_operation_semaphore: asyncio.Semaphore | None = None
+
+
+class _SingleFlight:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._futures: dict[str, asyncio.Future] = {}
+
+    async def do(self, key: str, kind: str, producer):
+        async with self._lock:
+            future = self._futures.get(key)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                self._futures[key] = future
+                leader = True
+                CACHE_MISS_LEADERS.labels(kind=kind).inc()
+            else:
+                leader = False
+                COALESCED_CACHE_MISS_REQUESTS.labels(kind=kind).inc()
+
+        if not leader:
+            return await future
+
+        try:
+            result = await producer()
+        except Exception as exc:
+            future.set_exception(exc)
+            future.exception()
+            raise
+        else:
+            future.set_result(result)
+            return result
+        finally:
+            async with self._lock:
+                self._futures.pop(key, None)
+
+
+_singleflight = _SingleFlight()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _slides
+    global _slides, _image_operation_semaphore
     _slides = SlideCache(capacity=settings.max_open_slides)
+    _image_operation_semaphore = asyncio.Semaphore(settings.max_image_operations)
     await tile_cache.init_cache()
     if not settings.aws_endpoint_url:
         logger.warning(
@@ -114,7 +162,7 @@ async def wsi_namespace(request, call_next):
 
 TILE_CACHE_HEADERS  = {"Cache-Control": "private, max-age=3600"}
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300"}
-# Patient/sample metadata contains PHI — must not be cached by shared/public proxies
+# Metadata and search responses contain patient/slide information.
 PHI_CACHE_HEADERS   = {"Cache-Control": "private, no-store"}
 
 
@@ -123,18 +171,37 @@ async def _in_thread(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
 
 
+async def _run_image_operation(fn, *args):
+    if _image_operation_semaphore is None:
+        return await _in_thread(fn, *args)
+    async with _image_operation_semaphore:
+        async with track_image_operation():
+            return await _in_thread(fn, *args)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _resolve_slide_id(image_id: str) -> str:
-    """Resolve an image_id to its S3 URI, with in-process caching."""
+    """Resolve an image_id to a local path or S3 URI, with in-process caching."""
     if image_id in _path_cache:
+        _path_cache.move_to_end(image_id)
         return _path_cache[image_id]
+    test_path = settings.test_slide_map.get(image_id)
+    if test_path:
+        _path_cache[image_id] = test_path
+        _path_cache.move_to_end(image_id)
+        while len(_path_cache) > settings.path_cache_capacity:
+            _path_cache.popitem(last=False)
+        return test_path
     path = meta.get_slide_path(image_id, settings.databricks_warehouse_id)
     if not path:
         raise FileNotFoundError(f"Slide not found: {image_id}")
     _path_cache[image_id] = path
+    _path_cache.move_to_end(image_id)
+    while len(_path_cache) > settings.path_cache_capacity:
+        _path_cache.popitem(last=False)
     return path
 
 
@@ -159,44 +226,10 @@ def health():
     return {"status": "ok", "n_workers": settings.n_workers}
 
 
-# ---------------------------------------------------------------------------
-# Databricks metadata routes
-# ---------------------------------------------------------------------------
-
-@app.get("/patient/{patient_id}")
-async def patient_hierarchy(patient_id: str):
-    """
-    Return the full patient slide hierarchy sourced from Databricks
-    (DEID_TABLE joined with INVENTORY_TABLE — see app/constants.py).
-
-    Structure: { patient_id, samples: [{ sample_id, cancer_type, …,
-      parts: [{ part_number, …, blocks: [{ block_number, …,
-        slides: [{ image_id, stain_name, can_serve_tiles, … }] }] }] }] }
-    """
-    cached = await tile_cache.get_patient(patient_id)
-    if cached is not None:
-        return Response(content=json.dumps(cached), media_type="application/json",
-                        headers=PHI_CACHE_HEADERS)
-
-    try:
-        result = await _in_thread(
-            get_patient_hierarchy,
-            patient_id,
-            settings.databricks_warehouse_id,
-        )
-    except Exception:
-        logger.exception("Databricks query failed for patient %s", patient_id)
-        raise HTTPException(status_code=502, detail="Metadata query failed")
-
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient not found in slide inventory",
-        )
-
-    await tile_cache.set_patient(patient_id, result)
-    return Response(content=json.dumps(result), media_type="application/json",
-                    headers=PHI_CACHE_HEADERS)
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    payload, content_type = metrics_payload()
+    return Response(content=payload, media_type=content_type)
 
 
 @app.get("/slides/{image_id}/dbmeta")
@@ -258,19 +291,30 @@ async def metadata(slide_id: str):
     if cached is not None:
         return Response(content=json.dumps(cached), media_type="application/json",
                         headers=PHI_CACHE_HEADERS)
-    slide = await _in_thread(_get_slide, slide_id)
-    result = await _in_thread(slide_metadata, slide)
+    slide = await _run_image_operation(_get_slide, slide_id)
+    result = await _run_image_operation(slide_metadata, slide)
     await tile_cache.set_metadata(slide_id, result)
     return Response(content=json.dumps(result), media_type="application/json",
                     headers=PHI_CACHE_HEADERS)
 
 
 @app.get("/tiles/{slide_id}/warmup", include_in_schema=False)
-def warmup(slide_id: str):
+async def warmup(slide_id: str):
     """Fetch and discard the overview tile to prime the TiffSlide cache on this worker."""
     try:
-        slide = _slides.get(slide_id)
-        get_tile_bytes(slide, 0, 0, 0)
+        slide = await _run_image_operation(_get_slide, slide_id)
+        image, _ = await _run_image_operation(render_tile_image, slide, 0, 0, 0)
+        image.close()
+    except OverviewTooLarge as exc:
+        logger.warning(
+            "Warmup overview rejected for slide %s level=%d read=%dx%d pixels=%d limit=%d",
+            slide_id,
+            exc.best_level,
+            exc.read_width,
+            exc.read_height,
+            exc.requested_pixels,
+            exc.max_decode_pixels,
+        )
     except Exception:
         pass
     return {"status": "ok"}
@@ -290,10 +334,29 @@ async def thumbnail(
         return Response(content=cached, media_type="image/jpeg",
                         headers=THUMB_CACHE_HEADERS)
 
-    slide = await _in_thread(_get_slide, slide_id)
-    data = await _in_thread(get_thumbnail_bytes, slide, width, height)
+    cache_key = tile_cache.thumbnail_cache_key(slide_id, width, height)
 
-    await tile_cache.set_thumbnail(slide_id, width, height, data)
+    async def _build_thumbnail():
+        slide = await _run_image_operation(_get_slide, slide_id)
+        image_bytes = await _run_image_operation(get_thumbnail_bytes, slide, width, height)
+        await tile_cache.set_thumbnail(slide_id, width, height, image_bytes)
+        return image_bytes
+
+    try:
+        data = await _singleflight.do(cache_key, "thumbnail", _build_thumbnail)
+    except OverviewTooLarge as exc:
+        logger.warning(
+            "Thumbnail overview rejected for slide %s level=%d read=%dx%d pixels=%d limit=%d",
+            slide_id,
+            exc.best_level,
+            exc.read_width,
+            exc.read_height,
+            exc.requested_pixels,
+            exc.max_decode_pixels,
+        )
+        DECODE_SOURCE_PIXELS.observe(exc.requested_pixels)
+        OVERSIZED_DECODE_REJECTIONS.labels(kind="thumbnail").inc()
+        raise HTTPException(status_code=422, detail={"error": "overview_requires_preprocessing"})
     return Response(content=data, media_type="image/jpeg",
                     headers=THUMB_CACHE_HEADERS)
 
@@ -305,17 +368,37 @@ async def tile(slide_id: str, z: int, x: int, y: int):
         return Response(content=cached, media_type="image/jpeg",
                         headers=TILE_CACHE_HEADERS)
 
-    slide = await _in_thread(_get_slide, slide_id)
-
     try:
-        data = await _in_thread(get_tile_bytes, slide, z, x, y)
+        cache_key = tile_cache.tile_cache_key(slide_id, z, x, y)
+
+        async def _build_tile():
+            slide = await _run_image_operation(_get_slide, slide_id)
+            image_bytes = await _run_image_operation(get_tile_bytes, slide, z, x, y)
+            await tile_cache.set_tile(slide_id, z, x, y, image_bytes)
+            return image_bytes
+
+        data = await _singleflight.do(cache_key, "tile", _build_tile)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except OverviewTooLarge as exc:
+        logger.warning(
+            "Tile overview rejected for slide %s z=%d x=%d y=%d level=%d read=%dx%d pixels=%d limit=%d",
+            slide_id,
+            z,
+            x,
+            y,
+            exc.best_level,
+            exc.read_width,
+            exc.read_height,
+            exc.requested_pixels,
+            exc.max_decode_pixels,
+        )
+        DECODE_SOURCE_PIXELS.observe(exc.requested_pixels)
+        OVERSIZED_DECODE_REJECTIONS.labels(kind="tile").inc()
+        raise HTTPException(status_code=422, detail={"error": "overview_requires_preprocessing"})
     except Exception:
         logger.exception("Tile extraction failed for %s z=%d x=%d y=%d",
                          slide_id, z, x, y)
         raise HTTPException(status_code=500, detail="Tile extraction failed")
-
-    await tile_cache.set_tile(slide_id, z, x, y, data)
     return Response(content=data, media_type="image/jpeg",
                     headers=TILE_CACHE_HEADERS)

@@ -4,11 +4,11 @@ Redis tile cache.
 Keys:  tile:{slide_id}:{z}:{x}:{y}
 Value: raw JPEG bytes
 
-Tiles are immutable so TTL defaults to 0 (no expiry). A separate thumbnail
-cache uses the key thumbnail:{slide_id}:{width}:{height}.
+Tiles are immutable so tile TTL is configured separately. A thumbnail cache
+uses the key thumbnail:{slide_id}:{width}:{height}.
 
-Patient hierarchy is cached as JSON under patient:{patient_id} with a
-configurable TTL (default 24 h, controlled by PATIENT_CACHE_TTL).
+Patient hierarchy is owned by the cBioPortal backend. This cache is limited to
+slide tiles, thumbnails, slide metadata, and short-lived search results.
 """
 
 import json
@@ -30,11 +30,16 @@ def _tile_key(slide_id: str, z: int, x: int, y: int) -> str:
 def _thumb_key(slide_id: str, width: int, height: int) -> str:
     return f"thumbnail:{slide_id}:{width}:{height}"
 
-def _patient_key(patient_id: str) -> str:
-    return f"patient:{patient_id}"
-
 def _meta_key(slide_id: str) -> str:
     return f"meta:{slide_id}"
+
+
+def tile_cache_key(slide_id: str, z: int, x: int, y: int) -> str:
+    return _tile_key(slide_id, z, x, y)
+
+
+def thumbnail_cache_key(slide_id: str, width: int, height: int) -> str:
+    return _thumb_key(slide_id, width, height)
 
 
 def _redis_configured() -> bool:
@@ -117,23 +122,7 @@ async def get_thumbnail(slide_id: str, width: int, height: int) -> bytes | None:
 
 
 async def set_thumbnail(slide_id: str, width: int, height: int, data: bytes) -> None:
-    await _redis_set(_thumb_key(slide_id, width, height), data)
-
-
-# ---------------------------------------------------------------------------
-# Patient hierarchy cache
-# ---------------------------------------------------------------------------
-
-async def get_patient(patient_id: str) -> dict | None:
-    if not settings.patient_cache_ttl:
-        return None
-    return await _redis_get_json(_patient_key(patient_id))
-
-
-async def set_patient(patient_id: str, data: dict) -> None:
-    if not settings.patient_cache_ttl:
-        return
-    await _redis_set_json(_patient_key(patient_id), data, ttl=settings.patient_cache_ttl)
+    await _redis_set(_thumb_key(slide_id, width, height), data, ttl=settings.thumbnail_cache_ttl)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +138,7 @@ async def set_raw(key: str, data: object, ttl: int = 300) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Slide metadata cache (immutable — no TTL)
+# Slide metadata cache
 # ---------------------------------------------------------------------------
 
 async def get_metadata(slide_id: str) -> dict | None:
@@ -157,4 +146,4 @@ async def get_metadata(slide_id: str) -> dict | None:
 
 
 async def set_metadata(slide_id: str, data: dict) -> None:
-    await _redis_set_json(_meta_key(slide_id), data)
+    await _redis_set_json(_meta_key(slide_id), data, ttl=settings.metadata_cache_ttl)

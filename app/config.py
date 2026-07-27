@@ -1,6 +1,8 @@
 import configparser
+import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .constants import DEFAULT_WAREHOUSE_ID as _DEFAULT_WAREHOUSE_ID
 
@@ -34,6 +36,17 @@ def _env_csv(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
 
+def _env_json_file_map(name: str) -> dict[str, str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return {}
+    path = Path(raw)
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"{name} must point to a JSON object")
+    return {str(key): str(value) for key, value in data.items()}
+
+
 @dataclass
 class Settings:
     # WSI request authentication
@@ -49,14 +62,19 @@ class Settings:
     # Tile settings
     tile_size: int = field(default_factory=lambda: _env_int("TILE_SIZE", 256))
     jpeg_quality: int = field(default_factory=lambda: _env_int("JPEG_QUALITY", 85))
+    max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 4_194_304))
 
     # Redis tile cache
     redis_url: str = field(default_factory=lambda: _env_str("REDIS_URL", "redis://redis:6379"))
     tile_cache_ttl: int = field(default_factory=lambda: _env_int("TILE_CACHE_TTL", 86_400))
+    thumbnail_cache_ttl: int = field(default_factory=lambda: _env_int("THUMBNAIL_CACHE_TTL", 86_400))
+    metadata_cache_ttl: int = field(default_factory=lambda: _env_int("METADATA_CACHE_TTL", 86_400))
 
     # Slide cache / workers
     max_open_slides: int = field(default_factory=lambda: _env_int("MAX_OPEN_SLIDES", 64))
     n_workers: int = field(default_factory=lambda: _env_int("N_WORKERS", 4))
+    max_image_operations: int = field(default_factory=lambda: _env_int("MAX_IMAGE_OPERATIONS", 2))
+    path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
 
     # Databricks SQL
     databricks_warehouse_id: str = field(
@@ -69,12 +87,13 @@ class Settings:
         default_factory=lambda: _env_bool("ALLOW_LEGACY_ASSOCIATION_FALLBACK", False)
     )
 
-    # Metadata cache
-    patient_cache_ttl: int = field(default_factory=lambda: _env_int("PATIENT_CACHE_TTL", 86_400))
-
     # Block cache
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
     blockcache_block_size: int = field(default_factory=lambda: _env_int("BLOCKCACHE_BLOCK_SIZE", 8 * 1024 * 1024))
+
+    # Test-only local slide fixtures
+    test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
+    test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
 
     # CORS
     cors_origins: list[str] = field(

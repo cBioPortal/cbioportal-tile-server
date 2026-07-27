@@ -63,11 +63,15 @@ AWS_ENDPOINT_URL=http://pmindecs.mskcc.org:9020
 DATABRICKS_WAREHOUSE_ID=0b49b7d78734ad5c
 KEYCLOAK_JWKS_URL=<MSK Keycloak JWKS endpoint>
 ANNOTATION_AUTH_ENABLED=true
-TILE_CACHE_TTL=0
-PATIENT_CACHE_TTL=86400
+TILE_CACHE_TTL=86400
+THUMBNAIL_CACHE_TTL=86400
+METADATA_CACHE_TTL=86400
+MAX_DECODE_PIXELS=4194304
 BLOCKCACHE_PATH=/cache/slide-blocks
 BLOCKCACHE_BLOCK_SIZE=8388608
-MAX_OPEN_SLIDES=4
+MAX_OPEN_SLIDES=1
+MAX_IMAGE_OPERATIONS=2
+N_WORKERS=2
 TILE_SIZE=256
 JPEG_QUALITY=85
 CORS_ORIGINS=https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org
@@ -81,10 +85,9 @@ The blue and green cBioPortal backend deployments are configured with the
 same secret and with audience `cbioportal-wsi` and a 300-second token TTL.
 `WSI_AUTH_REQUIRED` is `true` in production.
 
-The production value `MAX_OPEN_SLIDES=4` is intentionally lower than this
-repository's benchmark-backed default of 64. Treat the deployment value as
-the operational setting; change it only after measuring memory and concurrent
-slide behavior on the production worker size.
+The production values above are the memory-bound starting point for a 4 GiB
+pod. Increase `N_WORKERS`, `MAX_OPEN_SLIDES`, or `MAX_IMAGE_OPERATIONS` only
+after measuring RSS under representative slide load.
 
 Use a password-protected Redis URL in shared environments. Redis is a cache,
 not an authorization boundary. Keep it private and do not place WSI metadata
@@ -176,9 +179,18 @@ publicly cacheable.
 - Tiles: `private, max-age=3600`.
 - Thumbnails: `private, max-age=300`.
 - Patient hierarchy, slide metadata, and search: `private, no-store`.
-- Tiles are immutable at the application layer; the production tile cache TTL
-  is `0` and refers to the tile cache implementation, not public HTTP cache
-  permission.
+- Thumbnails and metadata now use 24-hour Redis TTLs by default.
+- Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
+  explicitly for the resulting working set.
+
+## Overview decode guard
+
+Thumbnail and overview-tile requests are memory-bounded. If a slide lacks a
+safe overview pyramid level, the server returns HTTP `422` with
+`{"error":"overview_requires_preprocessing"}` and logs the selected pyramid
+level, requested decode dimensions, requested pixel count, and decode limit.
+Prepare those slides offline by generating a proper low-resolution pyramid or
+a precomputed thumbnail before exposing them to the service.
 
 ## ETL and study operations
 
@@ -186,6 +198,16 @@ The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
 
 1. `tools/wsi_canonical_associations_pipeline.sql`
 2. `tools/wsi_summary_pipeline.sql`
+
+The bundle output is loaded into the cBioPortal ClickHouse
+`wsi_patient_hierarchy` table. The tile server does not load or cache the
+patient hierarchy; it serves slide paths, metadata, and image tiles only.
+The loader accepts one materialized hierarchy per JSONL line and publishes the
+manifest only after all rows are inserted:
+
+```bash
+python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl --version 20260723030000
+```
 
 Preview migrations before writing:
 
