@@ -7,14 +7,17 @@ Reads:
   ~/.databrickscfg    selected profile metadata (prefers __settings__.default_profile)
 
 Usage:
-  python3 tools/write_dev_env.py > .env
+  python3 tools/write_dev_env.py
   docker compose up --build
 """
+import argparse
 import configparser
 import json
 import os
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 
 def _section(cfg: configparser.ConfigParser, section: str) -> configparser.SectionProxy | dict:
@@ -57,7 +60,36 @@ def _mint_databricks_cli_token(profile_name: str) -> str:
     return str(payload.get("access_token", "")).strip()
 
 
-def main() -> None:
+def _write_secure(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(".env"),
+        help="Secure output path (default: .env).",
+    )
+    args = parser.parse_args(argv)
     aws = configparser.ConfigParser()
     aws.read(os.path.expanduser("~/.aws/credentials"))
 
@@ -117,7 +149,9 @@ def main() -> None:
         f"WSI_AUTH_SECRET={os.environ.get('WSI_AUTH_SECRET', 'local-dev-wsi-secret')}",
         f"REDIS_PASSWORD={os.environ.get('REDIS_PASSWORD', 'local-dev-redis-password')}",
     ]
-    print("\n".join(lines))
+    output = args.output.expanduser().resolve()
+    _write_secure(output, "\n".join(lines) + "\n")
+    print(f"Wrote secure environment file: {output}", file=sys.stderr)
 
 
 if __name__ == "__main__":

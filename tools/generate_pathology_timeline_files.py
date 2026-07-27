@@ -25,6 +25,11 @@ from app.constants import (  # noqa: E402
     CANONICAL_ASSOCIATION_TABLE as _CANONICAL_ASSOCIATION_TABLE,
     DEFAULT_WAREHOUSE_ID as _DEFAULT_WAREHOUSE,
 )
+from app.associations import (  # noqa: E402
+    build_specimen_key,
+    canonicalize_association_rows,
+    derive_block_fields as _derive_block_fields,
+)
 
 _TIMELINE_META_FILENAME = "meta_clinical_timeline_pathology_slides.txt"
 _TIMELINE_DATA_FILENAME = "data_clinical_timeline_pathology_slides.txt"
@@ -190,41 +195,6 @@ def _clean_timeline_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "")).strip()
 
 
-def _derive_block_fields(
-    block_id: str | None, block_label: str | None
-) -> tuple[int | None, str, str | None]:
-    part_number: int | None = None
-    block_number = ""
-    source = block_id or ""
-    if source:
-        match = re.search(r"/(\d+)-([^/]+)$", source)
-        if match:
-            part_number = int(match.group(1))
-            raw_block = match.group(2).strip()
-            label = (block_label or raw_block).strip()
-            block_number_match = re.match(r"^(\d+)", raw_block)
-            block_number = (
-                block_number_match.group(1) if block_number_match else raw_block
-            )
-            return part_number, block_number, label
-
-    label = (block_label or "").strip()
-    block_number_match = re.match(r"^(\d+)", label)
-    block_number = block_number_match.group(1) if block_number_match else label
-    return part_number, block_number, label or None
-
-
-def _build_specimen_key(
-    match_level: str, part_number: int | None, block_number: str
-) -> str:
-    part_token = str(part_number) if part_number is not None else "?"
-    if match_level == "BLOCK":
-        return f"block::{part_token}::{block_number or '?'}"
-    if match_level == "PART":
-        return f"part::{part_token}"
-    return f"unmatched::{part_token}::{block_number or '?'}"
-
-
 def _format_specimen_label(
     match_level: str,
     part_number: int | None,
@@ -277,70 +247,8 @@ def _build_linkout(
     return f"/patient/wsiHESlides?{urlencode(params)}"
 
 
-def _path_rank(slide_path: str | None) -> int:
-    path = slide_path or ""
-    if path.startswith("s3://mskmind-bkt/reef-slides/"):
-        return 0
-    if path.startswith("s3://"):
-        return 1
-    return 2
-
-
-def _match_rank(match_level: str | None) -> int:
-    normalized = (match_level or "UNMATCHED").upper()
-    if normalized == "BLOCK":
-        return 0
-    if normalized == "PART":
-        return 1
-    if normalized == "UNMATCHED":
-        return 2
-    return 3
-
-
-def _canonical_row_preference(row: dict) -> tuple[object, ...]:
-    part_number, block_number, _ = _derive_block_fields(
-        row.get("block_id"),
-        row.get("block_label"),
-    )
-    part_token = (
-        f"{int(part_number):08d}" if isinstance(part_number, int) else "~~~~~~~~"
-    )
-    block_token = block_number or "~~~~~~~~"
-    return (
-        _path_rank(row.get("slide_path")),
-        _match_rank(row.get("match_level")),
-        0 if row.get("sample_id") else 1,
-        str(row.get("sample_id") or "~~~~~~~~"),
-        part_token,
-        block_token,
-        str(row.get("stain_group") or "~~~~~~~~"),
-        str(row.get("stain_name") or "~~~~~~~~"),
-        0 if row.get("part_description") else 1,
-        str(row.get("part_description") or "~~~~~~~~"),
-        0 if row.get("slide_timepoint_days") is not None else 1,
-        str(row.get("image_id") or ""),
-    )
-
-
 def _canonicalize_association_rows(rows: list[dict]) -> list[dict]:
-    best_by_patient_image: dict[tuple[str, str], dict] = {}
-
-    for row in rows:
-        patient_id = str(row.get("patient_id") or "").strip()
-        image_id = str(row.get("image_id") or "").strip()
-        if not patient_id or not image_id:
-            continue
-
-        key = (patient_id, image_id)
-        existing = best_by_patient_image.get(key)
-        if existing is None:
-            best_by_patient_image[key] = row
-            continue
-
-        if _canonical_row_preference(row) < _canonical_row_preference(existing):
-            best_by_patient_image[key] = row
-
-    return list(best_by_patient_image.values())
+    return canonicalize_association_rows(rows, ("patient_id", "image_id"))
 
 
 def _fetch_canonical_associations(
@@ -396,7 +304,7 @@ def build_pathology_timeline_rows(
             row.get("block_id"),
             row.get("block_label"),
         )
-        specimen_key = _build_specimen_key(
+        specimen_key = build_specimen_key(
             raw_match_level, part_number, block_number
         )
         specimen = _format_specimen_label(
