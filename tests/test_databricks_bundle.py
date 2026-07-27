@@ -1,7 +1,6 @@
 from pathlib import Path
 
 from app.constants import CANONICAL_ASSOCIATION_TABLE
-from app import meta_store
 
 
 def test_canonical_association_sql_asset_exists():
@@ -25,10 +24,8 @@ def test_databricks_bundle_references_canonical_association_task():
     assert "- task_key: compute-canonical-associations" in contents
 
 
-def test_canonical_and_legacy_queries_prefer_reef_inventory_paths():
+def test_canonical_pipeline_prefers_reef_inventory_paths():
     reef_pattern = "s3://mskmind-bkt/reef-slides/"
-    assert reef_pattern in meta_store.LEGACY_PATIENT_ASSOCIATIONS_SQL
-
     sql_path = (
         Path(__file__).resolve().parent.parent
         / "tools"

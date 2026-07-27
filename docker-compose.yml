@@ -1,7 +1,7 @@
 ---
 # Quick start:
 #
-#   python3 tools/write_dev_env.py > .env   # auto-populate from local credentials
+#   python3 tools/write_dev_env.py          # securely write .env from local credentials
 #   docker compose up --build
 #
 # Or: cp .env.example .env  then fill in credentials manually.
@@ -28,6 +28,8 @@ services:
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
       WSI_AUTH_REQUIRED: ${WSI_AUTH_REQUIRED:-true}
       WSI_TEST_SLIDE_MAP_FILE: ${WSI_TEST_SLIDE_MAP_FILE:-}
+      WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
 
       # ── Tile settings ─────────────────────────────────────────────────────
       TILE_SIZE: ${TILE_SIZE:-256}
@@ -73,7 +75,7 @@ services:
       start_period: 15s
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.5-alpine
     command: >
       redis-server
       --maxmemory ${REDIS_MAXMEMORY:-1g}

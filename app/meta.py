@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import logging
 import re
+from decimal import Decimal
 from typing import Any
 
 from . import meta_store
+from .associations import (
+    association_match_rank,
+    build_specimen_key,
+    canonicalize_association_rows,
+    derive_block_fields as _derive_block_fields,
+)
 
 logger = logging.getLogger(__name__)
 _run_query = meta_store.run_query
@@ -20,7 +27,7 @@ _param = meta_store.param
 def _infer_stain_flags(stain_group: str | None, stain_name: str | None) -> tuple[bool, bool]:
     group = (stain_group or "").lower()
     name = (stain_name or "").lower()
-    normalized_name = re.sub(r"\s+", " ", name.replace("&", "&")).strip()
+    normalized_name = re.sub(r"\s+", " ", name).strip()
     is_hne = group in {"h&e (initial)", "h&e (other)", "h&e"} or normalized_name in {
         "h&e",
         "he",
@@ -29,37 +36,12 @@ def _infer_stain_flags(stain_group: str | None, stain_name: str | None) -> tuple
     return is_hne, is_ihc
 
 
-def _derive_block_fields(block_id: str | None, block_label: str | None) -> tuple[int | None, str, str | None]:
-    part_number: int | None = None
-    block_number = ""
-    part_designator: str | None = None
-    source = block_id or ""
-    if source:
-        match = re.search(r"/(\d+)-([^/]+)$", source)
-        if match:
-            part_number = int(match.group(1))
-            raw_block = match.group(2).strip()
-            label = (block_label or raw_block).strip()
-            block_number_match = re.match(r"^(\d+)", raw_block)
-            block_number = block_number_match.group(1) if block_number_match else raw_block
-            part_designator = str(part_number)
-            return part_number, block_number, label
-    label = (block_label or "").strip()
-    block_number_match = re.match(r"^(\d+)", label)
-    block_number = block_number_match.group(1) if block_number_match else label
-    return part_number, block_number, label or None
-
-
 def _coerce(v: Any) -> Any:
     """Convert non-JSON-safe types (Decimal, etc.) to native Python."""
     if v is None:
         return None
-    try:
-        from decimal import Decimal  # noqa: PLC0415
-        if isinstance(v, Decimal):
-            return float(v)
-    except ImportError:
-        pass
+    if isinstance(v, Decimal):
+        return float(v)
     return v
 
 
@@ -129,18 +111,6 @@ def _new_slide(row: dict, block_label: str | None, block_number: str, is_hne: bo
     }
 
 
-def _build_specimen_key(
-    row: dict, part_number: int | None, block_number: str
-) -> str:
-    match_level = (row.get("match_level") or "UNMATCHED").upper()
-    part_token = str(part_number) if part_number is not None else "?"
-    if match_level == "BLOCK":
-        return f"block::{part_token}::{block_number or '?'}"
-    if match_level == "PART":
-        return f"part::{part_token}"
-    return f"unmatched::{part_token}::{block_number or '?'}"
-
-
 def _association_identity(
     row: dict[str, Any],
     part_number: int | None,
@@ -152,62 +122,17 @@ def _association_identity(
         str(row.get("image_id")),
         row.get("sample_id"),
         (row.get("match_level") or "UNMATCHED").upper(),
-        _build_specimen_key(row, part_number, block_number),
+        build_specimen_key(
+            (row.get("match_level") or "UNMATCHED").upper(),
+            part_number,
+            block_number,
+        ),
         can_serve,
         slide_timepoint_days,
     )
 
 
-def _association_path_rank(slide_path: str | None) -> int:
-    path = slide_path or ""
-    if path.startswith("s3://mskmind-bkt/reef-slides/"):
-        return 0
-    if path.startswith("s3://"):
-        return 1
-    return 2
-
-
-def _association_match_rank(match_level: str | None) -> int:
-    normalized = (match_level or "UNMATCHED").upper()
-    if normalized == "BLOCK":
-        return 0
-    if normalized == "PART":
-        return 1
-    if normalized == "UNMATCHED":
-        return 2
-    return 3
-
-
-def _canonical_association_preference(
-    row: dict[str, Any],
-) -> tuple[Any, ...]:
-    part_number, block_number, _ = _derive_block_fields(
-        row.get("block_id"),
-        row.get("block_label"),
-    )
-    part_token = (
-        f"{int(part_number):08d}" if isinstance(part_number, int) else "~~~~~~~~"
-    )
-    block_token = block_number or "~~~~~~~~"
-    return (
-        _association_path_rank(row.get("slide_path")),
-        _association_match_rank(row.get("match_level")),
-        0 if row.get("sample_id") else 1,
-        str(row.get("sample_id") or "~~~~~~~~"),
-        part_token,
-        block_token,
-        str(row.get("stain_group") or "~~~~~~~~"),
-        str(row.get("stain_name") or "~~~~~~~~"),
-        0 if row.get("part_description") else 1,
-        str(row.get("part_description") or "~~~~~~~~"),
-        0 if row.get("slide_timepoint_days") is not None else 1,
-        str(row.get("image_id") or ""),
-    )
-
-
-def _canonicalize_association_rows(
-    rows: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+def _canonicalize_association_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     def _timepoint_sort_value(row: dict[str, Any]) -> float:
         value = row.get("slide_timepoint_days")
         if value is None:
@@ -217,28 +142,11 @@ def _canonicalize_association_rows(
         except (TypeError, ValueError):
             return float("inf")
 
-    best_by_image_id: dict[str, dict[str, Any]] = {}
-
-    for row in rows:
-        image_id = str(row.get("image_id") or "").strip()
-        if not image_id:
-            continue
-
-        existing = best_by_image_id.get(image_id)
-        if existing is None:
-            best_by_image_id[image_id] = row
-            continue
-
-        if _canonical_association_preference(row) < _canonical_association_preference(
-            existing
-        ):
-            best_by_image_id[image_id] = row
-
-    canonical_rows = list(best_by_image_id.values())
+    canonical_rows = canonicalize_association_rows(rows, ("image_id",))
     canonical_rows.sort(
         key=lambda row: (
             str(row.get("sample_id") or ""),
-            _association_match_rank(row.get("match_level")),
+            association_match_rank(row.get("match_level")),
             _timepoint_sort_value(row),
             str(row.get("image_id") or ""),
         )
@@ -285,7 +193,11 @@ def _assemble_slide_associations(rows: list[dict[str, Any]]) -> tuple[list[dict]
                 "image_id": str(row.get("image_id")),
                 "sample_id": row.get("sample_id"),
                 "match_level": (row.get("match_level") or "UNMATCHED").upper(),
-                "specimen_key": _build_specimen_key(row, part_number, block_number),
+                "specimen_key": build_specimen_key(
+                    (row.get("match_level") or "UNMATCHED").upper(),
+                    part_number,
+                    block_number,
+                ),
                 "part_number": str(part_number) if part_number is not None else None,
                 "part_description": row.get("part_description"),
                 "block_number": block_number or None,
@@ -301,16 +213,30 @@ def _assemble_slide_associations(rows: list[dict[str, Any]]) -> tuple[list[dict]
     return associations, reference_sample_id, reference_sequencing_date
 
 
+def _prepare_hierarchy_for_merge(hierarchy: dict) -> None:
+    for sample in hierarchy["samples"]:
+        parts = {}
+        for part in sample.get("parts", []):
+            part_key = str(part.get("part_number") or "?")
+            part["blocks"] = {
+                str(block.get("block_number") or ""): block
+                for block in part.get("blocks", [])
+            }
+            parts[part_key] = part
+        sample["parts"] = parts
+
+
 def _merge_association_rows_into_hierarchy(
     hierarchy: dict,
     rows: list[dict[str, Any]],
 ) -> None:
+    _prepare_hierarchy_for_merge(hierarchy)
     sample_map = {sample["sample_id"]: sample for sample in hierarchy["samples"]}
     seen_slide_keys = set()
 
     for sample in hierarchy["samples"]:
-        for part in sample["parts"]:
-            for block in part["blocks"]:
+        for part in sample["parts"].values():
+            for block in part["blocks"].values():
                 for slide in block["slides"]:
                     seen_slide_keys.add((sample["sample_id"], slide["image_id"]))
 
@@ -342,26 +268,8 @@ def _merge_association_rows_into_hierarchy(
             sample_map[sample_id] = sample
             hierarchy["samples"].append(sample)
 
-        if isinstance(sample.get("parts"), list):
-            sample["parts"] = {
-                str(part.get("part_number") or "?"): {
-                    **{k: v for k, v in part.items() if k != "blocks"},
-                    "blocks": {
-                        str(block.get("block_number") or ""): block
-                        for block in part.get("blocks", [])
-                    },
-                }
-                for part in sample["parts"]
-            }
-
         part_key = str(part_number) if part_number is not None else "?"
         part = sample["parts"].setdefault(part_key, _new_part(row, part_number))
-
-        if isinstance(part.get("blocks"), list):
-            part["blocks"] = {
-                str(block.get("block_number") or ""): block
-                for block in part["blocks"]
-            }
 
         block = part["blocks"].setdefault(
             block_number,
@@ -380,22 +288,18 @@ def _merge_association_rows_into_hierarchy(
 
     normalized_samples: list[dict] = []
     for sample in hierarchy["samples"]:
-        if isinstance(sample.get("parts"), dict):
-            parts_list = []
-            for part in sample["parts"].values():
-                if isinstance(part.get("blocks"), dict):
-                    blocks_list = []
-                    for block in part["blocks"].values():
-                        block["slides"].sort(key=_slide_sort_key)
-                        blocks_list.append(block)
-                    part = {k: v for k, v in part.items() if k != "blocks"} | {
-                        "blocks": blocks_list
-                    }
-                parts_list.append(part)
-            sample = {k: v for k, v in sample.items() if k != "parts"} | {
-                "parts": parts_list
-            }
-        normalized_samples.append(sample)
+        parts_list = []
+        for part in sample["parts"].values():
+            blocks_list = []
+            for block in part["blocks"].values():
+                block["slides"].sort(key=_slide_sort_key)
+                blocks_list.append(block)
+            parts_list.append({k: v for k, v in part.items() if k != "blocks"} | {
+                "blocks": blocks_list
+            })
+        normalized_samples.append({k: v for k, v in sample.items() if k != "parts"} | {
+            "parts": parts_list
+        })
 
     hierarchy["samples"] = normalized_samples
 
@@ -571,6 +475,14 @@ def search_suggestions(query: str, warehouse_id: str) -> list[dict]:
 # Slide summary (Phase 7)
 # ---------------------------------------------------------------------------
 
+def _sample_id_filter(sample_ids: list[str]) -> tuple[str, list]:
+    placeholders = ", ".join(f":sample_id_{index}" for index in range(len(sample_ids)))
+    params = [
+        _param(f"sample_id_{index}", sample_id)
+        for index, sample_id in enumerate(sample_ids)
+    ]
+    return placeholders, params
+
 def get_sample_slide_summary(
     sample_ids: list[str],
     warehouse_id: str,
@@ -591,7 +503,7 @@ def get_sample_slide_summary(
     """
     if not sample_ids:
         return []
-    placeholders = ", ".join(f"'{sid.replace(chr(39), '')}'" for sid in sample_ids)
+    placeholders, params = _sample_id_filter(sample_ids)
     rows = _run_query(
         f"""
 SELECT
@@ -608,6 +520,7 @@ WHERE sample_id IN ({placeholders})
 ORDER BY sample_id
 """,
         warehouse_id,
+        params,
     )
     return [
         {
@@ -643,7 +556,7 @@ def get_live_sample_slide_summary(
     """
     if not sample_ids:
         return []
-    placeholders = ", ".join(f"'{sid.replace(chr(39), '')}'" for sid in sample_ids)
+    placeholders, params = _sample_id_filter(sample_ids)
     rows = _run_query(
         f"""
 WITH selected_samples AS (
@@ -752,6 +665,7 @@ LEFT JOIN non_viewable_patient_summary non_viewable
 ORDER BY selected_samples.sample_id
 """,
         warehouse_id,
+        params,
     )
     return [
         {

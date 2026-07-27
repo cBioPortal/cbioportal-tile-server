@@ -11,6 +11,7 @@ import app.cache as cache_module
 import app.main as main_module
 import app.meta as meta_module
 from app.config import settings
+from app.rate_limit import RequestRateLimiter
 from app.tiles import TILE_SIZE
 from tests.conftest import make_mock_slide
 
@@ -96,6 +97,22 @@ class TestHealth:
         resp = api_client.get("/wsi/tiles/1/metadata")
         assert resp.status_code == 401
 
+    def test_health_is_exempt_from_rate_limit(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
+        monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
+        assert api_client.get("/health").status_code == 200
+        assert api_client.get("/health").status_code == 200
+
+    def test_expensive_requests_are_rate_limited(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
+        monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
+        assert api_client.get("/search?q=P-1").status_code == 401
+        limited = api_client.get("/search?q=P-2")
+        assert limited.status_code == 429
+        assert limited.headers["retry-after"] == "60"
+
 
 # ---------------------------------------------------------------------------
 # /tiles/{slide_id}/metadata
@@ -132,6 +149,18 @@ class TestMetadataRoute:
             assert resp.status_code in (404, 500)
         finally:
             main_module._slides.get.side_effect = None
+
+    def test_warmup_resolves_image_id_before_opening(self, api_client):
+        with patch.object(
+            meta_module,
+            "get_slide_path",
+            return_value="s3://test-bucket/1492807.svs",
+        ) as get_path:
+            resp = api_client.get("/tiles/1492807/warmup")
+
+        assert resp.status_code == 200
+        get_path.assert_called_once_with("1492807", settings.databricks_warehouse_id)
+        main_module._slides.get.assert_called_with("s3://test-bucket/1492807.svs")
 
 
 # ---------------------------------------------------------------------------

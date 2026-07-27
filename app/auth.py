@@ -18,7 +18,9 @@ def _b64decode(value: str) -> bytes:
         raise InvalidWsiToken("invalid token encoding") from exc
 
 
-def validate_wsi_token(token: str, secret: str, audience: str) -> dict:
+def validate_wsi_token(
+    token: str, secret: str, audience: str, max_ttl: int = 300
+) -> dict:
     if not secret or len(secret.encode()) < 32:
         raise InvalidWsiToken("WSI authentication is not configured")
 
@@ -32,6 +34,9 @@ def validate_wsi_token(token: str, secret: str, audience: str) -> dict:
         payload = json.loads(_b64decode(encoded_payload))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InvalidWsiToken("invalid token payload") from exc
+
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise InvalidWsiToken("invalid token structure")
 
     if header.get("alg") != "HS256" or header.get("typ") != "JWT":
         raise InvalidWsiToken("unsupported token algorithm")
@@ -53,5 +58,7 @@ def validate_wsi_token(token: str, secret: str, audience: str) -> dict:
         raise InvalidWsiToken("expired token")
     if not isinstance(payload.get("iat"), int) or payload["iat"] > now + 60:
         raise InvalidWsiToken("invalid token issued-at")
+    if max_ttl <= 0 or payload["exp"] - payload["iat"] > max_ttl:
+        raise InvalidWsiToken("token lifetime exceeds maximum")
 
     return payload

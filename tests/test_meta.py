@@ -497,8 +497,10 @@ class TestGetSampleSlideSummary:
     def test_sql_contains_sample_ids(self):
         _, mock_rq = self._call(["P-001-T01", "P-002-T01"], rows=[])
         sql_arg = mock_rq.call_args[0][0]
-        assert "P-001-T01" in sql_arg
-        assert "P-002-T01" in sql_arg
+        params = mock_rq.call_args[0][2]
+        assert ":sample_id_0" in sql_arg
+        assert ":sample_id_1" in sql_arg
+        assert [param.value for param in params] == ["P-001-T01", "P-002-T01"]
 
     def test_sql_queries_summary_table(self):
         from app.constants import SUMMARY_TABLE
@@ -573,90 +575,13 @@ class TestPatientAssociationRows:
         sql = mock_rq.call_args_list[0].args[0]
         assert meta_store._CANONICAL_ASSOCIATION_TABLE in sql
 
-    def test_missing_canonical_table_falls_back_to_legacy_query(self):
-        with patch(
-            "app.meta_store.run_query",
-            side_effect=[
-                RuntimeError(
-                    "TABLE_OR_VIEW_NOT_FOUND: cdsi_prod.pathology_data_mining.canonical_slide_associations does not exist"
-                ),
-                [{"image_id": "1"}],
-            ],
-        ) as mock_rq:
-            with patch.object(
-                meta_store.settings, "allow_legacy_association_fallback", True
-            ):
-                rows = meta_store.get_patient_association_rows("P-0001", "wh-test")
-
-        assert rows == [{"image_id": "1"}]
-        assert len(mock_rq.call_args_list) == 2
-        canonical_sql = mock_rq.call_args_list[0].args[0]
-        legacy_sql = mock_rq.call_args_list[1].args[0]
-        assert meta_store._CANONICAL_ASSOCIATION_TABLE in canonical_sql
-        assert "matched_associations_raw AS" in legacy_sql
-
-    def test_non_missing_canonical_error_does_not_fall_back(self):
+    def test_canonical_query_errors_propagate(self):
         with patch(
             "app.meta_store.run_query",
             side_effect=RuntimeError("Databricks query timed out"),
         ):
             with pytest.raises(RuntimeError, match="timed out"):
                 meta_store.get_patient_association_rows("P-0001", "wh-test")
-
-    def test_missing_canonical_table_logs_fallback(self, caplog):
-        with patch(
-            "app.meta_store.run_query",
-            side_effect=[
-                RuntimeError(
-                    "TABLE_OR_VIEW_NOT_FOUND: cdsi_prod.pathology_data_mining.canonical_slide_associations does not exist"
-                ),
-                [{"image_id": "1"}],
-            ],
-        ):
-            with patch.object(
-                meta_store.settings, "allow_legacy_association_fallback", True
-            ):
-                with caplog.at_level("WARNING"):
-                    rows = meta_store.get_patient_association_rows("P-0001", "wh-test")
-
-        assert rows == [{"image_id": "1"}]
-        assert "Falling back to legacy association SQL for patient P-0001" in caplog.text
-
-    def test_explicit_legacy_mode_skips_canonical_query(self):
-        with patch("app.meta_store.run_query", return_value=[{"image_id": "1"}]) as mock_rq:
-            rows = meta_store.get_patient_association_rows(
-                "P-0001",
-                "wh-test",
-                mode="legacy",
-            )
-
-        assert rows == [{"image_id": "1"}]
-        sql = mock_rq.call_args_list[0].args[0]
-        assert "matched_associations_raw AS" in sql
-
-    def test_explicit_canonical_mode_skips_fallback(self):
-        with patch("app.meta_store.run_query", return_value=[{"image_id": "1"}]) as mock_rq:
-            rows = meta_store.get_patient_association_rows(
-                "P-0001",
-                "wh-test",
-                mode="canonical",
-            )
-
-        assert rows == [{"image_id": "1"}]
-        sql = mock_rq.call_args_list[0].args[0]
-        assert meta_store._CANONICAL_ASSOCIATION_TABLE in sql
-
-    def test_explicit_canonical_mode_logs_canonical_query(self, caplog):
-        with patch("app.meta_store.run_query", return_value=[{"image_id": "1"}]):
-            with caplog.at_level("INFO"):
-                rows = meta_store.get_patient_association_rows(
-                    "P-0001",
-                    "wh-test",
-                    mode="canonical",
-                )
-
-        assert rows == [{"image_id": "1"}]
-        assert "Querying canonical association table for patient P-0001" in caplog.text
 
     def test_canonical_only_patient_still_builds_hierarchy(self):
         association_rows = [

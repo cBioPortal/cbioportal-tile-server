@@ -112,6 +112,10 @@ The frontend caches tokens per study and sends:
 Authorization: Bearer <token>
 ```
 
+The tile server rejects WSI tokens whose lifetime exceeds 300 seconds and
+applies an in-process limit of 120 expensive requests per client per minute.
+Production ingress should apply distributed rate limits as well.
+
 The tile server validates the signature, algorithm, audience, scope, subject,
 issued-at time, and expiry. It does not currently validate the `study_id`
 claim against a slide-to-study mapping. Therefore backend-issued,

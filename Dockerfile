@@ -1,7 +1,7 @@
-FROM python:3.13-slim
+FROM python:3.13.5-slim-bookworm
 
 # Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
 
 WORKDIR /app
 

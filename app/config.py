@@ -53,6 +53,7 @@ class Settings:
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
     wsi_auth_required: bool = field(default_factory=lambda: _env_bool("WSI_AUTH_REQUIRED", True))
+    wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
 
     # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
@@ -75,16 +76,11 @@ class Settings:
     n_workers: int = field(default_factory=lambda: _env_int("N_WORKERS", 4))
     max_image_operations: int = field(default_factory=lambda: _env_int("MAX_IMAGE_OPERATIONS", 2))
     path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
+    rate_limit_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 120))
 
     # Databricks SQL
     databricks_warehouse_id: str = field(
         default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
-    )
-    use_canonical_association_table: bool = field(
-        default_factory=lambda: _env_bool("USE_CANONICAL_ASSOCIATION_TABLE", True)
-    )
-    allow_legacy_association_fallback: bool = field(
-        default_factory=lambda: _env_bool("ALLOW_LEGACY_ASSOCIATION_FALLBACK", False)
     )
 
     # Block cache

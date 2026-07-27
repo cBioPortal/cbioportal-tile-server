@@ -16,9 +16,8 @@ Completed in the tile server:
   configured to build
   `cdsi_prod.pathology_data_mining.canonical_slide_associations` nightly
   before the WSI summary pipeline runs.
-- The tile server association read path now prefers
-  `cdsi_prod.pathology_data_mining.canonical_slide_associations` and falls
-  back to the legacy inline SQL only when the canonical table is missing.
+- The tile server association read path now uses
+  `cdsi_prod.pathology_data_mining.canonical_slide_associations` exclusively.
 - Regression coverage in `tests/test_meta.py` for duplicate
   `slide_associations`.
 - A study-file generator now exists at
@@ -33,7 +32,7 @@ Verified on July 19, 2026:
   no longer returns duplicate H&E associations at `-142` days.
 - The materialized canonical Databricks table now exists at
   `cdsi_prod.pathology_data_mining.canonical_slide_associations`.
-- Representative canonical-vs-legacy validation now passes for:
+- Representative canonical validation now passes for:
   - `P-0002438`
   - `P-0048660`
   - `P-0011144`
@@ -51,10 +50,10 @@ Verified on July 19, 2026:
   events load through the existing `clinical_event` import path and become
   available from the ClickHouse-backed clinical events API after study reload.
 
-## What this wave does not do
+## Runtime prerequisite
 
-- It does not remove the legacy inline association SQL yet; runtime still keeps
-  that path as a missing-table fallback.
+- The canonical association table must be available before the tile server is
+  deployed. The Databricks bundle builds it before the WSI summary pipeline.
 - It does not move patient summary, clinical-data pathology rows, or study-view
   pathology counts off runtime augmentation and onto ClickHouse query paths by
   itself; it only loads canonical pathology events into the cBioPortal
@@ -65,11 +64,8 @@ Verified on July 19, 2026:
 
 ### Wave 1 remainder
 
-- Promote the current canonical association logic to a shared Databricks table
-  or view instead of only embedding it in the tile-server query.
-  Status on July 17, 2026: the shared SQL asset and nightly bundle task now
-  exist, and the tile server prefers the upstream materialized table with a
-  missing-table fallback to the legacy inline query.
+- The canonical association logic is now promoted to a shared Databricks table
+  and the nightly bundle task builds it before downstream consumers run.
 - Add explicit `association_version`, `updated_at`, `sample_bucket`, and
   `sample_label` in the shared upstream dataset.
   Status on July 18, 2026: these fields are now emitted by
@@ -110,9 +106,9 @@ Verified on July 19, 2026:
   - canonical Databricks associations
   - backend `/api/wsi/hierarchy/{study_id}/{patient_id}` payloads
   - ClickHouse aggregates
-  Status on July 17, 2026: a canonical-vs-legacy Databricks comparison helper
-  now exists at `tools/validate_canonical_associations.py`. Validation against
-  tile-server payloads and ClickHouse aggregates is still pending.
+  Status on July 17, 2026: a canonical Databricks validation helper now exists
+  at `tools/validate_canonical_associations.py`. Validation against tile-server
+  payloads and ClickHouse aggregates is still pending.
 
 ### Wave 5
 

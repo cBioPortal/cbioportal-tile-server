@@ -37,7 +37,8 @@ from .metrics import (
     metrics_payload,
     track_image_operation,
 )
-from .meta import get_slide_dbmeta, search_suggestions
+from .meta import get_patient_hierarchy, get_slide_dbmeta, search_suggestions
+from .rate_limit import EXPENSIVE_PATH_PREFIXES, rate_limiter
 from .slides import SlideCache
 from .tiles import OverviewTooLarge, get_thumbnail_bytes, get_tile_bytes, render_tile_image, slide_metadata
 
@@ -146,9 +147,29 @@ async def require_wsi_capability(request: Request, call_next):
             authorization[7:].strip(),
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
+            settings.wsi_auth_max_ttl,
         )
     except InvalidWsiToken:
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def limit_expensive_requests(request: Request, call_next):
+    path = request.scope["path"]
+    if (
+        settings.wsi_auth_required
+        and path.startswith(EXPENSIVE_PATH_PREFIXES)
+        and not rate_limiter.allow(
+            request.client.host if request.client else "unknown",
+            settings.rate_limit_per_minute,
+        )
+    ):
+        return Response(
+            status_code=429,
+            headers={"Retry-After": "60"},
+            content="Rate limit exceeded",
+        )
     return await call_next(request)
 
 
@@ -230,6 +251,32 @@ def health():
 def metrics():
     payload, content_type = metrics_payload()
     return Response(content=payload, media_type=content_type)
+
+
+@app.get("/patient/{patient_id}")
+async def patient_hierarchy(patient_id: str):
+    """Return the Databricks-backed patient slide hierarchy."""
+    try:
+        result = await _in_thread(
+            get_patient_hierarchy,
+            patient_id,
+            settings.databricks_warehouse_id,
+        )
+    except Exception:
+        logger.exception("Databricks query failed for patient %s", patient_id)
+        raise HTTPException(status_code=502, detail="Metadata query failed")
+
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Patient not found in slide inventory",
+        )
+
+    return Response(
+        content=json.dumps(result),
+        media_type="application/json",
+        headers=PHI_CACHE_HEADERS,
+    )
 
 
 @app.get("/slides/{image_id}/dbmeta")
