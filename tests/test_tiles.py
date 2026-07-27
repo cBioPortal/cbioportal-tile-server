@@ -7,11 +7,13 @@ import pytest
 from PIL import Image
 
 from app.tiles import (
+    OverviewTooLarge,
     TILE_SIZE,
     _resize_and_pad,
     _slide_properties_metadata,
     _tile_geometry,
     get_tile_bytes,
+    get_thumbnail_bytes,
     max_zoom,
     slide_metadata,
 )
@@ -125,6 +127,19 @@ class TestGetTileBytes:
         result = get_tile_bytes(make_mock_slide(4096, 4096, levels=5), 0, 0, 0)
         assert result[:2] == b"\xff\xd8"
 
+    def test_overview_rejected_when_decode_budget_exceeded(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=1)
+        slide.read_region = MagicMock(side_effect=AssertionError("read_region should not run"))
+        monkeypatch.setattr("app.tiles.settings.max_decode_pixels", 4_194_304)
+        with pytest.raises(OverviewTooLarge):
+            get_tile_bytes(slide, 0, 0, 0)
+
+    def test_overview_at_pixel_boundary_is_allowed(self, monkeypatch):
+        slide = make_mock_slide(2048, 2048, levels=1)
+        monkeypatch.setattr("app.tiles.settings.max_decode_pixels", 4_194_304)
+        result = get_tile_bytes(slide, 0, 0, 0)
+        assert result[:2] == b"\xff\xd8"
+
     def test_z_above_max_raises(self):
         slide = make_mock_slide()
         mz = max_zoom(slide)
@@ -153,3 +168,20 @@ class TestGetTileBytes:
         result = get_tile_bytes(slide, max_zoom(slide), 1, 0)   # partial edge tile
         img = Image.open(BytesIO(result))
         assert img.size == (TILE_SIZE, TILE_SIZE)
+
+
+class TestThumbnailBytes:
+    def test_thumbnail_preserves_slide_aspect_ratio(self):
+        slide = make_mock_slide(4096, 1024, levels=5)
+        result = get_thumbnail_bytes(slide, 256, 256)
+        from io import BytesIO
+
+        img = Image.open(BytesIO(result))
+        assert img.size == (256, 64)
+
+    def test_thumbnail_rejected_when_overview_decode_budget_exceeded(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=1)
+        slide.read_region = MagicMock(side_effect=AssertionError("read_region should not run"))
+        monkeypatch.setattr("app.tiles.settings.max_decode_pixels", 4_194_304)
+        with pytest.raises(OverviewTooLarge):
+            get_thumbnail_bytes(slide, 256, 256)

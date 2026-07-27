@@ -49,8 +49,6 @@ def api_client():
         patch.object(cache_module, "set_thumbnail", _noop_set),
         patch.object(cache_module, "get_metadata",  _noop_get),
         patch.object(cache_module, "set_metadata",  _noop_set),
-        patch.object(cache_module, "get_patient",   _noop_get),
-        patch.object(cache_module, "set_patient",   _noop_set),
         patch.object(cache_module, "get_raw",       _noop_get),
         patch.object(cache_module, "set_raw",       _noop_set),
         patch.object(meta_module, "get_slide_path",
@@ -95,7 +93,7 @@ class TestHealth:
     def test_wsi_data_requires_capability(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
-        resp = api_client.get("/wsi/patient/P-1")
+        resp = api_client.get("/wsi/tiles/1/metadata")
         assert resp.status_code == 401
 
 
@@ -104,6 +102,12 @@ class TestHealth:
 # ---------------------------------------------------------------------------
 
 class TestMetadataRoute:
+    def test_test_slide_map_bypasses_databricks_lookup(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "test_slide_map", {"tiny-slide": "/app/testdata/CMU-1-Small-Region.svs"})
+        with patch.object(meta_module, "get_slide_path", side_effect=AssertionError("should not query databricks")):
+            resp = api_client.get("/tiles/tiny-slide/metadata")
+        assert resp.status_code == 200
+
     def test_returns_200_with_shape(self, api_client):
         resp = api_client.get("/tiles/1492807/metadata")
         assert resp.status_code == 200
@@ -156,6 +160,12 @@ class TestTileRoute:
         resp = api_client.get("/tiles/1492807/zxy/2/999/0")
         assert resp.status_code == 404
 
+    def test_oversized_overview_returns_422(self, api_client):
+        main_module._slides.get.return_value = make_mock_slide(4096, 4096, levels=1)
+        resp = api_client.get("/tiles/1492807/zxy/0/0/0")
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "overview_requires_preprocessing"
+
 
 # ---------------------------------------------------------------------------
 # /tiles/{slide_id}/thumbnail
@@ -177,33 +187,11 @@ class TestThumbnailRoute:
         resp = api_client.get("/tiles/1492807/thumbnail")
         assert "max-age" in resp.headers.get("cache-control", "")
 
-
-# ---------------------------------------------------------------------------
-# /patient/{patient_id}
-# ---------------------------------------------------------------------------
-
-class TestPatientRoute:
-    def test_not_found_returns_404(self, api_client):
-        with patch("app.main.get_patient_hierarchy", new_callable=AsyncMock) as mock_fn:
-            mock_fn.return_value = None
-            # get_patient_hierarchy is called via _in_thread, so patch the imported name
-        # Simpler: patch at the module level and make _in_thread call it
-        with patch("app.main._in_thread", new=AsyncMock(return_value=None)):
-            resp = api_client.get("/patient/P-NOTEXIST")
-        assert resp.status_code == 404
-
-    def test_wsi_namespace_reaches_patient_route(self, api_client):
-        with patch("app.main._in_thread", new=AsyncMock(return_value=None)):
-            resp = api_client.get("/wsi/patient/GENERIC-PATIENT-ID")
-        assert resp.status_code == 404
-
-    def test_databricks_error_returns_502(self, api_client):
-        async def _raise(*a, **k):
-            raise RuntimeError("Databricks down")
-
-        with patch("app.main._in_thread", new=_raise):
-            resp = api_client.get("/patient/P-0001")
-        assert resp.status_code == 502
+    def test_oversized_thumbnail_returns_422(self, api_client):
+        main_module._slides.get.return_value = make_mock_slide(4096, 4096, levels=1)
+        resp = api_client.get("/tiles/1492807/thumbnail?width=256&height=256")
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "overview_requires_preprocessing"
 
 
 # ---------------------------------------------------------------------------

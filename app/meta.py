@@ -208,6 +208,15 @@ def _canonical_association_preference(
 def _canonicalize_association_rows(
     rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
+    def _timepoint_sort_value(row: dict[str, Any]) -> float:
+        value = row.get("slide_timepoint_days")
+        if value is None:
+            return float("inf")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("inf")
+
     best_by_image_id: dict[str, dict[str, Any]] = {}
 
     for row in rows:
@@ -230,9 +239,7 @@ def _canonicalize_association_rows(
         key=lambda row: (
             str(row.get("sample_id") or ""),
             _association_match_rank(row.get("match_level")),
-            row.get("slide_timepoint_days")
-            if row.get("slide_timepoint_days") is not None
-            else float("inf"),
+            _timepoint_sort_value(row),
             str(row.get("image_id") or ""),
         )
     )

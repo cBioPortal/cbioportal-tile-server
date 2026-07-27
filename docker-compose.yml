@@ -27,22 +27,27 @@ services:
       WSI_AUTH_SECRET: ${WSI_AUTH_SECRET:?WSI_AUTH_SECRET must be set}
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
       WSI_AUTH_REQUIRED: ${WSI_AUTH_REQUIRED:-true}
+      WSI_TEST_SLIDE_MAP_FILE: ${WSI_TEST_SLIDE_MAP_FILE:-}
 
       # ── Tile settings ─────────────────────────────────────────────────────
       TILE_SIZE: ${TILE_SIZE:-256}
       JPEG_QUALITY: ${JPEG_QUALITY:-85}
+      MAX_DECODE_PIXELS: ${MAX_DECODE_PIXELS:-4194304}
 
       # ── Redis cache ───────────────────────────────────────────────────────
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
       TILE_CACHE_TTL: ${TILE_CACHE_TTL:-86400}
-      PATIENT_CACHE_TTL: ${PATIENT_CACHE_TTL:-300}   # 5 min for dev; 86400 in prod
+      THUMBNAIL_CACHE_TTL: ${THUMBNAIL_CACHE_TTL:-86400}
+      METADATA_CACHE_TTL: ${METADATA_CACHE_TTL:-86400}
 
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
 
       # ── Capacity (tune to host RAM; each open SVS ≈ 50–200 MB) ───────────
-      MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-16}
-      N_WORKERS: ${N_WORKERS:-4}
+      MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
+      N_WORKERS: ${N_WORKERS:-2}
+      MAX_IMAGE_OPERATIONS: ${MAX_IMAGE_OPERATIONS:-2}
+      PATH_CACHE_CAPACITY: ${PATH_CACHE_CAPACITY:-4096}
 
       # ── fsspec BlockCache — point at a fast local disk (NVMe preferred) ──
       # The named volume above keeps cold SVS range reads local between
@@ -51,6 +56,7 @@ services:
       BLOCKCACHE_BLOCK_SIZE: ${BLOCKCACHE_BLOCK_SIZE:-8388608}   # 8 MB
     volumes:
       - slide_blocks:/cache/slide-blocks
+      - ./tests/testdata:/app/testdata:ro
     depends_on:
       redis:
         condition: service_healthy

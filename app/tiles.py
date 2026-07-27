@@ -11,13 +11,63 @@ white so callers never have to handle partial tiles.
 
 import io
 import math
+from dataclasses import dataclass
 
 from PIL import Image
 from tiffslide import TiffSlide
 
 from .config import settings
+from .metrics import DECODE_SOURCE_PIXELS
 
 TILE_SIZE = settings.tile_size
+
+
+class OverviewTooLarge(RuntimeError):
+    """Raised when an overview decode would exceed the configured pixel budget."""
+
+    def __init__(
+        self,
+        *,
+        z: int,
+        x: int,
+        y: int,
+        best_level: int,
+        level_downsample: float,
+        read_width: int,
+        read_height: int,
+        requested_pixels: int,
+    ) -> None:
+        self.z = z
+        self.x = x
+        self.y = y
+        self.best_level = best_level
+        self.level_downsample = level_downsample
+        self.read_width = read_width
+        self.read_height = read_height
+        self.requested_pixels = requested_pixels
+        self.max_decode_pixels = settings.max_decode_pixels
+        super().__init__(
+            "overview decode requires preprocessing "
+            f"(z={z} x={x} y={y} level={best_level} "
+            f"read={read_width}x{read_height} pixels={requested_pixels} "
+            f"limit={self.max_decode_pixels})"
+        )
+
+
+@dataclass(frozen=True)
+class DecodePlan:
+    z: int
+    x: int
+    y: int
+    x0: int
+    y0: int
+    out_width: int
+    out_height: int
+    best_level: int
+    level_downsample: float
+    read_width: int
+    read_height: int
+    requested_pixels: int
 
 
 def max_zoom(slide: TiffSlide) -> int:
@@ -97,39 +147,103 @@ def _resize_and_pad(region: Image.Image, out_w: int, out_h: int) -> Image.Image:
     return region
 
 
+def _plan_decode(slide: TiffSlide, z: int, x: int, y: int) -> DecodePlan:
+    _, target_ds, x0, y0, src_w, src_h, out_w, out_h = _tile_geometry(slide, z, x, y)
+
+    best_level = slide.get_best_level_for_downsample(target_ds)
+    level_ds = slide.level_downsamples[best_level]
+
+    read_w = math.ceil(src_w / level_ds)
+    read_h = math.ceil(src_h / level_ds)
+
+    level_w, level_h = slide.level_dimensions[best_level]
+    read_w = min(read_w, level_w - math.floor(x0 / level_ds))
+    read_h = min(read_h, level_h - math.floor(y0 / level_ds))
+
+    if read_w <= 0 or read_h <= 0:
+        return DecodePlan(
+            z=z,
+            x=x,
+            y=y,
+            x0=x0,
+            y0=y0,
+            out_width=out_w,
+            out_height=out_h,
+            best_level=best_level,
+            level_downsample=level_ds,
+            read_width=0,
+            read_height=0,
+            requested_pixels=0,
+        )
+
+    requested_pixels = read_w * read_h
+    if requested_pixels > settings.max_decode_pixels:
+        raise OverviewTooLarge(
+            z=z,
+            x=x,
+            y=y,
+            best_level=best_level,
+            level_downsample=level_ds,
+            read_width=read_w,
+            read_height=read_h,
+            requested_pixels=requested_pixels,
+        )
+
+    return DecodePlan(
+        z=z,
+        x=x,
+        y=y,
+        x0=x0,
+        y0=y0,
+        out_width=out_w,
+        out_height=out_h,
+        best_level=best_level,
+        level_downsample=level_ds,
+        read_width=read_w,
+        read_height=read_h,
+        requested_pixels=requested_pixels,
+    )
+
+
+def render_tile_image(slide: TiffSlide, z: int, x: int, y: int) -> tuple[Image.Image, DecodePlan]:
+    plan = _plan_decode(slide, z, x, y)
+    DECODE_SOURCE_PIXELS.observe(plan.requested_pixels)
+    if plan.read_width <= 0 or plan.read_height <= 0:
+        return Image.new("RGB", (TILE_SIZE, TILE_SIZE), (255, 255, 255)), plan
+
+    region = slide.read_region((plan.x0, plan.y0), plan.best_level, (plan.read_width, plan.read_height))
+    region = region.convert("RGB")
+    return _resize_and_pad(region, plan.out_width, plan.out_height), plan
+
+
+def render_overview_image(slide: TiffSlide) -> tuple[Image.Image, DecodePlan]:
+    plan = _plan_decode(slide, 0, 0, 0)
+    DECODE_SOURCE_PIXELS.observe(plan.requested_pixels)
+    if plan.read_width <= 0 or plan.read_height <= 0:
+        return Image.new("RGB", (1, 1), (255, 255, 255)), plan
+
+    region = slide.read_region((plan.x0, plan.y0), plan.best_level, (plan.read_width, plan.read_height))
+    region = region.convert("RGB")
+    if region.size != (plan.out_width, plan.out_height):
+        region = region.resize((plan.out_width, plan.out_height), Image.LANCZOS)
+    return region, plan
+
+
 def get_tile_bytes(slide: TiffSlide, z: int, x: int, y: int) -> bytes:
     """
     Extract tile (x, y) at zoom level z and return JPEG bytes.
 
     Raises ValueError for out-of-range coordinates.
     """
-    _, target_ds, x0, y0, src_w, src_h, out_w, out_h = _tile_geometry(slide, z, x, y)
-
-    # Best available pyramid level (largest ds that doesn't exceed target)
-    best_level = slide.get_best_level_for_downsample(target_ds)
-    level_ds = slide.level_downsamples[best_level]
-
-    # How many pixels to read from best_level to cover src region
-    read_w = math.ceil(src_w / level_ds)
-    read_h = math.ceil(src_h / level_ds)
-
-    # Clamp to available pixels at this level
-    level_w, level_h = slide.level_dimensions[best_level]
-    read_w = min(read_w, level_w - math.floor(x0 / level_ds))
-    read_h = min(read_h, level_h - math.floor(y0 / level_ds))
-
-    if read_w <= 0 or read_h <= 0:
-        return _blank_tile()
-
-    # read_region returns RGBA; convert to RGB
-    region = slide.read_region((x0, y0), best_level, (read_w, read_h))
-    region = region.convert("RGB")
-    return _encode_jpeg(_resize_and_pad(region, out_w, out_h))
+    image, _ = render_tile_image(slide, z, x, y)
+    return _encode_jpeg(image)
 
 
 def get_thumbnail_bytes(slide: TiffSlide, width: int, height: int) -> bytes:
-    thumb = slide.get_thumbnail((width, height))
-    return _encode_jpeg(thumb.convert("RGB"))
+    image, _ = render_overview_image(slide)
+    image = image.copy()
+    image.thumbnail((width, height), Image.Resampling.LANCZOS)
+    return _encode_jpeg(image)
 
 
 def _blank_tile() -> bytes:

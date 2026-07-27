@@ -49,16 +49,7 @@ def run_smoke(host: str, patient_id: str, slide_id: str) -> bool:
         print(f"    n_workers = {data.get('n_workers')}")
     passed += int(ok); failed += int(not ok)
 
-    # 2. Patient hierarchy (Databricks connectivity)
-    resp = s.get(f"{host}/patient/{patient_id}")
-    ok = check(f"/patient/{patient_id}", resp)
-    if ok:
-        hierarchy = resp.json()
-        n_samples = len(hierarchy.get("samples", []))
-        print(f"    {n_samples} sample(s)")
-    passed += int(ok); failed += int(not ok)
-
-    # 3. Slide metadata (S3 + TiffSlide open)
+    # 2. Slide metadata (S3 + TiffSlide open)
     resp = s.get(f"{host}/tiles/{slide_id}/metadata")
     ok = check(f"/tiles/{slide_id}/metadata", resp)
     meta = None
@@ -69,12 +60,12 @@ def run_smoke(host: str, patient_id: str, slide_id: str) -> bool:
               f"max_zoom={meta.get('max_zoom')}  levels={meta.get('levels')}")
     passed += int(ok); failed += int(not ok)
 
-    # 4. Thumbnail
+    # 3. Thumbnail
     resp = s.get(f"{host}/tiles/{slide_id}/thumbnail?width=256&height=256")
     ok = check(f"/tiles/{slide_id}/thumbnail", resp) and resp.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
-    # 5. Tiles: z=0 (overview), z=1, and highest zoom if available
+    # 4. Tiles: z=0 (overview), z=1, and highest zoom if available
     test_zooms = [0, 1]
     if meta:
         mz = meta.get("max_zoom", 0)
@@ -85,7 +76,7 @@ def run_smoke(host: str, patient_id: str, slide_id: str) -> bool:
         ok = check(f"/tiles/{slide_id}/zxy/{z}/0/0", resp) and resp.headers.get("content-type", "").startswith("image/")
         passed += int(ok); failed += int(not ok)
 
-    # 6. Cache hit — second tile request should be faster (served from Redis)
+    # 5. Cache hit — second tile request should be faster (served from Redis)
     t0 = time.monotonic()
     resp2 = s.get(f"{host}/tiles/{slide_id}/zxy/0/0/0")
     elapsed2 = (time.monotonic() - t0) * 1000
@@ -94,7 +85,7 @@ def run_smoke(host: str, patient_id: str, slide_id: str) -> bool:
           f"HTTP {resp2.status_code}  ({elapsed2:.0f} ms)")
     passed += int(ok); failed += int(not ok)
 
-    # 7. Search endpoint
+    # 6. Search endpoint
     q = patient_id[:4]  # first 4 chars as search query
     resp = s.get(f"{host}/search?q={q}")
     ok = check(f"/search?q={q}", resp)

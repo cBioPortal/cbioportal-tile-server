@@ -4,14 +4,16 @@ Generate a local .env file for docker-compose from machine credentials.
 
 Reads:
   ~/.aws/credentials  [ecs] section — Dell ECS S3 keys for IMPACT slides
-  ~/.databrickscfg    [DEFAULT]     — Databricks PAT
+  ~/.databrickscfg    selected profile metadata (prefers __settings__.default_profile)
 
 Usage:
   python3 tools/write_dev_env.py > .env
   docker compose up --build
 """
 import configparser
+import json
 import os
+import subprocess
 import sys
 
 
@@ -23,6 +25,38 @@ def _section(cfg: configparser.ConfigParser, section: str) -> configparser.Secti
     return {}
 
 
+def _preferred_databricks_profile(cfg: configparser.ConfigParser) -> str:
+    env_profile = os.environ.get("DATABRICKS_CONFIG_PROFILE", "").strip()
+    if env_profile:
+        return env_profile
+
+    settings = _section(cfg, "__settings__")
+    default_profile = str(settings.get("default_profile", "")).strip()
+    if default_profile:
+        return default_profile
+
+    return "DEFAULT"
+
+
+def _mint_databricks_cli_token(profile_name: str) -> str:
+    try:
+        proc = subprocess.run(
+            ["databricks", "auth", "token", "--profile", profile_name, "--output", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return ""
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return ""
+
+    return str(payload.get("access_token", "")).strip()
+
+
 def main() -> None:
     aws = configparser.ConfigParser()
     aws.read(os.path.expanduser("~/.aws/credentials"))
@@ -32,13 +66,27 @@ def main() -> None:
 
     ecs = aws["ecs"] if aws.has_section("ecs") else {}
 
-    dbc_def = dict(dbc.defaults())
+    profile_name = _preferred_databricks_profile(dbc)
+    dbc_profile = _section(dbc, profile_name)
 
-    host = dbc_def.get("host", "")
-    token = dbc_def.get("token", "")
-    if not host or not token:
-        print("WARNING: ~/.databrickscfg DEFAULT profile missing host or token",
-              file=sys.stderr)
+    host = str(dbc_profile.get("host", "")).strip()
+    token = str(dbc_profile.get("token", "")).strip()
+    auth_type = str(dbc_profile.get("auth_type", "")).strip()
+
+    if auth_type == "databricks-cli":
+        token = _mint_databricks_cli_token(profile_name) or token
+
+    if not host:
+        print(
+            f"WARNING: ~/.databrickscfg profile '{profile_name}' missing host",
+            file=sys.stderr,
+        )
+
+    if not token and auth_type not in {"databricks-cli", "env-oidc", "github-oidc", "azure-cli"}:
+        print(
+            f"WARNING: ~/.databrickscfg profile '{profile_name}' missing token",
+            file=sys.stderr,
+        )
 
     if not ecs.get("aws_access_key_id"):
         print("WARNING: no [ecs] section found in ~/.aws/credentials",
@@ -54,20 +102,23 @@ def main() -> None:
         "",
         "# ── Databricks ────────────────────────────────────────────────────",
         f"DATABRICKS_HOST={host}",
+        f"DATABRICKS_CONFIG_PROFILE={profile_name}",
+        f"DATABRICKS_AUTH_TYPE={auth_type}",
         f"DATABRICKS_TOKEN={token}",
         "DATABRICKS_WAREHOUSE_ID=0b49b7d78734ad5c",
         "",
         "# ── Local dev overrides ───────────────────────────────────────────",
-        "PATIENT_CACHE_TTL=60",
         "MAX_OPEN_SLIDES=8",
         "REDIS_MAXMEMORY=256mb",
         "APP_MEMORY_LIMIT=4g",
         "CORS_ORIGINS=http://localhost:8080,http://localhost:3000",
-        "SERVER_PORT=8080",
+        "SERVER_PORT=8081",
+        "WSI_AUTH_REQUIRED=false",
+        f"WSI_AUTH_SECRET={os.environ.get('WSI_AUTH_SECRET', 'local-dev-wsi-secret')}",
+        f"REDIS_PASSWORD={os.environ.get('REDIS_PASSWORD', 'local-dev-redis-password')}",
     ]
     print("\n".join(lines))
 
 
 if __name__ == "__main__":
     main()
-
