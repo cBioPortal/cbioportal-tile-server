@@ -132,6 +132,26 @@ app.add_middleware(
 
 
 @app.middleware("http")
+async def limit_expensive_requests(request: Request, call_next):
+    path = request.scope["path"]
+    if (
+        settings.wsi_auth_required
+        and path.startswith(EXPENSIVE_PATH_PREFIXES)
+        and (payload := getattr(request.state, "wsi_token_payload", None)) is not None
+        and not rate_limiter.allow(
+            payload["sub"],
+            settings.rate_limit_per_minute,
+        )
+    ):
+        return Response(
+            status_code=429,
+            headers={"Retry-After": "60"},
+            content="Rate limit exceeded",
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
     """Require a cBioPortal-issued capability for every non-health API request."""
     if request.scope["path"] in ("/health", "/wsi/health"):
@@ -143,7 +163,7 @@ async def require_wsi_capability(request: Request, call_next):
     if not authorization.startswith("Bearer "):
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
     try:
-        validate_wsi_token(
+        request.state.wsi_token_payload = validate_wsi_token(
             authorization[7:].strip(),
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
@@ -151,25 +171,6 @@ async def require_wsi_capability(request: Request, call_next):
         )
     except InvalidWsiToken:
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def limit_expensive_requests(request: Request, call_next):
-    path = request.scope["path"]
-    if (
-        settings.wsi_auth_required
-        and path.startswith(EXPENSIVE_PATH_PREFIXES)
-        and not rate_limiter.allow(
-            request.client.host if request.client else "unknown",
-            settings.rate_limit_per_minute,
-        )
-    ):
-        return Response(
-            status_code=429,
-            headers={"Retry-After": "60"},
-            content="Rate limit exceeded",
-        )
     return await call_next(request)
 
 

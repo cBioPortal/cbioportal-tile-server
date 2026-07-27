@@ -1,6 +1,7 @@
 """Tests for FastAPI HTTP routes (app/main.py)."""
 
 from io import BytesIO
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ import app.meta as meta_module
 from app.config import settings
 from app.rate_limit import RequestRateLimiter
 from app.tiles import TILE_SIZE
+from tests.test_auth import make_token
 from tests.conftest import make_mock_slide
 
 
@@ -104,14 +106,54 @@ class TestHealth:
         assert api_client.get("/health").status_code == 200
         assert api_client.get("/health").status_code == 200
 
-    def test_expensive_requests_are_rate_limited(self, api_client, monkeypatch):
+    def test_unauthenticated_expensive_requests_do_not_consume_quota(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
         monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
         monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
         assert api_client.get("/search?q=P-1").status_code == 401
         limited = api_client.get("/search?q=P-2")
+        assert limited.status_code == 401
+
+    def test_expensive_requests_are_rate_limited_per_subject(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
+        monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
+        monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
+
+        now = int(time.time())
+        alice = make_token(
+            settings.wsi_auth_secret,
+            sub="alice@example.org",
+            aud=settings.wsi_auth_audience,
+            scope="wsi:read",
+            iat=now,
+            exp=now + settings.wsi_auth_max_ttl,
+        )
+        bob = make_token(
+            settings.wsi_auth_secret,
+            sub="bob@example.org",
+            aud=settings.wsi_auth_audience,
+            scope="wsi:read",
+            iat=now,
+            exp=now + settings.wsi_auth_max_ttl,
+        )
+
+        with patch.object(main_module, "search_suggestions", return_value=[]):
+            allowed = api_client.get(
+                "/search?q=P-1", headers={"Authorization": f"Bearer {alice}"}
+            )
+            limited = api_client.get(
+                "/search?q=P-2", headers={"Authorization": f"Bearer {alice}"}
+            )
+            other_subject = api_client.get(
+                "/search?q=P-3", headers={"Authorization": f"Bearer {bob}"}
+            )
+
+        assert allowed.status_code == 200
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
+        assert other_subject.status_code == 200
 
 
 # ---------------------------------------------------------------------------

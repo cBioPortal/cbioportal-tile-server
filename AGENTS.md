@@ -9,11 +9,11 @@ Use `uv` for local Python workflows.
 ```bash
 uv sync --dev
 uv run pytest
-python3 tools/write_dev_env.py > .env
+python3 tools/write_dev_env.py
 docker compose up --build
 ```
 
-`uv sync --dev` installs runtime and test dependencies. `uv run pytest` runs the full test suite. `python3 tools/write_dev_env.py > .env` populates local credentials for Docker-based development. `docker compose up --build` starts the tile server and Redis locally on port `8080`.
+`uv sync --dev` installs runtime and test dependencies. `uv run pytest` runs the full test suite. `python3 tools/write_dev_env.py` securely writes the local `.env` file for Docker-based development. `docker compose up --build` starts the tile server and Redis locally on port `8080`.
 
 ## Coding Style & Naming Conventions
 Target Python 3.11+ and follow the existing style: 4-space indentation, explicit type hints where useful, small focused functions, and module-level constants in `UPPER_SNAKE_CASE`. Use `snake_case` for functions, variables, and test names. Preserve the current FastAPI pattern of thin route handlers delegating to service modules. No formatter or linter is configured in-repo, so match surrounding code closely and keep imports and logging tidy.
