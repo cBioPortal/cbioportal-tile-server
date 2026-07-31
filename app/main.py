@@ -39,6 +39,7 @@ from .metrics import (
 )
 from .meta import get_patient_hierarchy, get_slide_dbmeta, search_suggestions
 from .rate_limit import EXPENSIVE_PATH_PREFIXES, rate_limiter
+from .resource_index import ResourceIndexUnavailable, get_resource_index
 from .slides import SlideCache
 from .tiles import OverviewTooLarge, get_thumbnail_bytes, get_tile_bytes, render_tile_image, slide_metadata
 
@@ -163,7 +164,7 @@ async def require_wsi_capability(request: Request, call_next):
     if not authorization.startswith("Bearer "):
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
     try:
-        request.state.wsi_token_payload = validate_wsi_token(
+        claims = validate_wsi_token(
             authorization[7:].strip(),
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
@@ -171,6 +172,8 @@ async def require_wsi_capability(request: Request, call_next):
         )
     except InvalidWsiToken:
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    request.state.wsi_token_payload = claims
+    request.state.wsi_claims = claims
     return await call_next(request)
 
 
@@ -182,10 +185,10 @@ async def wsi_namespace(request, call_next):
         request.scope["path"] = path[4:] or "/"
     return await call_next(request)
 
-TILE_CACHE_HEADERS  = {"Cache-Control": "private, max-age=3600"}
-THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300"}
+TILE_CACHE_HEADERS  = {"Cache-Control": "private, max-age=3600", "Vary": "Authorization"}
+THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
 # Metadata and search responses contain patient/slide information.
-PHI_CACHE_HEADERS   = {"Cache-Control": "private, no-store"}
+PHI_CACHE_HEADERS   = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
 
 
 async def _in_thread(fn, *args):
@@ -239,6 +242,45 @@ def _get_slide(image_id: str):
         raise HTTPException(status_code=500, detail="Failed to open slide")
 
 
+def _authorize_resource(request: Request, resource_type: str, resource_id: str) -> str | None:
+    """Bind a protected resource to the study in the validated capability."""
+    if not settings.wsi_auth_required:
+        return None
+
+    claims = getattr(request.state, "wsi_claims", None)
+    if not claims:
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    study_id = claims["study_id"]
+    requested_study = request.query_params.get("studyId")
+    if requested_study is not None and requested_study != study_id:
+        raise HTTPException(status_code=403, detail="study does not match capability")
+
+    try:
+        index = get_resource_index(settings.wsi_resource_index_file)
+        allowed = index.contains(study_id, resource_type, str(resource_id))
+    except ResourceIndexUnavailable:
+        logger.error("WSI resource index is unavailable; refusing protected resource")
+        raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
+    if not allowed:
+        raise HTTPException(status_code=403, detail="resource is outside capability study")
+    return study_id
+
+
+def _filter_search_results(request: Request, results: list[dict]) -> list[dict]:
+    if not settings.wsi_auth_required:
+        return results
+    claims = getattr(request.state, "wsi_claims", None)
+    if not claims:
+        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    try:
+        return get_resource_index(settings.wsi_resource_index_file).filter_search(
+            claims["study_id"], results
+        )
+    except ResourceIndexUnavailable:
+        logger.error("WSI resource index is unavailable; refusing protected search")
+        raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -248,41 +290,56 @@ def health():
     return {"status": "ok", "n_workers": settings.n_workers}
 
 
-@app.get("/metrics", include_in_schema=False)
-def metrics():
-    payload, content_type = metrics_payload()
-    return Response(content=payload, media_type=content_type)
+async def _patient_hierarchy(request: Request, patient_id: str, bootstrap: bool) -> Response:
+    study_id = _authorize_resource(request, "patients", patient_id)
+    if study_id is None:
+        study_id = request.query_params.get("studyId")
 
+    # The local snapshot runner installs this immutable fixture on app.state;
+    # production uses the Databricks materialized hierarchy.
+    snapshot = getattr(app.state, "wsi_snapshot_hierarchies", {})
+    hierarchy = snapshot.get(study_id, {}).get(patient_id) if study_id else None
+    if hierarchy is None:
+        try:
+            hierarchy = await _in_thread(
+                get_patient_hierarchy,
+                patient_id,
+                settings.databricks_warehouse_id,
+            )
+        except Exception:
+            logger.exception("Patient hierarchy query failed for %s", patient_id)
+            raise HTTPException(status_code=502, detail="Patient hierarchy query failed")
+    if hierarchy is None:
+        raise HTTPException(status_code=404, detail="Patient hierarchy not found")
 
-@app.get("/patient/{patient_id}")
-async def patient_hierarchy(patient_id: str):
-    """Return the Databricks-backed patient slide hierarchy."""
-    try:
-        result = await _in_thread(
-            get_patient_hierarchy,
-            patient_id,
-            settings.databricks_warehouse_id,
-        )
-    except Exception:
-        logger.exception("Databricks query failed for patient %s", patient_id)
-        raise HTTPException(status_code=502, detail="Metadata query failed")
-
-    if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient not found in slide inventory",
-        )
-
+    payload = {"hierarchy": hierarchy, "initial": None} if bootstrap else hierarchy
     return Response(
-        content=json.dumps(result),
+        content=json.dumps(payload, separators=(",", ":")),
         media_type="application/json",
         headers=PHI_CACHE_HEADERS,
     )
 
 
+@app.get("/patient/{patient_id}", include_in_schema=False)
+async def patient_hierarchy(request: Request, patient_id: str) -> Response:
+    return await _patient_hierarchy(request, patient_id, bootstrap=False)
+
+
+@app.get("/patient/{patient_id}/bootstrap", include_in_schema=False)
+async def patient_hierarchy_bootstrap(request: Request, patient_id: str) -> Response:
+    return await _patient_hierarchy(request, patient_id, bootstrap=True)
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    payload, content_type = metrics_payload()
+    return Response(content=payload, media_type=content_type, headers=PHI_CACHE_HEADERS)
+
+
 @app.get("/slides/{image_id}/dbmeta")
-async def slide_dbmeta(image_id: str):
+async def slide_dbmeta(request: Request, image_id: str):
     """Return the raw Databricks metadata row for a single slide (by numeric image_id)."""
+    _authorize_resource(request, "slides", image_id)
     try:
         result = await _in_thread(
             get_slide_dbmeta,
@@ -300,7 +357,7 @@ async def slide_dbmeta(image_id: str):
 
 
 @app.get("/search")
-async def search(q: str = ""):
+async def search(request: Request, q: str = ""):
     """
     Autocomplete suggestions for the search bar.
 
@@ -310,12 +367,12 @@ async def search(q: str = ""):
     """
     q = q.strip()
     if len(q) < 2:
-        return []
+        return Response(content="[]", media_type="application/json", headers=PHI_CACHE_HEADERS)
 
     cache_key = f"search:{q.lower()}"
     cached = await tile_cache.get_raw(cache_key)
     if cached is not None:
-        return Response(content=json.dumps(cached, default=str),
+        return Response(content=json.dumps(_filter_search_results(request, cached), default=str),
                         media_type="application/json", headers=PHI_CACHE_HEADERS)
 
     try:
@@ -329,12 +386,13 @@ async def search(q: str = ""):
         raise HTTPException(status_code=502, detail="Search query failed")
 
     await tile_cache.set_raw(cache_key, results, ttl=300)
-    return Response(content=json.dumps(results, default=str),
+    return Response(content=json.dumps(_filter_search_results(request, results), default=str),
                     media_type="application/json", headers=PHI_CACHE_HEADERS)
 
 
 @app.get("/tiles/{slide_id}/metadata")
-async def metadata(slide_id: str):
+async def metadata(request: Request, slide_id: str):
+    _authorize_resource(request, "slides", slide_id)
     cached = await tile_cache.get_metadata(slide_id)
     if cached is not None:
         return Response(content=json.dumps(cached), media_type="application/json",
@@ -347,8 +405,9 @@ async def metadata(slide_id: str):
 
 
 @app.get("/tiles/{slide_id}/warmup", include_in_schema=False)
-async def warmup(slide_id: str):
+async def warmup(request: Request, slide_id: str):
     """Fetch and discard the overview tile to prime the TiffSlide cache on this worker."""
+    _authorize_resource(request, "slides", slide_id)
     try:
         slide = await _run_image_operation(_get_slide, slide_id)
         image, _ = await _run_image_operation(render_tile_image, slide, 0, 0, 0)
@@ -365,15 +424,21 @@ async def warmup(slide_id: str):
         )
     except Exception:
         pass
-    return {"status": "ok"}
+    return Response(
+        content=json.dumps({"status": "ok"}),
+        media_type="application/json",
+        headers=PHI_CACHE_HEADERS,
+    )
 
 
 @app.get("/tiles/{slide_id}/thumbnail")
 async def thumbnail(
+    request: Request,
     slide_id: str,
     width: int = 256,
     height: int = 256,
 ):
+    _authorize_resource(request, "slides", slide_id)
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
 
@@ -410,7 +475,8 @@ async def thumbnail(
 
 
 @app.get("/tiles/{slide_id}/zxy/{z}/{x}/{y}")
-async def tile(slide_id: str, z: int, x: int, y: int):
+async def tile(request: Request, slide_id: str, z: int, x: int, y: int):
+    _authorize_resource(request, "slides", slide_id)
     cached = await tile_cache.get_tile(slide_id, z, x, y)
     if cached:
         return Response(content=cached, media_type="image/jpeg",

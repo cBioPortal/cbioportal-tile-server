@@ -14,6 +14,8 @@ OpenSeadragon via ZXY tile requests.  Used as the backend for the cBioPortal H&E
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
 | GET | `/tiles/{slide_id}/thumbnail` | JPEG thumbnail |
 | GET | `/tiles/{slide_id}/zxy/{z}/{x}/{y}` | ZXY tile (JPEG) |
+| GET | `/patient/{patient_id}` | Study-bound patient hierarchy |
+| GET | `/patient/{patient_id}/bootstrap` | Study-bound hierarchy bootstrap |
 
 The same endpoints are also available under the explicit `/wsi` namespace,
 for example `/wsi/tiles/{slide_id}/...`.
@@ -25,10 +27,11 @@ capability in the header:
 Authorization: Bearer <token>
 ```
 
-The token must be an HMAC-SHA256 JWT with the configured audience, the
-`wsi:read` scope, a non-empty subject, and valid `iat`/`exp` claims. The
-`/wsi/health` alias is also unauthenticated for probes. Do not disable this
-check in production.
+The token must be an HMAC-SHA256 JWT with the configured audience,
+`scope=wsi:read`, a non-empty subject, `study_id`, `wsi_auth_version=1`, and
+valid `iat`/`exp` claims whose lifetime does not exceed `WSI_AUTH_MAX_TTL`.
+The `/wsi/health` alias is also unauthenticated for probes. Do not disable
+this check in production.
 
 ## Quick start
 
@@ -54,6 +57,7 @@ All settings are environment variables (see `app/config.py`):
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability-token audience |
 | `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for non-health routes |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum WSI token lifetime in seconds |
+| `WSI_RESOURCE_INDEX_FILE` | — | Loader-published version-1 study/resource binding; required when auth is enabled |
 | `TILE_SIZE` | `256` | Tile edge length in pixels |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `4194304` | Maximum source pixels a single on-demand decode may read before the request is rejected |
@@ -80,6 +84,33 @@ If a slide lacks a sufficiently downsampled overview pyramid, thumbnail and
 overview-tile requests now return HTTP `422` with
 `{"error":"overview_requires_preprocessing"}` instead of attempting a
 memory-unsafe full-slide decode.
+
+## Study isolation contract
+
+Authenticated production mode (`WSI_AUTH_REQUIRED=true`) authorizes every
+protected resource against
+the `WSI_RESOURCE_INDEX_FILE` produced from the materialized hierarchy
+snapshot. The token's `study_id` is authoritative. A `studyId` query parameter
+may be supplied by the frontend only as a consistency check and is never
+trusted on its own.
+
+The mapping is required for patient hierarchy requests, slide metadata,
+thumbnails, tiles, warmup, raw `/slides/{id}/dbmeta`, and `/search`. A token
+for study A must return `403` for a patient or slide bound only to study B;
+missing or invalid capabilities return `401`. A missing or invalid trusted
+index fails closed with `503` rather than treating an authorization failure as
+an empty hierarchy. Search results are filtered to the token study.
+Resource identifiers must be unambiguous across studies in the published
+index; ambiguous patient, sample, or slide identifiers fail closed rather than
+being served through an ID-only metadata query.
+
+The cBioPortal backend and this service must use the same secret bytes,
+audience (`cbioportal-wsi`), and compatible TTL (`300` seconds from the
+backend, no more than `WSI_AUTH_MAX_TTL`). Protected responses use private
+cache headers; Redis and an HTTP cache are never authorization boundaries.
+
+Unauthenticated local/development mode (`WSI_AUTH_REQUIRED=false`) is retained
+for public fixtures only. It must not be used for private-study deployment.
 
 ## Local file-backed test slides
 

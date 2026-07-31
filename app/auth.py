@@ -23,6 +23,8 @@ def validate_wsi_token(
 ) -> dict:
     if not secret or len(secret.encode()) < 32:
         raise InvalidWsiToken("WSI authentication is not configured")
+    if not audience or not audience.strip() or max_ttl < 1:
+        raise InvalidWsiToken("WSI authentication is not configured")
 
     parts = token.split(".")
     if len(parts) != 3:
@@ -34,7 +36,6 @@ def validate_wsi_token(
         payload = json.loads(_b64decode(encoded_payload))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InvalidWsiToken("invalid token payload") from exc
-
     if not isinstance(header, dict) or not isinstance(payload, dict):
         raise InvalidWsiToken("invalid token structure")
 
@@ -54,11 +55,15 @@ def validate_wsi_token(
         raise InvalidWsiToken("invalid token audience or scope")
     if not isinstance(payload.get("sub"), str) or not payload["sub"]:
         raise InvalidWsiToken("invalid token subject")
-    if not isinstance(payload.get("exp"), int) or payload["exp"] <= now:
+    if not isinstance(payload.get("study_id"), str) or not payload["study_id"].strip():
+        raise InvalidWsiToken("invalid token study")
+    if type(payload.get("wsi_auth_version")) is not int or payload["wsi_auth_version"] != 1:
+        raise InvalidWsiToken("unsupported WSI authorization contract")
+    if type(payload.get("exp")) is not int or payload["exp"] <= now:
         raise InvalidWsiToken("expired token")
-    if not isinstance(payload.get("iat"), int) or payload["iat"] > now + 60:
+    if type(payload.get("iat")) is not int or payload["iat"] > now + 60:
         raise InvalidWsiToken("invalid token issued-at")
-    if max_ttl <= 0 or payload["exp"] - payload["iat"] > max_ttl:
-        raise InvalidWsiToken("token lifetime exceeds maximum")
+    if payload["exp"] <= payload["iat"] or payload["exp"] - payload["iat"] > max_ttl:
+        raise InvalidWsiToken("token lifetime exceeds configured maximum")
 
     return payload
