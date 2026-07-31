@@ -75,6 +75,14 @@ class TestOtherSettings:
         s = make_settings()
         assert s.metadata_cache_ttl == 86_400
 
+    def test_wsi_auth_max_ttl_reads_environment(self):
+        s = make_settings(WSI_AUTH_MAX_TTL="600")
+        assert s.wsi_auth_max_ttl == 600
+
+    def test_wsi_resource_index_file_reads_environment(self):
+        s = make_settings(WSI_RESOURCE_INDEX_FILE="/var/lib/wsi/index.json")
+        assert s.wsi_resource_index_file == "/var/lib/wsi/index.json"
+
     def test_max_image_operations_default(self):
         s = make_settings()
         assert s.max_image_operations == 2

@@ -9,12 +9,8 @@ import os
 from pathlib import Path
 
 import uvicorn
-from fastapi import HTTPException, Query
-from fastapi.responses import Response
 
-from app.main import PHI_CACHE_HEADERS, app
-from app.meta import get_patient_hierarchy
-from app.config import settings
+from app.main import app
 
 
 def _load_snapshot(path: Path) -> dict[str, dict[str, dict]]:
@@ -48,32 +44,7 @@ def main() -> int:
     if args.snapshot:
         snapshot = Path(args.snapshot).expanduser().resolve()
         hierarchy_by_study = _load_snapshot(snapshot)
-
-    @app.get("/patient/{patient_id}", include_in_schema=False)
-    async def patient_hierarchy(patient_id: str, studyId: str = Query(...)) -> Response:  # noqa: N803
-        hierarchy = hierarchy_by_study.get(studyId, {}).get(patient_id)
-        if hierarchy is None:
-            hierarchy = get_patient_hierarchy(patient_id, settings.databricks_warehouse_id)
-        if hierarchy is None:
-            raise HTTPException(status_code=404, detail="Patient hierarchy not found")
-        return Response(
-            content=json.dumps(hierarchy, separators=(",", ":")),
-            media_type="application/json",
-            headers=PHI_CACHE_HEADERS,
-        )
-
-    @app.get("/patient/{patient_id}/bootstrap", include_in_schema=False)
-    async def patient_hierarchy_bootstrap(patient_id: str, studyId: str = Query(...)) -> Response:  # noqa: N803
-        hierarchy = hierarchy_by_study.get(studyId, {}).get(patient_id)
-        if hierarchy is None:
-            hierarchy = get_patient_hierarchy(patient_id, settings.databricks_warehouse_id)
-        if hierarchy is None:
-            raise HTTPException(status_code=404, detail="Patient hierarchy not found")
-        return Response(
-            content=json.dumps({"hierarchy": hierarchy, "initial": None}, separators=(",", ":")),
-            media_type="application/json",
-            headers=PHI_CACHE_HEADERS,
-        )
+    app.state.wsi_snapshot_hierarchies = hierarchy_by_study
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0

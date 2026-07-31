@@ -1,5 +1,10 @@
 """Tests for FastAPI HTTP routes (app/main.py)."""
 
+import base64
+import hashlib
+import hmac
+import json
+import time
 from io import BytesIO
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,6 +21,59 @@ from app.rate_limit import RequestRateLimiter
 from app.tiles import TILE_SIZE
 from tests.test_auth import make_token
 from tests.conftest import make_mock_slide
+
+
+def make_wsi_token(secret: str, study_id: str, **overrides) -> str:
+    def encode(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    now = int(time.time())
+    claims = {
+        "sub": "wsi-test-user",
+        "aud": "cbioportal-wsi",
+        "scope": "wsi:read",
+        "study_id": study_id,
+        "wsi_auth_version": 1,
+        "iat": now,
+        "exp": now + 300,
+    }
+    claims.update(overrides)
+    header = encode({"alg": "HS256", "typ": "JWT"})
+    payload = encode(claims)
+    signature = base64.urlsafe_b64encode(
+        hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    ).rstrip(b"=").decode()
+    return f"{header}.{payload}.{signature}"
+
+
+def configure_resource_auth(monkeypatch, tmp_path):
+    secret = "wsi-test-secret-0123456789abcdef"
+    resource_index = tmp_path / "wsi-resource-index.json"
+    resource_index.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "studies": {
+                    "study-a": {
+                        "patients": ["patient-a"],
+                        "samples": ["sample-a"],
+                        "slides": ["1492807"],
+                    },
+                    "study-b": {
+                        "patients": ["patient-b"],
+                        "samples": ["sample-b"],
+                        "slides": ["2492807"],
+                    },
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(settings, "wsi_auth_required", True)
+    monkeypatch.setattr(settings, "wsi_auth_secret", secret)
+    monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+    monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+    monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
+    return secret
 
 
 @pytest.fixture(autouse=False)
@@ -115,26 +173,29 @@ class TestHealth:
         limited = api_client.get("/search?q=P-2")
         assert limited.status_code == 401
 
-    def test_expensive_requests_are_rate_limited_per_subject(self, api_client, monkeypatch):
-        monkeypatch.setattr(settings, "wsi_auth_required", True)
-        monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
+    def test_expensive_requests_are_rate_limited_per_subject(self, api_client, monkeypatch, tmp_path):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
         monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
         monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
 
         now = int(time.time())
         alice = make_token(
-            settings.wsi_auth_secret,
+            secret,
             sub="alice@example.org",
             aud=settings.wsi_auth_audience,
             scope="wsi:read",
+            study_id="study-a",
+            wsi_auth_version=1,
             iat=now,
             exp=now + settings.wsi_auth_max_ttl,
         )
         bob = make_token(
-            settings.wsi_auth_secret,
+            secret,
             sub="bob@example.org",
             aud=settings.wsi_auth_audience,
             scope="wsi:read",
+            study_id="study-a",
+            wsi_auth_version=1,
             iat=now,
             exp=now + settings.wsi_auth_max_ttl,
         )
@@ -154,6 +215,105 @@ class TestHealth:
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
         assert other_subject.status_code == 200
+    def test_study_capability_binds_slide_resources(self, api_client, monkeypatch, tmp_path):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        token_a = make_wsi_token(secret, "study-a")
+
+        allowed = api_client.get(
+            "/tiles/1492807/metadata", headers={"Authorization": f"Bearer {token_a}"}
+        )
+        denied = api_client.get(
+            "/tiles/2492807/metadata", headers={"Authorization": f"Bearer {token_a}"}
+        )
+        mismatched_query = api_client.get(
+            "/tiles/1492807/metadata?studyId=study-b",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+
+        assert allowed.status_code == 200
+        assert denied.status_code == 403
+        assert mismatched_query.status_code == 403
+        assert "private" in allowed.headers["cache-control"]
+        assert "public" not in allowed.headers["cache-control"]
+
+    def test_missing_resource_index_fails_closed(self, api_client, monkeypatch):
+        secret = "wsi-test-secret-0123456789abcdef"
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", secret)
+        monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_resource_index_file", "")
+
+        response = api_client.get(
+            "/tiles/1492807/metadata",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
+        )
+
+        assert response.status_code == 503
+
+    def test_ambiguous_resource_index_fails_closed(self, api_client, monkeypatch, tmp_path):
+        secret = "wsi-test-secret-0123456789abcdef"
+        resource_index = tmp_path / "ambiguous-resource-index.json"
+        resource_index.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "studies": {
+                        "study-a": {"patients": ["same-patient"]},
+                        "study-b": {"patients": ["same-patient"]},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", secret)
+        monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
+
+        response = api_client.get(
+            "/patient/same-patient",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
+        )
+
+        assert response.status_code == 503
+
+    def test_patient_raw_metadata_and_search_are_study_filtered(
+        self, api_client, monkeypatch, tmp_path
+    ):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        token_a = make_wsi_token(secret, "study-a")
+
+        async def fake_in_thread(fn, *args):
+            if fn is main_module.get_patient_hierarchy:
+                return {"patient_id": "patient-a", "samples": []}
+            if fn is main_module.get_slide_dbmeta:
+                return {"image_id": args[0]}
+            return [
+                {"type": "patient", "id": "patient-a"},
+                {"type": "patient", "id": "patient-b"},
+            ]
+
+        with patch.object(main_module, "_in_thread", new=fake_in_thread):
+            patient = api_client.get(
+                "/patient/patient-a?studyId=study-a",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            other_patient = api_client.get(
+                "/patient/patient-b?studyId=study-b",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+            raw_metadata = api_client.get(
+                "/slides/1492807/dbmeta", headers={"Authorization": f"Bearer {token_a}"}
+            )
+            search = api_client.get(
+                "/search?q=patient", headers={"Authorization": f"Bearer {token_a}"}
+            )
+
+        assert patient.status_code == 200
+        assert other_patient.status_code == 403
+        assert raw_metadata.status_code == 200
+        assert [item["id"] for item in search.json()] == ["patient-a"]
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +378,12 @@ class TestTileRoute:
 
     def test_cache_control_is_private(self, api_client):
         resp = api_client.get("/tiles/1492807/zxy/0/0/0")
+        cache_control = resp.headers.get("cache-control", "")
+        assert "private" in cache_control
+        assert "public" not in cache_control
+
+    def test_warmup_cache_control_is_private(self, api_client):
+        resp = api_client.get("/tiles/1492807/warmup")
         cache_control = resp.headers.get("cache-control", "")
         assert "private" in cache_control
         assert "public" not in cache_control

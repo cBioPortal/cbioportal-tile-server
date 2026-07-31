@@ -83,7 +83,10 @@ Credentials are supplied by the `slide-viewer-secrets` Secret:
 server receives `WSI_AUTH_SECRET` from the `cbioportal-msk-blue` Secret.
 The blue and green cBioPortal backend deployments are configured with the
 same secret and with audience `cbioportal-wsi` and a 300-second token TTL.
-`WSI_AUTH_REQUIRED` is `true` in production.
+`WSI_AUTH_REQUIRED` is `true`, `WSI_AUTH_MAX_TTL` is `900`, and
+`WSI_RESOURCE_INDEX_FILE` points to the loader-published trusted resource
+index in production. The secret and audience must match exactly, and the
+backend TTL must not exceed the tile-server maximum.
 
 The production values above are the memory-bound starting point for a 4 GiB
 pod. Increase `N_WORKERS`, `MAX_OPEN_SLIDES`, or `MAX_IMAGE_OPERATIONS` only
@@ -117,11 +120,16 @@ applies an in-process limit of 120 expensive requests per client per minute.
 Production ingress should apply distributed rate limits as well.
 
 The tile server validates the signature, algorithm, audience, scope, subject,
-issued-at time, and expiry. It does not currently validate the `study_id`
-claim against a slide-to-study mapping. Therefore backend-issued,
-study-scoped tokens do not yet prove study-level isolation at the tile-server
-boundary. Do not describe this as complete until that mapping check is
-implemented and tested.
+authorization-contract version, issued-at time, expiry, and maximum lifetime.
+It then validates the token's `study_id` against the loader-published mapping
+for every patient, sample, and slide resource. The mapping covers patient
+hierarchy, slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
+search. A client-supplied `studyId` query parameter is only a consistency
+check and cannot widen access. A missing mapping fails closed; it is not
+interpreted as “no slides”.
+The loader and tile server reject ambiguous patient, sample, or slide
+identifiers that are listed under more than one study, because the underlying
+metadata APIs are ID-addressed and cannot safely disambiguate such a resource.
 
 `/health` is public for Kubernetes probes. All other routes require a valid
 Bearer token when `WSI_AUTH_REQUIRED=true`.
@@ -175,8 +183,8 @@ tests/smoke/slide-viewer-routing.sh
 The test first requires unauthenticated patient and tile requests to return
 `401` or `403`, then verifies both routes succeed with the Bearer token.
 Also verify anonymous token requests return `401`, unauthorized studies
-return `403`, tokens are cached per study, and metadata responses are not
-publicly cacheable.
+return `403`, tokens are cached per study, study-A tokens cannot access
+study-B resources, and metadata responses are not publicly cacheable.
 
 ## Cache and response policy
 
@@ -204,14 +212,24 @@ The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
 2. `tools/wsi_summary_pipeline.sql`
 
 The bundle output is loaded into the cBioPortal ClickHouse
-`wsi_patient_hierarchy` table. The tile server does not load or cache the
-patient hierarchy; it serves slide paths, metadata, and image tiles only.
-The loader accepts one materialized hierarchy per JSONL line and publishes the
-manifest only after all rows are inserted:
+`wsi_patient_hierarchy` table. The loader accepts one materialized hierarchy per
+JSONL line, validates the entire input before writing, rejects duplicate
+`(study_id, patient_id)` rows, assigns a unique publication ID, and publishes
+the manifest and trusted study-to-patient/sample/slide index only after all
+rows are accepted:
 
 ```bash
-python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl --version 20260723030000
+python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
+  --version 20260723030000 \
+  --resource-index /var/lib/wsi/wsi-resource-index.json
 ```
+
+Retrying a version creates a new publication ID; the active manifest points to
+that ID, so corrected rows win deterministically. A failed row insert leaves
+the previous manifest active and leaves only invisible orphan rows. The
+backend query uses the active publication ID plus deterministic `argMax` keys,
+not `LIMIT 1`. Rebuild pre-publication-ID tables before a private-study
+rollout; an old manifest engine is not the new publication contract.
 
 Preview migrations before writing:
 
@@ -233,6 +251,6 @@ python3 -m pytest -q
 
 Frontend WSI tests and local end-to-end study-access tests are defined in
 `../cbioportal-frontend`. Production rollout, image tags, Kubernetes changes,
-DNS/TLS, secret rotation, ingress policy, observability, rollback, and the
-study-to-slide mapping check are owned outside this repository. Update this
+DNS/TLS, secret rotation, ingress policy, observability, rollback, and
+secret/index distribution remain owned outside this repository. Update this
 runbook when those sources of truth change.
