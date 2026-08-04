@@ -94,7 +94,7 @@ def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
 
     slide = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_slide FORMAT"))
     assert json.loads(slide.decode().splitlines()[0])["image_id"] == "SLIDE-1"
-    snapshot = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_patient_snapshot FORMAT"))
+    snapshot = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_patient_publication FORMAT"))
     snapshot_row = json.loads(snapshot.decode().splitlines()[0])
     assert snapshot_row["reference_sample_id"] == 700
     assert snapshot_row["reference_sequencing_date"] == "2024-01-20"
@@ -121,7 +121,7 @@ def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
     snapshot_body = next(
         body
         for query, body in clickhouse.calls
-        if query.startswith("INSERT INTO wsi_patient_snapshot FORMAT")
+        if query.startswith("INSERT INTO wsi_patient_publication FORMAT")
     )
     assert json.loads(snapshot_body.decode().splitlines()[0])["reference_sample_id"] == 700
 

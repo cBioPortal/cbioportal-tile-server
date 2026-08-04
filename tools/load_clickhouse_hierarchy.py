@@ -24,44 +24,44 @@ from urllib.request import Request, urlopen
 TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS wsi_publication_manifest (
     cancer_study_id Int64,
-    active_version UInt64,
+    active_publication_version UInt64,
     publication_id String,
     updated_at DateTime64(6)
-) ENGINE = MergeTree() ORDER BY cancer_study_id;
-CREATE TABLE IF NOT EXISTS wsi_patient_snapshot (
-    cancer_study_id Int64, patient_id Int64, snapshot_version UInt64,
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, active_publication_version, publication_id);
+CREATE TABLE IF NOT EXISTS wsi_patient_publication (
+    cancer_study_id Int64, patient_id Int64, publication_version UInt64,
     publication_id String, reference_sample_id Nullable(Int64),
     reference_sequencing_date Nullable(DateTime64(6))
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, snapshot_version, publication_id);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, publication_version, publication_id);
 CREATE TABLE IF NOT EXISTS wsi_part (
-    cancer_study_id Int64, patient_id Int64, snapshot_version UInt64,
+    cancer_study_id Int64, patient_id Int64, publication_version UInt64,
     publication_id String, part_key String, part_number Nullable(String),
     part_designator Nullable(String), part_type Nullable(String),
     part_description Nullable(String), subspecialty Nullable(String),
     path_dx_title Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, snapshot_version, publication_id, part_key);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, publication_version, publication_id, part_key);
 CREATE TABLE IF NOT EXISTS wsi_block (
-    cancer_study_id Int64, patient_id Int64, snapshot_version UInt64,
+    cancer_study_id Int64, patient_id Int64, publication_version UInt64,
     publication_id String, part_key String, block_key String,
     block_number Nullable(String), block_label Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, snapshot_version, publication_id, part_key, block_key);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, publication_version, publication_id, part_key, block_key);
 CREATE TABLE IF NOT EXISTS wsi_slide (
-    cancer_study_id Int64, patient_id Int64, snapshot_version UInt64,
+    cancer_study_id Int64, patient_id Int64, publication_version UInt64,
     publication_id String, image_id String, stain_name Nullable(String),
     stain_group Nullable(String), is_hne Bool, is_ihc Bool,
     magnification Nullable(String), file_size_bytes Nullable(UInt64),
     can_serve_tiles Bool, barcode Nullable(String), slide_type Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, snapshot_version, publication_id, image_id);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, publication_version, publication_id, image_id);
 CREATE TABLE IF NOT EXISTS wsi_slide_placement (
-    cancer_study_id Int64, patient_id Int64, snapshot_version UInt64,
+    cancer_study_id Int64, patient_id Int64, publication_version UInt64,
     publication_id String, image_id String, part_key String, block_key String,
     sample_id Nullable(Int64), match_level String, specimen_key String,
     procedure_date_days Nullable(Int32), timepoint_source Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, snapshot_version, publication_id, image_id);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, publication_version, publication_id, image_id, part_key, block_key);
 """
 
 INSERT_TABLES = (
-    "wsi_patient_snapshot",
+    "wsi_patient_publication",
     "wsi_part",
     "wsi_block",
     "wsi_slide",
@@ -298,9 +298,9 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
             reference_sample = None
         if reference_sample is not None and reference_sample not in sample_map:
             raise ValueError(f"unknown reference sample: {study_id}/{patient_id}/{reference_sample}")
-        tables["wsi_patient_snapshot"].append({
+        tables["wsi_patient_publication"].append({
             "cancer_study_id": study_internal, "patient_id": patient_internal,
-            "snapshot_version": version, "publication_id": publication_id,
+            "publication_version": version, "publication_id": publication_id,
             "reference_sample_id": sample_map.get(reference_sample) if reference_sample else None,
             "reference_sequencing_date": hierarchy.get(
                 "reference_sequencing_date", hierarchy.get("referenceSequencingDate")
@@ -329,7 +329,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                 part_key = str(part.get("part_key") or part_number or "?")
                 part_row = {
                     "cancer_study_id": study_internal, "patient_id": patient_internal,
-                    "snapshot_version": version, "publication_id": publication_id,
+                    "publication_version": version, "publication_id": publication_id,
                     "part_key": part_key, "part_number": str(part_number) if part_number is not None else None,
                     "part_designator": part.get("part_designator"), "part_type": part.get("part_type"),
                     "part_description": part.get("part_description"), "subspecialty": part.get("subspecialty"),
@@ -343,7 +343,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                     block_key = str(block.get("block_key") or block_number or "?")
                     block_row = {
                         "cancer_study_id": study_internal, "patient_id": patient_internal,
-                        "snapshot_version": version, "publication_id": publication_id,
+                        "publication_version": version, "publication_id": publication_id,
                         "part_key": part_key, "block_key": block_key,
                         "block_number": str(block_number) if block_number is not None else None,
                         "block_label": block.get("block_label"),
@@ -370,7 +370,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                             )
                         slide_row = {
                             "cancer_study_id": study_internal, "patient_id": patient_internal,
-                            "snapshot_version": version, "publication_id": publication_id,
+                            "publication_version": version, "publication_id": publication_id,
                             "image_id": image_id, "stain_name": slide.get("stain_name"),
                             "stain_group": slide.get("stain_group"), "is_hne": bool(slide.get("is_hne", False)),
                             "is_ihc": bool(slide.get("is_ihc", False)), "magnification": slide.get("magnification"),
@@ -384,7 +384,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                         match_level = str(association.get("match_level") or ("UNMATCHED" if sample_internal is None else "BLOCK")).upper()
                         placement = {
                             "cancer_study_id": study_internal, "patient_id": patient_internal,
-                            "snapshot_version": version, "publication_id": publication_id,
+                            "publication_version": version, "publication_id": publication_id,
                             "image_id": image_id, "part_key": part_key, "block_key": block_key,
                             "sample_id": sample_internal, "match_level": match_level,
                             "specimen_key": association.get("specimen_key") or f"{match_level.lower()}::{part_key}::{block_key}",
@@ -498,7 +498,7 @@ def load(snapshot: Path, version: int, clickhouse: ClickHouse, resource_index_pa
         _publish_resource_index(resource_index_path, index_payload)
     try:
         _insert_rows(clickhouse, "wsi_publication_manifest", [
-            {"cancer_study_id": study_id, "active_version": version, "publication_id": publication_id, "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
+            {"cancer_study_id": study_id, "active_publication_version": version, "publication_id": publication_id, "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
             for study_id in sorted(study_internal_ids)
         ])
     except Exception:
