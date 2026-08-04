@@ -210,12 +210,15 @@ The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
 1. `tools/wsi_canonical_associations_pipeline.sql`
 2. `tools/wsi_summary_pipeline.sql`
 
-The bundle output is loaded into normalized cBioPortal ClickHouse WSI tables.
-The loader accepts one upstream hierarchy row per JSONL line, resolves every
-study/patient/sample reference against the portal, validates the entire input
-before writing, rejects duplicate `(study_id, patient_id)` rows, assigns a
-unique release ID, and publishes the release row and trusted
-study-to-patient/sample/slide index only after all rows are accepted:
+The canonical association output is the loader's strict, normalized JSONL
+contract. Each row contains explicit part and block keys, slide and placement
+facts, an optional portal sample reference, and `slide_path` only for trusted
+index publication. It contains neither portal-owned clinical data nor a
+sequencing date. The loader resolves every study/patient/sample reference by
+its full tuple, validates the entire input before writing, rejects malformed
+keys and duplicate placements, assigns a unique release ID, and publishes the
+release row and version-2 study-to-patient/sample/slide index only after all
+rows are accepted:
 
 ```bash
 python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
@@ -224,11 +227,12 @@ python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
 ```
 
 Retrying a version creates a new release ID; the latest completed release
-points to that ID, so corrected rows win deterministically. A failed row insert
-leaves the previous release active and leaves only invisible orphan rows. The
+points to that ID, so corrected rows win deterministically. A failed row or
+index publication leaves the previous release and trusted index active. The
 backend query uses the active release ID plus deterministic `argMax` keys,
-not `LIMIT 1`. Rebuild pre-release-ID tables before a private-study
-rollout; an old release engine is not the new release contract.
+not `LIMIT 1`. This is a coordinated pre-release rebuild: recreate the
+canonical table, snapshot, ClickHouse WSI data, and trusted index before a
+private-study rollout.
 
 Preview migrations before writing:
 

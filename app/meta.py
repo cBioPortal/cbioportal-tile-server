@@ -71,9 +71,17 @@ def _format_slide_suggestions(rows: list[dict[str, Any]]) -> list[dict]:
     ]
 
 
-def get_slide_dbmeta(image_id: str, warehouse_id: str) -> dict | None:
+def get_slide_dbmeta(
+    image_id: str,
+    warehouse_id: str,
+    patient_id: str | None = None,
+) -> dict | None:
     """Return flat Databricks metadata row for one slide."""
-    rows = _run_query(meta_store.SLIDE_SQL, warehouse_id, [_param("image_id", str(image_id))])
+    sql = meta_store.SLIDE_SCOPED_SQL if patient_id is not None else meta_store.SLIDE_SQL
+    params = [_param("image_id", str(image_id))]
+    if patient_id is not None:
+        params.append(_param("patient_id", str(patient_id)))
+    rows = _run_query(sql, warehouse_id, params)
     if not rows:
         return None
     return {k: _coerce(v) for k, v in rows[0].items()}

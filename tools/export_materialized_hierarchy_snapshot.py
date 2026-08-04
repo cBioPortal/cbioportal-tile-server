@@ -78,7 +78,7 @@ def main() -> int:
             handle.write("\n")
 
     print(
-        f"Wrote {len(rows)} hierarchy rows for {args.study_id} to {output}"
+        f"Wrote {len(rows)} canonical association rows for {args.study_id} to {output}"
         f" (missing {len(missing)} patients)"
     )
     if missing:

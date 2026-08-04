@@ -55,9 +55,19 @@ def association_match_rank(match_level: str | None) -> int:
 
 
 def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
-    part_number, block_number, _ = derive_block_fields(
-        row.get("block_id"), row.get("block_label")
+    raw_part_number = row.get("part_number")
+    part_number = (
+        int(raw_part_number)
+        if isinstance(raw_part_number, (int, str)) and str(raw_part_number).isdigit()
+        else None
     )
+    block_number = str(row.get("block_number") or "").strip()
+    if part_number is None or not block_number:
+        legacy_part_number, legacy_block_number, _ = derive_block_fields(
+            row.get("block_id"), row.get("block_label")
+        )
+        part_number = part_number if part_number is not None else legacy_part_number
+        block_number = block_number or legacy_block_number
     return (
         association_path_rank(row.get("slide_path")),
         association_match_rank(row.get("match_level")),
@@ -69,7 +79,10 @@ def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
         str(row.get("stain_name") or "~~~~~~~~"),
         0 if row.get("part_description") else 1,
         str(row.get("part_description") or "~~~~~~~~"),
-        0 if row.get("slide_timepoint_days") is not None else 1,
+        0
+        if row.get("procedure_date_days", row.get("slide_timepoint_days"))
+        is not None
+        else 1,
         str(row.get("image_id") or ""),
     )
 

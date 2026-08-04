@@ -14,9 +14,10 @@ and writes one append-only release to the normalized ClickHouse tables:
 
 The release row is the visibility boundary. A retry receives a new release
 ID, and it is inserted only after all normalized rows have been inserted. The
-trusted resource index is generated from the same portal references and slide
-IDs; a failed release restores the prior
-index. Unknown or mismatched study/patient/sample references, duplicate
+trusted version-2 resource index is generated from the same portal references
+and slide IDs. Patient, sample, and slide IDs are scoped to the study;
+duplicate slide IDs carry a study-qualified source path. A failed release
+restores the prior index. Unknown or mismatched study/patient/sample references, duplicate
 placements, and orphan slide associations are rejected before release.
 
 cBioPortal assembles `GET /api/wsi/v2/hierarchy/{studyId}/{patientId}` from the

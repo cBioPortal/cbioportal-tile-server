@@ -40,20 +40,25 @@ SELECT
     sample_id,
     match_level,
     image_id,
-    block_id,
+    part_key,
+    part_number,
+    block_key,
+    block_number,
     block_label,
     part_description,
     stain_name,
     stain_group,
     slide_path,
-    slide_timepoint_days,
-    slide_timepoint_source
+    can_serve_tiles,
+    specimen_key,
+    procedure_date_days,
+    timepoint_source
 FROM {canonical_table}
 WHERE patient_id IN ({placeholders})
 ORDER BY
     patient_id,
-    slide_timepoint_days,
-    sample_bucket,
+    procedure_date_days,
+    sample_id,
     match_level,
     image_id
 """
@@ -287,7 +292,9 @@ def build_pathology_timeline_rows(
         if not patient_id or not image_id:
             continue
 
-        slide_timepoint_days = row.get("slide_timepoint_days")
+        slide_timepoint_days = row.get(
+            "procedure_date_days", row.get("slide_timepoint_days")
+        )
         if slide_timepoint_days is None:
             continue
         try:
@@ -300,11 +307,19 @@ def build_pathology_timeline_rows(
             continue
 
         raw_match_level = str(row.get("match_level") or "UNMATCHED").upper()
-        part_number, block_number, block_label = _derive_block_fields(
-            row.get("block_id"),
-            row.get("block_label"),
+        part_number_value = row.get("part_number")
+        part_number = (
+            int(part_number_value)
+            if isinstance(part_number_value, (int, str)) and str(part_number_value).isdigit()
+            else None
         )
-        specimen_key = build_specimen_key(
+        block_number = str(row.get("block_number") or "").strip()
+        block_label = row.get("block_label")
+        if not block_number:
+            part_number, block_number, block_label = _derive_block_fields(
+                row.get("block_id"), row.get("block_label")
+            )
+        specimen_key = row.get("specimen_key") or build_specimen_key(
             raw_match_level, part_number, block_number
         )
         specimen = _format_specimen_label(
@@ -314,7 +329,11 @@ def build_pathology_timeline_rows(
             block_label,
             block_number,
         )
-        can_serve_tiles = str(row.get("slide_path") or "").startswith("s3://")
+        can_serve_tiles = (
+            bool(row["can_serve_tiles"])
+            if row.get("can_serve_tiles") is not None
+            else str(row.get("slide_path") or "").startswith("s3://")
+        )
         sample_display = _sample_display_value(row.get("sample_id"), raw_match_level)
         match_level = _match_level_display_value(raw_match_level)
         grouping_specimen_token = specimen_key if can_serve_tiles else specimen
@@ -343,7 +362,7 @@ def build_pathology_timeline_rows(
         grouped.add_image(
             image_id=image_id,
             can_serve_tiles=can_serve_tiles,
-            timepoint_source=row.get("slide_timepoint_source"),
+            timepoint_source=row.get("timepoint_source", row.get("slide_timepoint_source")),
         )
 
     ordered_groups = sorted(

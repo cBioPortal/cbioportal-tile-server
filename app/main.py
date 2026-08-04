@@ -208,35 +208,50 @@ async def _run_image_operation(fn, *args):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_slide_id(image_id: str) -> str:
+def _resolve_slide_id(image_id: str, study_id: str | None = None) -> str:
     """Resolve an image_id to a local path or S3 URI, with in-process caching."""
-    if image_id in _path_cache:
-        _path_cache.move_to_end(image_id)
-        return _path_cache[image_id]
+    cache_key = f"{study_id}:{image_id}" if study_id else image_id
+    if cache_key in _path_cache:
+        _path_cache.move_to_end(cache_key)
+        return _path_cache[cache_key]
     test_path = settings.test_slide_map.get(image_id)
     if test_path:
-        _path_cache[image_id] = test_path
-        _path_cache.move_to_end(image_id)
+        _path_cache[cache_key] = test_path
+        _path_cache.move_to_end(cache_key)
         while len(_path_cache) > settings.path_cache_capacity:
             _path_cache.popitem(last=False)
         return test_path
+    if study_id:
+        binding = get_resource_index(settings.wsi_resource_index_file).slide_binding(study_id, image_id)
+        if not binding or not binding.get("source_path"):
+            raise ResourceIndexUnavailable(
+                "study-qualified slide binding is missing a source path"
+            )
+        path = str(binding["source_path"])
+        _path_cache[cache_key] = path
+        _path_cache.move_to_end(cache_key)
+        while len(_path_cache) > settings.path_cache_capacity:
+            _path_cache.popitem(last=False)
+        return path
     path = meta.get_slide_path(image_id, settings.databricks_warehouse_id)
     if not path:
         raise FileNotFoundError(f"Slide not found: {image_id}")
-    _path_cache[image_id] = path
-    _path_cache.move_to_end(image_id)
+    _path_cache[cache_key] = path
+    _path_cache.move_to_end(cache_key)
     while len(_path_cache) > settings.path_cache_capacity:
         _path_cache.popitem(last=False)
     return path
 
 
-def _get_slide(image_id: str):
+def _get_slide(image_id: str, study_id: str | None = None):
     """Resolve image_id → S3 path, open/retrieve from cache; raise 404 on failure."""
     try:
-        s3_uri = _resolve_slide_id(image_id)
+        s3_uri = _resolve_slide_id(image_id, study_id)
         return _slides.get(s3_uri)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Slide not found: {image_id}")
+    except ResourceIndexUnavailable:
+        raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
     except Exception:
         logger.exception("Failed to open slide %s", image_id)
         raise HTTPException(status_code=500, detail="Failed to open slide")
@@ -266,15 +281,14 @@ def _authorize_resource(request: Request, resource_type: str, resource_id: str) 
     return study_id
 
 
-def _filter_search_results(request: Request, results: list[dict]) -> list[dict]:
-    if not settings.wsi_auth_required:
-        return results
+def _authenticated_search_suggestions(request: Request, query: str) -> tuple[str, list[dict]]:
     claims = getattr(request.state, "wsi_claims", None)
     if not claims:
         raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
     try:
-        return get_resource_index(settings.wsi_resource_index_file).filter_search(
-            claims["study_id"], results
+        study_id = claims["study_id"]
+        return study_id, get_resource_index(settings.wsi_resource_index_file).suggestions(
+            study_id, query
         )
     except ResourceIndexUnavailable:
         logger.error("WSI resource index is unavailable; refusing protected search")
@@ -299,12 +313,20 @@ def metrics():
 @app.get("/slides/{image_id}/dbmeta")
 async def slide_dbmeta(request: Request, image_id: str):
     """Return the raw Databricks metadata row for a single slide (by numeric image_id)."""
-    _authorize_resource(request, "slides", image_id)
+    study_id = _authorize_resource(request, "slides", image_id)
+    binding = (
+        get_resource_index(settings.wsi_resource_index_file).slide_binding(study_id, image_id)
+        if study_id
+        else None
+    )
+    if study_id and binding is None:
+        raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
     try:
         result = await _in_thread(
             get_slide_dbmeta,
             image_id,
             settings.databricks_warehouse_id,
+            binding.get("patient_id") if binding else None,
         )
     except Exception:
         logger.exception("Databricks query failed for slide %s", image_id)
@@ -329,10 +351,27 @@ async def search(request: Request, q: str = ""):
     if len(q) < 2:
         return Response(content="[]", media_type="application/json", headers=PHI_CACHE_HEADERS)
 
+    if settings.wsi_auth_required:
+        study_id, results = _authenticated_search_suggestions(request, q)
+        cache_key = f"search:{study_id}:{q.lower()}"
+        cached = await tile_cache.get_raw(cache_key)
+        if cached is not None:
+            return Response(
+                content=json.dumps(cached, default=str),
+                media_type="application/json",
+                headers=PHI_CACHE_HEADERS,
+            )
+        await tile_cache.set_raw(cache_key, results, ttl=300)
+        return Response(
+            content=json.dumps(results, default=str),
+            media_type="application/json",
+            headers=PHI_CACHE_HEADERS,
+        )
+
     cache_key = f"search:{q.lower()}"
     cached = await tile_cache.get_raw(cache_key)
     if cached is not None:
-        return Response(content=json.dumps(_filter_search_results(request, cached), default=str),
+        return Response(content=json.dumps(cached, default=str),
                         media_type="application/json", headers=PHI_CACHE_HEADERS)
 
     try:
@@ -346,20 +385,21 @@ async def search(request: Request, q: str = ""):
         raise HTTPException(status_code=502, detail="Search query failed")
 
     await tile_cache.set_raw(cache_key, results, ttl=300)
-    return Response(content=json.dumps(_filter_search_results(request, results), default=str),
+    return Response(content=json.dumps(results, default=str),
                     media_type="application/json", headers=PHI_CACHE_HEADERS)
 
 
 @app.get("/tiles/{slide_id}/metadata")
 async def metadata(request: Request, slide_id: str):
-    _authorize_resource(request, "slides", slide_id)
-    cached = await tile_cache.get_metadata(slide_id)
+    study_id = _authorize_resource(request, "slides", slide_id)
+    cache_key = f"{study_id}:{slide_id}" if study_id else slide_id
+    cached = await tile_cache.get_metadata(cache_key)
     if cached is not None:
         return Response(content=json.dumps(cached), media_type="application/json",
                         headers=PHI_CACHE_HEADERS)
-    slide = await _run_image_operation(_get_slide, slide_id)
+    slide = await _run_image_operation(_get_slide, slide_id, study_id)
     result = await _run_image_operation(slide_metadata, slide)
-    await tile_cache.set_metadata(slide_id, result)
+    await tile_cache.set_metadata(cache_key, result)
     return Response(content=json.dumps(result), media_type="application/json",
                     headers=PHI_CACHE_HEADERS)
 
@@ -367,9 +407,9 @@ async def metadata(request: Request, slide_id: str):
 @app.get("/tiles/{slide_id}/warmup", include_in_schema=False)
 async def warmup(request: Request, slide_id: str):
     """Fetch and discard the overview tile to prime the TiffSlide cache on this worker."""
-    _authorize_resource(request, "slides", slide_id)
+    study_id = _authorize_resource(request, "slides", slide_id)
     try:
-        slide = await _run_image_operation(_get_slide, slide_id)
+        slide = await _run_image_operation(_get_slide, slide_id, study_id)
         image, _ = await _run_image_operation(render_tile_image, slide, 0, 0, 0)
         image.close()
     except OverviewTooLarge as exc:
@@ -398,21 +438,22 @@ async def thumbnail(
     width: int = 256,
     height: int = 256,
 ):
-    _authorize_resource(request, "slides", slide_id)
+    study_id = _authorize_resource(request, "slides", slide_id)
+    cache_slide_id = f"{study_id}:{slide_id}" if study_id else slide_id
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
 
-    cached = await tile_cache.get_thumbnail(slide_id, width, height)
+    cached = await tile_cache.get_thumbnail(cache_slide_id, width, height)
     if cached:
         return Response(content=cached, media_type="image/jpeg",
                         headers=THUMB_CACHE_HEADERS)
 
-    cache_key = tile_cache.thumbnail_cache_key(slide_id, width, height)
+    cache_key = tile_cache.thumbnail_cache_key(cache_slide_id, width, height)
 
     async def _build_thumbnail():
-        slide = await _run_image_operation(_get_slide, slide_id)
+        slide = await _run_image_operation(_get_slide, slide_id, study_id)
         image_bytes = await _run_image_operation(get_thumbnail_bytes, slide, width, height)
-        await tile_cache.set_thumbnail(slide_id, width, height, image_bytes)
+        await tile_cache.set_thumbnail(cache_slide_id, width, height, image_bytes)
         return image_bytes
 
     try:
@@ -436,19 +477,20 @@ async def thumbnail(
 
 @app.get("/tiles/{slide_id}/zxy/{z}/{x}/{y}")
 async def tile(request: Request, slide_id: str, z: int, x: int, y: int):
-    _authorize_resource(request, "slides", slide_id)
-    cached = await tile_cache.get_tile(slide_id, z, x, y)
+    study_id = _authorize_resource(request, "slides", slide_id)
+    cache_slide_id = f"{study_id}:{slide_id}" if study_id else slide_id
+    cached = await tile_cache.get_tile(cache_slide_id, z, x, y)
     if cached:
         return Response(content=cached, media_type="image/jpeg",
                         headers=TILE_CACHE_HEADERS)
 
     try:
-        cache_key = tile_cache.tile_cache_key(slide_id, z, x, y)
+        cache_key = tile_cache.tile_cache_key(cache_slide_id, z, x, y)
 
         async def _build_tile():
-            slide = await _run_image_operation(_get_slide, slide_id)
+            slide = await _run_image_operation(_get_slide, slide_id, study_id)
             image_bytes = await _run_image_operation(get_tile_bytes, slide, z, x, y)
-            await tile_cache.set_tile(slide_id, z, x, y, image_bytes)
+            await tile_cache.set_tile(cache_slide_id, z, x, y, image_bytes)
             return image_bytes
 
         data = await _singleflight.do(cache_key, "tile", _build_tile)

@@ -18,6 +18,7 @@ import app.main as main_module
 import app.meta as meta_module
 from app.config import settings
 from app.rate_limit import RequestRateLimiter
+from app.resource_index import ResourceIndex
 from app.tiles import TILE_SIZE
 from tests.test_auth import make_token
 from tests.conftest import make_mock_slide
@@ -52,17 +53,27 @@ def configure_resource_auth(monkeypatch, tmp_path):
     resource_index.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "studies": {
                     "study-a": {
-                        "patients": ["patient-a"],
+                        "patients": ["P-a"],
                         "samples": ["sample-a"],
-                        "slides": ["1492807"],
+                        "slides": {
+                            "1492807": {
+                                "patient_id": "P-a",
+                                "source_path": "s3://test-bucket/1492807.svs",
+                            }
+                        },
                     },
                     "study-b": {
-                        "patients": ["patient-b"],
+                        "patients": ["P-b"],
                         "samples": ["sample-b"],
-                        "slides": ["2492807"],
+                        "slides": {
+                            "2492807": {
+                                "patient_id": "P-b",
+                                "source_path": "s3://test-bucket/2492807.svs",
+                            }
+                        },
                     },
                 },
             }
@@ -251,19 +262,11 @@ class TestHealth:
 
         assert response.status_code == 503
 
-    def test_ambiguous_resource_index_fails_closed(self, api_client, monkeypatch, tmp_path):
+    def test_version_one_resource_index_fails_closed(self, api_client, monkeypatch, tmp_path):
         secret = "wsi-test-secret-0123456789abcdef"
-        resource_index = tmp_path / "ambiguous-resource-index.json"
+        resource_index = tmp_path / "legacy-resource-index.json"
         resource_index.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "studies": {
-                        "study-a": {"patients": ["same-patient"]},
-                        "study-b": {"patients": ["same-patient"]},
-                    },
-                }
-            )
+            json.dumps({"version": 1, "studies": {"study-a": {"slides": ["1492807"]}}})
         )
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", secret)
@@ -278,18 +281,103 @@ class TestHealth:
 
         assert response.status_code == 503
 
+    def test_cross_study_duplicate_resource_ids_are_scoped(self, api_client, monkeypatch, tmp_path):
+        secret = "wsi-test-secret-0123456789abcdef"
+        resource_index = tmp_path / "ambiguous-resource-index.json"
+        resource_index.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "studies": {
+                        "study-a": {"patients": ["P-same"], "samples": [], "slides": {}},
+                        "study-b": {"patients": ["P-same"], "samples": [], "slides": {}},
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", secret)
+        monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
+
+        response = api_client.get(
+            "/search?q=P-same",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
+        )
+
+        assert response.status_code == 200
+        assert [item["id"] for item in response.json()] == ["P-same"]
+        index = ResourceIndex(str(resource_index))
+        assert index.contains("study-a", "patients", "P-same")
+        assert index.contains("study-b", "patients", "P-same")
+
+    def test_duplicate_slide_id_uses_the_token_study_binding(self, api_client, monkeypatch, tmp_path):
+        secret = "wsi-test-secret-0123456789abcdef"
+        resource_index = tmp_path / "resource-index.json"
+        resource_index.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "studies": {
+                        "study-a": {
+                            "patients": ["P-a"],
+                            "samples": [],
+                            "slides": {
+                                "same-slide": {
+                                    "patient_id": "P-a",
+                                    "source_path": "s3://test-bucket/study-a.svs",
+                                }
+                            },
+                        },
+                        "study-b": {
+                            "patients": ["P-b"],
+                            "samples": [],
+                            "slides": {
+                                "same-slide": {
+                                    "patient_id": "P-b",
+                                    "source_path": "s3://test-bucket/study-b.svs",
+                                }
+                            },
+                        },
+                    },
+                }
+            )
+        )
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", secret)
+        monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
+
+        response_a = api_client.get(
+            "/tiles/same-slide/metadata",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
+        )
+        response_b = api_client.get(
+            "/tiles/same-slide/metadata",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-b')}"},
+        )
+
+        assert response_a.status_code == 200
+        assert response_b.status_code == 200
+        assert main_module._slides.get.call_args_list[-2].args == ("s3://test-bucket/study-a.svs",)
+        assert main_module._slides.get.call_args_list[-1].args == ("s3://test-bucket/study-b.svs",)
+
     def test_raw_metadata_and_search_are_study_filtered(
         self, api_client, monkeypatch, tmp_path
     ):
         secret = configure_resource_auth(monkeypatch, tmp_path)
         token_a = make_wsi_token(secret, "study-a")
+        metadata_args = []
 
         async def fake_in_thread(fn, *args):
             if fn is main_module.get_slide_dbmeta:
+                metadata_args.extend(args)
                 return {"image_id": args[0]}
             return [
-                {"type": "patient", "id": "patient-a"},
-                {"type": "patient", "id": "patient-b"},
+                {"type": "patient", "id": "P-a"},
+                {"type": "patient", "id": "P-b"},
             ]
 
         with patch.object(main_module, "_in_thread", new=fake_in_thread):
@@ -297,11 +385,12 @@ class TestHealth:
                 "/slides/1492807/dbmeta", headers={"Authorization": f"Bearer {token_a}"}
             )
             search = api_client.get(
-                "/search?q=patient", headers={"Authorization": f"Bearer {token_a}"}
+                "/search?q=P-a", headers={"Authorization": f"Bearer {token_a}"}
             )
 
         assert raw_metadata.status_code == 200
-        assert [item["id"] for item in search.json()] == ["patient-a"]
+        assert metadata_args[2] == "P-a"
+        assert [item["id"] for item in search.json()] == ["P-a"]
 
 
 # ---------------------------------------------------------------------------

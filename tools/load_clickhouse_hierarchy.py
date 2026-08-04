@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Load a validated, normalized WSI snapshot into cBioPortal ClickHouse.
+"""Load canonical normalized WSI associations into cBioPortal ClickHouse.
 
-The upstream JSONL input is still accepted as an interchange format, but its
-portal-owned identifiers are resolved to cBioPortal internal IDs and only
+Each JSONL row contains a study, patient, and flat canonical slide rows. Its
+portal identifiers are resolved to cBioPortal internal IDs and only
 pathology-specific rows are written. Every table insert uses one release ID;
 the release insert is the visibility boundary.
 """
@@ -70,7 +70,7 @@ INSERT_TABLES = (
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("input", type=Path, help="Upstream hierarchy JSONL snapshot")
+    parser.add_argument("input", type=Path, help="Canonical WSI association JSONL snapshot")
     parser.add_argument("--version", type=int, required=True)
     parser.add_argument("--url", default=os.getenv("CLICKHOUSE_URL", "http://localhost:8123"))
     parser.add_argument("--database", default=os.getenv("CLICKHOUSE_DATABASE", "cbioportal"))
@@ -123,13 +123,10 @@ def _read_snapshot(snapshot: Path) -> list[tuple[str, str, dict]]:
             try:
                 value = json.loads(line)
                 study_id, patient_id = value.get("study_id"), value.get("patient_id")
-                hierarchy = value.get("hierarchy")
-                if hierarchy is None and isinstance(value.get("slides"), list):
-                    hierarchy = _hierarchy_from_canonical_rows(value["slides"])
-                if not isinstance(study_id, str) or not study_id.strip() or not isinstance(patient_id, str) or not patient_id.strip() or not isinstance(hierarchy, dict):
-                    raise ValueError("snapshot row needs non-empty string study_id, patient_id, and hierarchy")
-                if hierarchy.get("patient_id") not in (None, patient_id):
-                    raise ValueError(f"hierarchy patient_id does not match row for {patient_id}")
+                slides = value.get("slides")
+                if not isinstance(study_id, str) or not study_id.strip() or not isinstance(patient_id, str) or not patient_id.strip() or not isinstance(slides, list):
+                    raise ValueError("snapshot row needs non-empty string study_id, patient_id, and slides")
+                hierarchy = _hierarchy_from_canonical_rows(slides)
                 if (study_id, patient_id) in seen:
                     raise ValueError(f"duplicate study_id/patient_id in snapshot: {study_id}/{patient_id}")
                 seen.add((study_id, patient_id))
@@ -149,41 +146,60 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
     for row in rows:
         if not isinstance(row, dict) or row.get("image_id") is None:
             raise ValueError("canonical slide rows need an image_id")
+        part_key = row.get("part_key")
+        block_key = row.get("block_key")
+        if not isinstance(part_key, str) or not part_key.strip() or "?" in part_key:
+            raise ValueError("canonical slide rows need a non-empty part_key")
+        if not isinstance(block_key, str) or not block_key.strip() or "?" in block_key:
+            raise ValueError("canonical slide rows need a non-empty block_key")
+        match_level = row.get("match_level")
+        if not isinstance(match_level, str) or match_level.upper() not in {"BLOCK", "PART", "UNMATCHED"}:
+            raise ValueError("canonical slide rows need a valid match_level")
+        if not isinstance(row.get("specimen_key"), str) or not row["specimen_key"].strip():
+            raise ValueError("canonical slide rows need a non-empty specimen_key")
+        if not isinstance(row.get("can_serve_tiles"), bool):
+            raise ValueError("canonical slide rows need a boolean can_serve_tiles")
+        slide_path = row.get("slide_path")
+        if row["can_serve_tiles"] and (
+            not isinstance(slide_path, str) or not slide_path.startswith("s3://")
+        ):
+            raise ValueError("tile-servable canonical slide rows need an s3:// slide_path")
         reference_sample = row.get("reference_sample_id")
         if reference_sample not in (None, "", "UNMATCHED"):
             reference_samples.add(str(reference_sample))
         sample_id = row.get("sample_id") or None
+        if match_level.upper() == "UNMATCHED" and sample_id is not None:
+            raise ValueError("unmatched canonical slide rows need a null sample_id")
+        if match_level.upper() != "UNMATCHED" and sample_id is None:
+            raise ValueError("matched canonical slide rows need a sample_id")
         sample = samples.setdefault(sample_id, {"sample_id": sample_id, "parts": {}})
         part_number = row.get("part_number")
-        part_key = str(row.get("part_key") or part_number or "?")
-        part = sample["parts"].setdefault(
-            part_key,
-            {
-                "part_key": part_key,
-                "part_number": part_number,
-                "part_designator": row.get("part_designator"),
-                "part_type": row.get("part_type"),
-                "part_description": row.get("part_description"),
-                "subspecialty": row.get("subspecialty"),
-                "path_dx_title": row.get("path_dx_title"),
-                "blocks": {},
-            },
-        )
-        block_key = str(row.get("block_key") or row.get("block_number") or "?")
-        block = part["blocks"].setdefault(
-            block_key,
-            {
-                "block_key": block_key,
-                "block_number": row.get("block_number"),
-                "block_label": row.get("block_label"),
-                "slides": [],
-            },
-        )
+        part_fields = {
+            "part_key": part_key,
+            "part_number": part_number,
+            "part_designator": row.get("part_designator"),
+            "part_type": row.get("part_type"),
+            "part_description": row.get("part_description"),
+            "subspecialty": row.get("subspecialty"),
+            "path_dx_title": row.get("path_dx_title"),
+        }
+        part = sample["parts"].setdefault(part_key, {**part_fields, "blocks": {}})
+        if {key: part.get(key) for key in part_fields} != part_fields:
+            raise ValueError(f"conflicting canonical part definition: {part_key}")
+        block_fields = {
+            "block_key": block_key,
+            "block_number": row.get("block_number"),
+            "block_label": row.get("block_label"),
+        }
+        block = part["blocks"].setdefault(block_key, {**block_fields, "slides": []})
+        if {key: block.get(key) for key in block_fields} != block_fields:
+            raise ValueError(f"conflicting canonical block definition: {block_key}")
         slide = {
             key: row.get(key)
             for key in (
                 "image_id", "stain_name", "stain_group", "is_hne", "is_ihc",
                 "magnification", "file_size_bytes", "can_serve_tiles", "barcode", "slide_type",
+                "slide_path",
             )
         }
         block["slides"].append(slide)
@@ -232,38 +248,53 @@ def _resolve_identities(clickhouse: ClickHouse, parsed: list[tuple[str, str, dic
     if missing:
         raise ValueError(f"unknown cBioPortal study/patient references: {missing}")
 
-    sample_ids = sorted({
-        str(sample.get("sample_id"))
-        for _, _, hierarchy in parsed
-        for sample in hierarchy.get("samples", [])
-        if isinstance(sample, dict) and sample.get("sample_id") not in (None, "", "UNMATCHED")
-    } | {
-        str(
-            hierarchy.get(
-                "reference_sample_id", hierarchy.get("referenceSampleId")
-            )
-        )
-        for _, _, hierarchy in parsed
-        if hierarchy.get(
+    sample_keys: set[tuple[str, str, str]] = set()
+    for study_id, patient_id, hierarchy in parsed:
+        sample_ids = {
+            str(sample["sample_id"])
+            for sample in hierarchy.get("samples", [])
+            if isinstance(sample, dict)
+            and sample.get("sample_id") not in (None, "", "UNMATCHED")
+        }
+        reference_sample = hierarchy.get(
             "reference_sample_id", hierarchy.get("referenceSampleId")
-        ) not in (None, "", "UNMATCHED")
-    })
-    if not sample_ids:
+        )
+        if reference_sample not in (None, "", "UNMATCHED"):
+            sample_ids.add(str(reference_sample))
+        sample_keys.update((study_id, patient_id, sample_id) for sample_id in sample_ids)
+    if not sample_keys:
         return identities
-    sample_values = ", ".join(_sql_literal(sample_id) for sample_id in sample_ids)
+    sample_values = ", ".join(
+        f"({_sql_literal(study_id)}, {_sql_literal(patient_id)}, {_sql_literal(sample_id)})"
+        for study_id, patient_id, sample_id in sorted(sample_keys)
+    )
     sample_rows = clickhouse.query_json(
         "SELECT cs.cancer_study_identifier AS study_id, p.stable_id AS patient_id, "
         "s.stable_id AS sample_id, s.internal_id AS sample_internal_id "
         "FROM sample s INNER JOIN patient p ON p.internal_id = s.patient_id "
         "INNER JOIN cancer_study cs ON cs.cancer_study_id = p.cancer_study_id "
-        f"WHERE s.stable_id IN ({sample_values})"
+        f"WHERE (cs.cancer_study_identifier, p.stable_id, s.stable_id) IN ({sample_values})"
     )
+    resolved_keys: set[tuple[str, str, str]] = set()
     for row in sample_rows:
-        key = (str(row["study_id"]), str(row["patient_id"]))
-        identity = identities.get(key)
-        if identity is None:
-            raise ValueError(f"sample resolves outside the referenced study/patient: {row['sample_id']}")
-        identity.setdefault("samples", {})[str(row["sample_id"])] = int(row["sample_internal_id"])
+        key = (
+            str(row["study_id"]),
+            str(row["patient_id"]),
+            str(row["sample_id"]),
+        )
+        if key not in sample_keys:
+            continue
+        identity_key = key[:2]
+        identity = identities[identity_key]
+        if key in resolved_keys:
+            raise ValueError(
+                f"ambiguous sample reference: {key[0]}/{key[1]}/{key[2]}"
+            )
+        resolved_keys.add(key)
+        identity.setdefault("samples", {})[key[2]] = int(row["sample_internal_id"])
+    missing_samples = sorted(sample_keys - resolved_keys)
+    if missing_samples:
+        raise ValueError(f"unknown sample references: {missing_samples}")
     for study_id, patient_id, hierarchy in parsed:
         known = identities[(study_id, patient_id)].setdefault("samples", {})
         for sample in hierarchy.get("samples", []):
@@ -315,7 +346,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
             sample_internal = None if raw_sample_id in (None, "", "UNMATCHED") else sample_map.get(raw_sample_id)
             for part in sample.get("parts", []):
                 part_number = part.get("part_number")
-                part_key = str(part.get("part_key") or part_number or "?")
+                part_key = str(part["part_key"])
                 part_row = {
                     "cancer_study_id": study_internal, "release_id": release_id,
                     "patient_id": patient_internal,
@@ -329,7 +360,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                 parts[part_key] = part_row
                 for block in part.get("blocks", []):
                     block_number = block.get("block_number")
-                    block_key = str(block.get("block_key") or block_number or "?")
+                    block_key = str(block["block_key"])
                     block_row = {
                         "cancer_study_id": study_internal, "release_id": release_id,
                         "patient_id": patient_internal,
@@ -370,13 +401,13 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                         if image_id in slides and slides[image_id] != slide_row:
                             raise ValueError(f"duplicate/conflicting slide: {study_id}/{patient_id}/{image_id}")
                         slides[image_id] = slide_row
-                        match_level = str(association.get("match_level") or ("UNMATCHED" if sample_internal is None else "BLOCK")).upper()
+                        match_level = str(association["match_level"]).upper()
                         placement = {
                             "cancer_study_id": study_internal, "release_id": release_id,
                             "patient_id": patient_internal,
                             "image_id": image_id, "part_key": part_key, "block_key": block_key,
                             "sample_id": sample_internal, "match_level": match_level,
-                            "specimen_key": association.get("specimen_key") or f"{match_level.lower()}::{part_key}::{block_key}",
+                            "specimen_key": association["specimen_key"],
                             "procedure_date_days": (
                                 int(association["procedure_date_days"])
                                 if association.get("procedure_date_days") not in (None, "")
@@ -400,26 +431,38 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
     return tables, _resource_index_rows(resource_rows), studies
 
 
-def _resource_index_rows(parsed: list[tuple[str, str, dict]]) -> dict[str, dict[str, set[str]]]:
-    studies: dict[str, dict[str, set[str]]] = {}
+def _resource_index_rows(parsed: list[tuple[str, str, dict]]) -> dict[str, dict[str, object]]:
+    studies: dict[str, dict[str, object]] = {}
     for study_id, patient_id, hierarchy in parsed:
-        resources = studies.setdefault(study_id, {"patients": set(), "samples": set(), "slides": set()})
-        resources["patients"].add(patient_id)
+        resources = studies.setdefault(
+            study_id,
+            {"patients": set(), "samples": set(), "slides": {}},
+        )
+        resources["patients"].add(patient_id)  # type: ignore[union-attr]
+        reference_sample = hierarchy.get(
+            "reference_sample_id", hierarchy.get("referenceSampleId")
+        )
+        if reference_sample not in (None, "", "UNMATCHED"):
+            resources["samples"].add(str(reference_sample))  # type: ignore[union-attr]
         for sample in hierarchy.get("samples", []):
             if isinstance(sample, dict) and sample.get("sample_id") not in (None, "", "UNMATCHED"):
-                resources["samples"].add(str(sample["sample_id"]))
+                resources["samples"].add(str(sample["sample_id"]))  # type: ignore[union-attr]
             for part in sample.get("parts", []) if isinstance(sample, dict) else []:
                 for block in part.get("blocks", []) if isinstance(part, dict) else []:
                     for slide in block.get("slides", []) if isinstance(block, dict) else []:
                         if slide.get("image_id") is not None:
-                            resources["slides"].add(str(slide["image_id"]))
-    owners: dict[tuple[str, str], str] = {}
-    for study_id, resources in studies.items():
-        for resource_type, values in resources.items():
-            for resource_id in values:
-                owner = owners.setdefault((resource_type, resource_id), study_id)
-                if owner != study_id:
-                    raise ValueError(f"resource identifier is ambiguous across studies: {resource_type}/{resource_id}")
+                            image_id = str(slide["image_id"])
+                            binding = {
+                                "patient_id": patient_id,
+                                "source_path": slide.get("slide_path"),
+                            }
+                            slides = resources["slides"]  # type: ignore[assignment]
+                            previous = slides.get(image_id)
+                            if previous is not None and previous != binding:
+                                raise ValueError(
+                                    f"conflicting slide binding: {study_id}/{image_id}"
+                                )
+                            slides[image_id] = binding
     return studies
 
 
@@ -427,26 +470,39 @@ def _read_resource_index(path: Path | None) -> dict | None:
     if path is None or not path.exists():
         return None
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("version") != 1:
-        raise ValueError("resource index must be a version 1 JSON object")
+    if not isinstance(value, dict) or value.get("version") != 2:
+        raise ValueError("resource index must be a version 2 JSON object")
     return value
 
 
-def _merge_resource_index(rows: dict[str, dict[str, set[str]]], release_id: str, existing: dict | None) -> dict:
+def _merge_resource_index(rows: dict[str, dict[str, object]], release_id: str, existing: dict | None) -> dict:
     studies = {
         str(study_id): {
             resource_type: {str(value) for value in (resources.get(resource_type) or [])}
-            for resource_type in ("patients", "samples", "slides")
+            for resource_type in ("patients", "samples")
+        } | {
+            "slides": {
+                str(image_id): dict(binding)
+                for image_id, binding in (resources.get("slides") or {}).items()
+                if isinstance(binding, dict)
+            }
         }
         for study_id, resources in ((existing or {}).get("studies") or {}).items()
         if isinstance(resources, dict)
     }
     studies.update(rows)
     return {
-        "version": 1, "release_id": release_id,
+        "version": 2, "release_id": release_id,
         "generated_at": datetime.now(UTC).isoformat(),
         "studies": {
-            study_id: {resource_type: sorted(values) for resource_type, values in resources.items()}
+            study_id: {
+                resource_type: (
+                    sorted(values)
+                    if resource_type != "slides"
+                    else {key: values[key] for key in sorted(values)}
+                )
+                for resource_type, values in resources.items()
+            }
             for study_id, resources in sorted(studies.items())
         },
     }

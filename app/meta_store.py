@@ -112,6 +112,14 @@ WHERE image_id = :image_id
 LIMIT 1
 """
 
+SLIDE_SCOPED_SQL = f"""
+SELECT *
+FROM {_TABLE}
+WHERE image_id = :image_id
+  AND PATIENT_ID = :patient_id
+LIMIT 1
+"""
+
 SLIDE_PATH_SQL = f"""
 SELECT path FROM {_INVENTORY}
 WHERE image_id = :image_id
@@ -152,39 +160,38 @@ SELECT
     match_level,
     patient_id,
     sample_id,
-    CANCER_TYPE,
-    CANCER_TYPE_DETAILED,
-    ONCOTREE_CODE,
-    PRIMARY_SITE,
-    SAMPLE_TYPE,
-    METASTATIC_SITE,
-    TUMOR_PURITY,
-    ONCOGENIC_MUTATIONS,
-    NUM_ONCOGENIC_MUTATIONS,
-    CVR_TMB_SCORE,
-    MSI_TYPE,
-    image_id,
-    block_id,
-    block_label,
+    reference_sample_id,
+    part_key,
+    part_number,
+    part_designator,
     part_type,
     part_description,
+    subspecialty,
     path_dx_title,
+    block_key,
+    block_number,
+    block_label,
+    image_id,
     stain_name,
     stain_group,
+    is_hne,
+    is_ihc,
     magnification,
     file_size_bytes,
-    slide_path,
-    procedure_date,
-    reference_sample_id,
-    reference_sequencing_date,
-    slide_timepoint_days,
-    slide_timepoint_source
+    can_serve_tiles,
+    barcode,
+    slide_type,
+    specimen_key,
+    procedure_date_days,
+    timepoint_source,
+    slide_path
 FROM {_CANONICAL_ASSOCIATION_TABLE}
 WHERE patient_id = :patient_id
 ORDER BY
     sample_id,
     match_level,
-    procedure_date,
+    part_key,
+    block_key,
     image_id
 """
 
