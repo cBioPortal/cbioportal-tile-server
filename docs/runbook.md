@@ -123,7 +123,7 @@ The tile server validates the signature, algorithm, audience, scope, subject,
 authorization-contract version, issued-at time, expiry, and maximum lifetime.
 It then validates the token's `study_id` against the loader-published mapping
 for every patient, sample, and slide resource. The mapping covers patient
-hierarchy, slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
+slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
 search. A client-supplied `studyId` query parameter is only a consistency
 check and cannot widen access. A missing mapping fails closed; it is not
 interpreted as “no slides”.
@@ -174,14 +174,13 @@ short-lived capability and explicit paths:
 ```bash
 cd ../knowledgesystems-k8s-deployment
 export CBIOPORTAL_URL=https://cbioportal.mskcc.org
-export WSI_PATIENT_PATH=/wsi/patient/<patient-id>
 export WSI_TILE_PATH=/wsi/tiles/<slide-id>/zxy/4/0/0
 export WSI_BEARER_TOKEN='<short-lived-token>'
 tests/smoke/slide-viewer-routing.sh
 ```
 
-The test first requires unauthenticated patient and tile requests to return
-`401` or `403`, then verifies both routes succeed with the Bearer token.
+The test first requires unauthenticated tile requests to return `401` or `403`,
+then verifies the tile route succeeds with the Bearer token.
 Also verify anonymous token requests return `401`, unauthorized studies
 return `403`, tokens are cached per study, study-A tokens cannot access
 study-B resources, and metadata responses are not publicly cacheable.
@@ -190,7 +189,7 @@ study-B resources, and metadata responses are not publicly cacheable.
 
 - Tiles: `private, max-age=3600`.
 - Thumbnails: `private, max-age=300`.
-- Patient hierarchy, slide metadata, and search: `private, no-store`.
+- Slide metadata and search: `private, no-store`.
 - Thumbnails and metadata now use 24-hour Redis TTLs by default.
 - Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
   explicitly for the resulting working set.
@@ -211,11 +210,14 @@ The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
 1. `tools/wsi_canonical_associations_pipeline.sql`
 2. `tools/wsi_summary_pipeline.sql`
 
-The bundle output is loaded into the cBioPortal ClickHouse
-`wsi_patient_hierarchy` table. The loader accepts one materialized hierarchy per
-JSONL line, validates the entire input before writing, rejects duplicate
-`(study_id, patient_id)` rows, assigns a unique publication ID, and publishes
-the manifest and trusted study-to-patient/sample/slide index only after all
+The canonical association output is the loader's strict, normalized JSONL
+contract. Each row contains explicit part and block keys, slide and placement
+facts, an optional portal sample reference, and `slide_path` only for trusted
+index publication. It contains neither portal-owned clinical data nor a
+sequencing date. The loader resolves every study/patient/sample reference by
+its full tuple, validates the entire input before writing, rejects malformed
+keys and duplicate placements, assigns a unique release ID, and publishes the
+release row and version-2 study-to-patient/sample/slide index only after all
 rows are accepted:
 
 ```bash
@@ -224,12 +226,13 @@ python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
   --resource-index /var/lib/wsi/wsi-resource-index.json
 ```
 
-Retrying a version creates a new publication ID; the active manifest points to
-that ID, so corrected rows win deterministically. A failed row insert leaves
-the previous manifest active and leaves only invisible orphan rows. The
-backend query uses the active publication ID plus deterministic `argMax` keys,
-not `LIMIT 1`. Rebuild pre-publication-ID tables before a private-study
-rollout; an old manifest engine is not the new publication contract.
+Retrying a version creates a new release ID; the latest completed release
+points to that ID, so corrected rows win deterministically. A failed row or
+index publication leaves the previous release and trusted index active. The
+backend query uses the active release ID plus deterministic `argMax` keys,
+not `LIMIT 1`. This is a coordinated pre-release rebuild: recreate the
+canonical table, snapshot, ClickHouse WSI data, and trusted index before a
+private-study rollout.
 
 Preview migrations before writing:
 

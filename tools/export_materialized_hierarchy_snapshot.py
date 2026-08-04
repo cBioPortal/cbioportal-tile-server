@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a study-scoped WSI hierarchy snapshot as JSONL rows."""
+"""Export canonical pathology rows as a study-scoped JSONL snapshot."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from app.config import settings
-from app.meta import get_patient_hierarchy
+from app import meta_store
 
 
 def _read_patient_ids(study_dir: Path) -> list[str]:
@@ -52,19 +52,23 @@ def main() -> int:
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
         futures = {
-            executor.submit(get_patient_hierarchy, patient_id, args.warehouse_id): patient_id
+            executor.submit(
+                meta_store.get_patient_association_rows,
+                patient_id,
+                args.warehouse_id,
+            ): patient_id
             for patient_id in patient_ids
         }
         for future in as_completed(futures):
             patient_id = futures[future]
-            hierarchy = future.result()
-            if hierarchy is None:
+            slides = future.result()
+            if not slides:
                 missing.append(patient_id)
                 continue
             rows[patient_id] = {
                 "study_id": args.study_id,
                 "patient_id": patient_id,
-                "hierarchy": hierarchy,
+                "slides": slides,
             }
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +78,7 @@ def main() -> int:
             handle.write("\n")
 
     print(
-        f"Wrote {len(rows)} hierarchy rows for {args.study_id} to {output}"
+        f"Wrote {len(rows)} canonical association rows for {args.study_id} to {output}"
         f" (missing {len(missing)} patients)"
     )
     if missing:

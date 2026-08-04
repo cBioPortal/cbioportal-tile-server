@@ -33,3 +33,27 @@ def test_canonical_pipeline_prefers_reef_inventory_paths():
     )
     sql = sql_path.read_text(encoding="utf-8")
     assert reef_pattern in sql
+
+
+def test_canonical_pipeline_emits_the_normalized_loader_contract():
+    sql_path = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_canonical_associations_pipeline.sql"
+    )
+    sql = sql_path.read_text(encoding="utf-8")
+
+    for column in (
+        "part_key",
+        "block_key",
+        "reference_sample_id",
+        "is_hne",
+        "is_ihc",
+        "can_serve_tiles",
+        "specimen_key",
+        "procedure_date_days",
+        "timepoint_source",
+        "slide_path",
+    ):
+        assert column in sql
+    assert "reference_sequencing_date" not in sql

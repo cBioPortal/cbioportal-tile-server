@@ -35,7 +35,7 @@ ATTRIBUTE_COLUMNS = [
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--study-id", required=True, help="Cancer study identifier.")
-    parser.add_argument("--snapshot", help="Input hierarchy JSONL snapshot.")
+    parser.add_argument("--snapshot", help="Input canonical WSI association JSONL snapshot.")
     parser.add_argument("--study-dir", required=True, help="Target study directory.")
     parser.add_argument(
         "--warehouse-id",
@@ -82,13 +82,17 @@ def _load_counts(snapshot: Path, study_id: str) -> dict[str, dict[str, int]]:
             row = json.loads(line)
             if row.get("study_id") != study_id:
                 continue
-            hierarchy = row.get("hierarchy") or {}
-            for association in hierarchy.get("slide_associations", []):
-                sample_id = association.get("sample_id")
+            slides = row.get("slides")
+            if not isinstance(slides, list):
+                raise ValueError("canonical snapshot rows need a slides list")
+            for slide in slides:
+                if not isinstance(slide, dict):
+                    raise ValueError("canonical snapshot slides must be objects")
+                sample_id = slide.get("sample_id")
                 if not sample_id:
                     continue
                 counts[sample_id]["WSI_SAMPLE_SLIDE_COUNT"] += 1
-                match_level = (association.get("match_level") or "").upper()
+                match_level = (slide.get("match_level") or "").upper()
                 if match_level == "PART":
                     counts[sample_id]["WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT"] += 1
                 elif match_level == "BLOCK":
