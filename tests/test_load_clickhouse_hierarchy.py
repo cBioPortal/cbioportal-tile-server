@@ -78,7 +78,6 @@ def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
                 "image_id": "SLIDE-1",
                 "sample_id": "S-1",
                 "reference_sample_id": "S-1",
-                "reference_sequencing_date": "2024-01-20",
                 "part_number": "1",
                 "block_number": "A",
                 "block_label": "A1",
@@ -94,10 +93,12 @@ def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
 
     slide = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_slide FORMAT"))
     assert json.loads(slide.decode().splitlines()[0])["image_id"] == "SLIDE-1"
-    snapshot = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_patient_release FORMAT"))
+    snapshot = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release_patient FORMAT"))
     snapshot_row = json.loads(snapshot.decode().splitlines()[0])
     assert snapshot_row["reference_sample_id"] == 700
-    assert snapshot_row["reference_sequencing_date"] == "2024-01-20"
+    assert "reference_sequencing_date" not in snapshot_row
+    part_body = next(body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_part FORMAT"))
+    assert "release_version" not in json.loads(part_body.decode().splitlines()[0])
 
 
 def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
@@ -108,7 +109,6 @@ def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
             "patient_id": "P-1",
             "hierarchy": {
                 "reference_sample_id": "S-1",
-                "reference_sequencing_date": "2024-01-20",
                 "samples": [],
                 "slide_associations": [],
             },
@@ -121,7 +121,7 @@ def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
     snapshot_body = next(
         body
         for query, body in clickhouse.calls
-        if query.startswith("INSERT INTO wsi_patient_release FORMAT")
+        if query.startswith("INSERT INTO wsi_release_patient FORMAT")
     )
     assert json.loads(snapshot_body.decode().splitlines()[0])["reference_sample_id"] == 700
 
@@ -172,25 +172,25 @@ def test_retry_uses_a_new_release_and_normalized_tables(tmp_path):
     count, studies = load(snapshot, 7, clickhouse, resource_index)
     assert count == 1
     assert studies == {"study"}
-    first_manifest = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release_manifest")][-1]
+    first_manifest = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release")][-1]
     first_release = json.loads(first_manifest.decode().splitlines()[0])["release_id"]
     assert any(query.startswith("INSERT INTO wsi_slide FORMAT") for query, _ in clickhouse.calls)
     assert not any("hierarchy_json" in (body or b"").decode() for _, body in clickhouse.calls)
 
     load(snapshot, 7, clickhouse, resource_index)
-    manifests = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release_manifest")]
+    manifests = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release")]
     second_release = json.loads(manifests[-1].decode().splitlines()[0])["release_id"]
     assert second_release != first_release
     assert json.loads(resource_index.read_text())["studies"]["study"]["samples"] == ["S-1"]
 
 
-def test_failed_manifest_release_restores_previous_resource_index(tmp_path):
+def test_failed_release_restores_previous_resource_index(tmp_path):
     snapshot = snapshot_file(tmp_path, [{"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy()}])
     resource_index = tmp_path / "resource-index.json"
     load(snapshot, 7, RecordingClickHouse(), resource_index)
     previous_index = resource_index.read_text()
 
-    failing = RecordingClickHouse(fail_on="INSERT INTO wsi_release_manifest")
+    failing = RecordingClickHouse(fail_on="INSERT INTO wsi_release")
     with pytest.raises(RuntimeError, match="simulated"):
         load(snapshot, 8, failing, resource_index)
     assert resource_index.read_text() == previous_index

@@ -214,7 +214,7 @@ The bundle output is loaded into normalized cBioPortal ClickHouse WSI tables.
 The loader accepts one upstream hierarchy row per JSONL line, resolves every
 study/patient/sample reference against the portal, validates the entire input
 before writing, rejects duplicate `(study_id, patient_id)` rows, assigns a
-unique release ID, and publishes the manifest and trusted
+unique release ID, and publishes the release row and trusted
 study-to-patient/sample/slide index only after all rows are accepted:
 
 ```bash
@@ -223,12 +223,12 @@ python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
   --resource-index /var/lib/wsi/wsi-resource-index.json
 ```
 
-Retrying a version creates a new release ID; the active manifest points to
-that ID, so corrected rows win deterministically. A failed row insert leaves
-the previous manifest active and leaves only invisible orphan rows. The
+Retrying a version creates a new release ID; the latest completed release
+points to that ID, so corrected rows win deterministically. A failed row insert
+leaves the previous release active and leaves only invisible orphan rows. The
 backend query uses the active release ID plus deterministic `argMax` keys,
 not `LIMIT 1`. Rebuild pre-release-ID tables before a private-study
-rollout; an old manifest engine is not the new release contract.
+rollout; an old release engine is not the new release contract.
 
 Preview migrations before writing:
 

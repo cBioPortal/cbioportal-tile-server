@@ -3,8 +3,8 @@
 
 The upstream JSONL input is still accepted as an interchange format, but its
 portal-owned identifiers are resolved to cBioPortal internal IDs and only
-pathology-specific rows are written.  Every table insert uses one release
-ID; the manifest insert is the release boundary.
+pathology-specific rows are written. Every table insert uses one release ID;
+the release insert is the visibility boundary.
 """
 
 from __future__ import annotations
@@ -22,46 +22,45 @@ from urllib.request import Request, urlopen
 
 
 TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS wsi_release_manifest (
+CREATE TABLE IF NOT EXISTS wsi_release (
     cancer_study_id Int64,
-    active_release_version UInt64,
     release_id String,
-    updated_at DateTime64(6)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, active_release_version, release_id);
-CREATE TABLE IF NOT EXISTS wsi_patient_release (
-    cancer_study_id Int64, patient_id Int64, release_version UInt64,
-    release_id String, reference_sample_id Nullable(Int64),
-    reference_sequencing_date Nullable(DateTime64(6))
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, release_version, release_id);
+    release_version UInt64,
+    released_at DateTime64(6)
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, released_at, release_id);
+CREATE TABLE IF NOT EXISTS wsi_release_patient (
+    cancer_study_id Int64, release_id String, patient_id Int64,
+    reference_sample_id Nullable(Int64)
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id);
 CREATE TABLE IF NOT EXISTS wsi_part (
-    cancer_study_id Int64, patient_id Int64, release_version UInt64,
-    release_id String, part_key String, part_number Nullable(String),
+    cancer_study_id Int64, release_id String, patient_id Int64,
+    part_key String, part_number Nullable(String),
     part_designator Nullable(String), part_type Nullable(String),
     part_description Nullable(String), subspecialty Nullable(String),
     path_dx_title Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, release_version, release_id, part_key);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id, part_key);
 CREATE TABLE IF NOT EXISTS wsi_block (
-    cancer_study_id Int64, patient_id Int64, release_version UInt64,
-    release_id String, part_key String, block_key String,
+    cancer_study_id Int64, release_id String, patient_id Int64,
+    part_key String, block_key String,
     block_number Nullable(String), block_label Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, release_version, release_id, part_key, block_key);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id, part_key, block_key);
 CREATE TABLE IF NOT EXISTS wsi_slide (
-    cancer_study_id Int64, patient_id Int64, release_version UInt64,
-    release_id String, image_id String, stain_name Nullable(String),
+    cancer_study_id Int64, release_id String, patient_id Int64,
+    image_id String, stain_name Nullable(String),
     stain_group Nullable(String), is_hne Bool, is_ihc Bool,
     magnification Nullable(String), file_size_bytes Nullable(UInt64),
     can_serve_tiles Bool, barcode Nullable(String), slide_type Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, release_version, release_id, image_id);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id, image_id);
 CREATE TABLE IF NOT EXISTS wsi_slide_placement (
-    cancer_study_id Int64, patient_id Int64, release_version UInt64,
-    release_id String, image_id String, part_key String, block_key String,
+    cancer_study_id Int64, release_id String, patient_id Int64,
+    image_id String, part_key String, block_key String,
     sample_id Nullable(Int64), match_level String, specimen_key String,
     procedure_date_days Nullable(Int32), timepoint_source Nullable(String)
-) ENGINE = MergeTree() ORDER BY (cancer_study_id, patient_id, release_version, release_id, image_id, part_key, block_key);
+) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id, image_id, part_key, block_key);
 """
 
 INSERT_TABLES = (
-    "wsi_patient_release",
+    "wsi_release_patient",
     "wsi_part",
     "wsi_block",
     "wsi_slide",
@@ -147,16 +146,12 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
     samples: dict[str | None, dict] = {}
     associations: list[dict] = []
     reference_samples: set[str] = set()
-    reference_dates: set[str] = set()
     for row in rows:
         if not isinstance(row, dict) or row.get("image_id") is None:
             raise ValueError("canonical slide rows need an image_id")
         reference_sample = row.get("reference_sample_id")
         if reference_sample not in (None, "", "UNMATCHED"):
             reference_samples.add(str(reference_sample))
-        reference_date = row.get("reference_sequencing_date")
-        if reference_date not in (None, ""):
-            reference_dates.add(str(reference_date))
         sample_id = row.get("sample_id") or None
         sample = samples.setdefault(sample_id, {"sample_id": sample_id, "parts": {}})
         part_number = row.get("part_number")
@@ -201,11 +196,8 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
         })
     if len(reference_samples) > 1:
         raise ValueError("canonical rows contain conflicting reference samples")
-    if len(reference_dates) > 1:
-        raise ValueError("canonical rows contain conflicting reference sequencing dates")
     return {
         "reference_sample_id": next(iter(reference_samples), None),
-        "reference_sequencing_date": next(iter(reference_dates), None),
         "samples": [
             {
                 **sample,
@@ -298,13 +290,10 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
             reference_sample = None
         if reference_sample is not None and reference_sample not in sample_map:
             raise ValueError(f"unknown reference sample: {study_id}/{patient_id}/{reference_sample}")
-        tables["wsi_patient_release"].append({
-            "cancer_study_id": study_internal, "patient_id": patient_internal,
-            "release_version": version, "release_id": release_id,
+        tables["wsi_release_patient"].append({
+            "cancer_study_id": study_internal, "release_id": release_id,
+            "patient_id": patient_internal,
             "reference_sample_id": sample_map.get(reference_sample) if reference_sample else None,
-            "reference_sequencing_date": hierarchy.get(
-                "reference_sequencing_date", hierarchy.get("referenceSequencingDate")
-            ),
         })
         raw_associations = hierarchy.get("slide_associations", [])
         if not isinstance(raw_associations, list) or any(
@@ -328,8 +317,8 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                 part_number = part.get("part_number")
                 part_key = str(part.get("part_key") or part_number or "?")
                 part_row = {
-                    "cancer_study_id": study_internal, "patient_id": patient_internal,
-                    "release_version": version, "release_id": release_id,
+                    "cancer_study_id": study_internal, "release_id": release_id,
+                    "patient_id": patient_internal,
                     "part_key": part_key, "part_number": str(part_number) if part_number is not None else None,
                     "part_designator": part.get("part_designator"), "part_type": part.get("part_type"),
                     "part_description": part.get("part_description"), "subspecialty": part.get("subspecialty"),
@@ -342,8 +331,8 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                     block_number = block.get("block_number")
                     block_key = str(block.get("block_key") or block_number or "?")
                     block_row = {
-                        "cancer_study_id": study_internal, "patient_id": patient_internal,
-                        "release_version": version, "release_id": release_id,
+                        "cancer_study_id": study_internal, "release_id": release_id,
+                        "patient_id": patient_internal,
                         "part_key": part_key, "block_key": block_key,
                         "block_number": str(block_number) if block_number is not None else None,
                         "block_label": block.get("block_label"),
@@ -369,8 +358,8 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                                 f"association sample does not match slide placement: {study_id}/{patient_id}/{image_id}"
                             )
                         slide_row = {
-                            "cancer_study_id": study_internal, "patient_id": patient_internal,
-                            "release_version": version, "release_id": release_id,
+                            "cancer_study_id": study_internal, "release_id": release_id,
+                            "patient_id": patient_internal,
                             "image_id": image_id, "stain_name": slide.get("stain_name"),
                             "stain_group": slide.get("stain_group"), "is_hne": bool(slide.get("is_hne", False)),
                             "is_ihc": bool(slide.get("is_ihc", False)), "magnification": slide.get("magnification"),
@@ -383,8 +372,8 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                         slides[image_id] = slide_row
                         match_level = str(association.get("match_level") or ("UNMATCHED" if sample_internal is None else "BLOCK")).upper()
                         placement = {
-                            "cancer_study_id": study_internal, "patient_id": patient_internal,
-                            "release_version": version, "release_id": release_id,
+                            "cancer_study_id": study_internal, "release_id": release_id,
+                            "patient_id": patient_internal,
                             "image_id": image_id, "part_key": part_key, "block_key": block_key,
                             "sample_id": sample_internal, "match_level": match_level,
                             "specimen_key": association.get("specimen_key") or f"{match_level.lower()}::{part_key}::{block_key}",
@@ -497,8 +486,8 @@ def load(snapshot: Path, version: int, clickhouse: ClickHouse, resource_index_pa
     if resource_index_path and index_payload:
         _publish_resource_index(resource_index_path, index_payload)
     try:
-        _insert_rows(clickhouse, "wsi_release_manifest", [
-            {"cancer_study_id": study_id, "active_release_version": version, "release_id": release_id, "updated_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
+        _insert_rows(clickhouse, "wsi_release", [
+            {"cancer_study_id": study_id, "release_id": release_id, "release_version": version, "released_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
             for study_id in sorted(study_internal_ids)
         ])
     except Exception:

@@ -5,17 +5,17 @@ structure and slide facts. The tile server loader resolves its stable study,
 patient, and sample identifiers against cBioPortal, validates all references,
 and writes one append-only release to the normalized ClickHouse tables:
 
-- `wsi_release_manifest`
-- `wsi_patient_snapshot`
+- `wsi_release`
+- `wsi_release_patient`
 - `wsi_part`
 - `wsi_block`
 - `wsi_slide`
 - `wsi_slide_placement`
 
-The manifest is the release boundary. A retry receives a new release
-ID, and the active version is advanced only after all normalized rows have been
-inserted. The trusted resource index is generated from the same portal
-references and slide IDs; a failed manifest release restores the prior
+The release row is the visibility boundary. A retry receives a new release
+ID, and it is inserted only after all normalized rows have been inserted. The
+trusted resource index is generated from the same portal references and slide
+IDs; a failed release restores the prior
 index. Unknown or mismatched study/patient/sample references, duplicate
 placements, and orphan slide associations are rejected before release.
 
