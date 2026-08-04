@@ -1,7 +1,7 @@
 """Trusted study-to-resource bindings for authenticated WSI requests.
 
 The index is produced by ``tools/load_clickhouse_hierarchy.py`` from the same
-normalized publication that cBioPortal activates. It is deliberately not
+normalized release that cBioPortal activates. It is deliberately not
 derived from a request's ``studyId`` query parameter.
 """
 

@@ -1,26 +1,26 @@
-# Normalized WSI publication flow
+# Normalized WSI release flow
 
 The upstream pathology association dataset remains the source for pathology
 structure and slide facts. The tile server loader resolves its stable study,
 patient, and sample identifiers against cBioPortal, validates all references,
-and writes one append-only publication to the normalized ClickHouse tables:
+and writes one append-only release to the normalized ClickHouse tables:
 
-- `wsi_publication_manifest`
+- `wsi_release_manifest`
 - `wsi_patient_snapshot`
 - `wsi_part`
 - `wsi_block`
 - `wsi_slide`
 - `wsi_slide_placement`
 
-The manifest is the publication boundary. A retry receives a new publication
+The manifest is the release boundary. A retry receives a new release
 ID, and the active version is advanced only after all normalized rows have been
 inserted. The trusted resource index is generated from the same portal
-references and slide IDs; a failed manifest publication restores the prior
+references and slide IDs; a failed manifest release restores the prior
 index. Unknown or mismatched study/patient/sample references, duplicate
-placements, and orphan slide associations are rejected before publication.
+placements, and orphan slide associations are rejected before release.
 
 cBioPortal assembles `GET /api/wsi/v2/hierarchy/{studyId}/{patientId}` from the
-active normalized publication. The response contains only the nested WSI
+active normalized release. The response contains only the nested WSI
 structure and slide placement facts. Unmatched pathology is represented by a
 null `sampleId` and an explicit sample group; there is no `UNMATCHED` sample
 record and no flat `slide_associations` payload.
