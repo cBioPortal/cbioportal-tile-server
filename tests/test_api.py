@@ -272,21 +272,19 @@ class TestHealth:
         monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
 
         response = api_client.get(
-            "/patient/same-patient",
+            "/tiles/1492807/metadata",
             headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
         )
 
         assert response.status_code == 503
 
-    def test_patient_raw_metadata_and_search_are_study_filtered(
+    def test_raw_metadata_and_search_are_study_filtered(
         self, api_client, monkeypatch, tmp_path
     ):
         secret = configure_resource_auth(monkeypatch, tmp_path)
         token_a = make_wsi_token(secret, "study-a")
 
         async def fake_in_thread(fn, *args):
-            if fn is main_module.get_patient_hierarchy:
-                return {"patient_id": "patient-a", "samples": []}
             if fn is main_module.get_slide_dbmeta:
                 return {"image_id": args[0]}
             return [
@@ -295,14 +293,6 @@ class TestHealth:
             ]
 
         with patch.object(main_module, "_in_thread", new=fake_in_thread):
-            patient = api_client.get(
-                "/patient/patient-a?studyId=study-a",
-                headers={"Authorization": f"Bearer {token_a}"},
-            )
-            other_patient = api_client.get(
-                "/patient/patient-b?studyId=study-b",
-                headers={"Authorization": f"Bearer {token_a}"},
-            )
             raw_metadata = api_client.get(
                 "/slides/1492807/dbmeta", headers={"Authorization": f"Bearer {token_a}"}
             )
@@ -310,8 +300,6 @@ class TestHealth:
                 "/search?q=patient", headers={"Authorization": f"Bearer {token_a}"}
             )
 
-        assert patient.status_code == 200
-        assert other_patient.status_code == 403
         assert raw_metadata.status_code == 200
         assert [item["id"] for item in search.json()] == ["patient-a"]
 

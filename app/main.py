@@ -37,7 +37,7 @@ from .metrics import (
     metrics_payload,
     track_image_operation,
 )
-from .meta import get_patient_hierarchy, get_slide_dbmeta, search_suggestions
+from .meta import get_slide_dbmeta, search_suggestions
 from .rate_limit import EXPENSIVE_PATH_PREFIXES, rate_limiter
 from .resource_index import ResourceIndexUnavailable, get_resource_index
 from .slides import SlideCache
@@ -288,46 +288,6 @@ def _filter_search_results(request: Request, results: list[dict]) -> list[dict]:
 @app.get("/health")
 def health():
     return {"status": "ok", "n_workers": settings.n_workers}
-
-
-async def _patient_hierarchy(request: Request, patient_id: str, bootstrap: bool) -> Response:
-    study_id = _authorize_resource(request, "patients", patient_id)
-    if study_id is None:
-        study_id = request.query_params.get("studyId")
-
-    # The local snapshot runner installs this immutable fixture on app.state;
-    # production uses the Databricks materialized hierarchy.
-    snapshot = getattr(app.state, "wsi_snapshot_hierarchies", {})
-    hierarchy = snapshot.get(study_id, {}).get(patient_id) if study_id else None
-    if hierarchy is None:
-        try:
-            hierarchy = await _in_thread(
-                get_patient_hierarchy,
-                patient_id,
-                settings.databricks_warehouse_id,
-            )
-        except Exception:
-            logger.exception("Patient hierarchy query failed for %s", patient_id)
-            raise HTTPException(status_code=502, detail="Patient hierarchy query failed")
-    if hierarchy is None:
-        raise HTTPException(status_code=404, detail="Patient hierarchy not found")
-
-    payload = {"hierarchy": hierarchy, "initial": None} if bootstrap else hierarchy
-    return Response(
-        content=json.dumps(payload, separators=(",", ":")),
-        media_type="application/json",
-        headers=PHI_CACHE_HEADERS,
-    )
-
-
-@app.get("/patient/{patient_id}", include_in_schema=False)
-async def patient_hierarchy(request: Request, patient_id: str) -> Response:
-    return await _patient_hierarchy(request, patient_id, bootstrap=False)
-
-
-@app.get("/patient/{patient_id}/bootstrap", include_in_schema=False)
-async def patient_hierarchy_bootstrap(request: Request, patient_id: str) -> Response:
-    return await _patient_hierarchy(request, patient_id, bootstrap=True)
 
 
 @app.get("/metrics", include_in_schema=False)

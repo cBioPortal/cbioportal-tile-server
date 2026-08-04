@@ -123,7 +123,7 @@ The tile server validates the signature, algorithm, audience, scope, subject,
 authorization-contract version, issued-at time, expiry, and maximum lifetime.
 It then validates the token's `study_id` against the loader-published mapping
 for every patient, sample, and slide resource. The mapping covers patient
-hierarchy, slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
+slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
 search. A client-supplied `studyId` query parameter is only a consistency
 check and cannot widen access. A missing mapping fails closed; it is not
 interpreted as “no slides”.
@@ -174,14 +174,13 @@ short-lived capability and explicit paths:
 ```bash
 cd ../knowledgesystems-k8s-deployment
 export CBIOPORTAL_URL=https://cbioportal.mskcc.org
-export WSI_PATIENT_PATH=/wsi/patient/<patient-id>
 export WSI_TILE_PATH=/wsi/tiles/<slide-id>/zxy/4/0/0
 export WSI_BEARER_TOKEN='<short-lived-token>'
 tests/smoke/slide-viewer-routing.sh
 ```
 
-The test first requires unauthenticated patient and tile requests to return
-`401` or `403`, then verifies both routes succeed with the Bearer token.
+The test first requires unauthenticated tile requests to return `401` or `403`,
+then verifies the tile route succeeds with the Bearer token.
 Also verify anonymous token requests return `401`, unauthorized studies
 return `403`, tokens are cached per study, study-A tokens cannot access
 study-B resources, and metadata responses are not publicly cacheable.
@@ -190,7 +189,7 @@ study-B resources, and metadata responses are not publicly cacheable.
 
 - Tiles: `private, max-age=3600`.
 - Thumbnails: `private, max-age=300`.
-- Patient hierarchy, slide metadata, and search: `private, no-store`.
+- Slide metadata and search: `private, no-store`.
 - Thumbnails and metadata now use 24-hour Redis TTLs by default.
 - Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
   explicitly for the resulting working set.
@@ -211,12 +210,12 @@ The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
 1. `tools/wsi_canonical_associations_pipeline.sql`
 2. `tools/wsi_summary_pipeline.sql`
 
-The bundle output is loaded into the cBioPortal ClickHouse
-`wsi_patient_hierarchy` table. The loader accepts one materialized hierarchy per
-JSONL line, validates the entire input before writing, rejects duplicate
-`(study_id, patient_id)` rows, assigns a unique publication ID, and publishes
-the manifest and trusted study-to-patient/sample/slide index only after all
-rows are accepted:
+The bundle output is loaded into normalized cBioPortal ClickHouse WSI tables.
+The loader accepts one upstream hierarchy row per JSONL line, resolves every
+study/patient/sample reference against the portal, validates the entire input
+before writing, rejects duplicate `(study_id, patient_id)` rows, assigns a
+unique publication ID, and publishes the manifest and trusted
+study-to-patient/sample/slide index only after all rows are accepted:
 
 ```bash
 python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \

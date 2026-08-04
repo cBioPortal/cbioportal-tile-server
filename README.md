@@ -8,14 +8,11 @@ OpenSeadragon via ZXY tile requests.  Used as the backend for the cBioPortal H&E
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness probe |
-| GET | `/patient/{patient_id}` | Slide hierarchy from Databricks |
 | GET | `/slides/{image_id}/dbmeta` | Raw Databricks row for a slide |
 | GET | `/search?q=` | Autocomplete suggestions |
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
 | GET | `/tiles/{slide_id}/thumbnail` | JPEG thumbnail |
 | GET | `/tiles/{slide_id}/zxy/{z}/{x}/{y}` | ZXY tile (JPEG) |
-| GET | `/patient/{patient_id}` | Study-bound patient hierarchy |
-| GET | `/patient/{patient_id}/bootstrap` | Study-bound hierarchy bootstrap |
 
 The same endpoints are also available under the explicit `/wsi` namespace,
 for example `/wsi/tiles/{slide_id}/...`.
@@ -94,12 +91,11 @@ snapshot. The token's `study_id` is authoritative. A `studyId` query parameter
 may be supplied by the frontend only as a consistency check and is never
 trusted on its own.
 
-The mapping is required for patient hierarchy requests, slide metadata,
-thumbnails, tiles, warmup, raw `/slides/{id}/dbmeta`, and `/search`. A token
+The mapping is required for slide metadata, thumbnails, tiles, warmup, raw
+`/slides/{id}/dbmeta`, and `/search`. A token
 for study A must return `403` for a patient or slide bound only to study B;
 missing or invalid capabilities return `401`. A missing or invalid trusted
-index fails closed with `503` rather than treating an authorization failure as
-an empty hierarchy. Search results are filtered to the token study.
+index fails closed with `503`. Search results are filtered to the token study.
 Resource identifiers must be unambiguous across studies in the published
 index; ambiguous patient, sample, or slide identifiers fail closed rather than
 being served through an ID-only metadata query.
