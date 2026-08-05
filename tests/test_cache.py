@@ -118,3 +118,18 @@ class TestRoundtrip:
         with patch.object(cache_module, "_redis", r):
             result = await cache_module.get_raw("search:p-0")
         assert result == data
+
+
+class TestRedisCircuitBreaker:
+    async def test_timeout_bypasses_subsequent_requests_during_backoff(self, monkeypatch):
+        r = _make_redis()
+        r.get = AsyncMock(side_effect=TimeoutError("redis unavailable"))
+        monkeypatch.setattr(cache_module.settings, "redis_failure_backoff_seconds", 5)
+        monkeypatch.setattr(cache_module, "_redis_disabled_until", 0.0)
+        monkeypatch.setattr(cache_module, "_redis_failure_logged", False)
+
+        with patch.object(cache_module, "_redis", r):
+            assert await cache_module.get_tile("abc", 1, 0, 0) is None
+            assert await cache_module.get_tile("abc", 1, 0, 0) is None
+
+        r.get.assert_awaited_once()

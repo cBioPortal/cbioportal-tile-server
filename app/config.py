@@ -25,6 +25,10 @@ def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
+
+
 def _env_bool(name: str, default: bool = True) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -70,6 +74,15 @@ class Settings:
 
     # Redis tile cache
     redis_url: str = field(default_factory=lambda: _env_str("REDIS_URL", "redis://redis:6379"))
+    redis_connect_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("REDIS_CONNECT_TIMEOUT_SECONDS", 0.25)
+    )
+    redis_command_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("REDIS_COMMAND_TIMEOUT_SECONDS", 0.25)
+    )
+    redis_failure_backoff_seconds: float = field(
+        default_factory=lambda: _env_float("REDIS_FAILURE_BACKOFF_SECONDS", 5.0)
+    )
     tile_cache_ttl: int = field(default_factory=lambda: _env_int("TILE_CACHE_TTL", 86_400))
     thumbnail_cache_ttl: int = field(default_factory=lambda: _env_int("THUMBNAIL_CACHE_TTL", 86_400))
     metadata_cache_ttl: int = field(default_factory=lambda: _env_int("METADATA_CACHE_TTL", 86_400))
@@ -89,6 +102,10 @@ class Settings:
     # Block cache
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
     blockcache_block_size: int = field(default_factory=lambda: _env_int("BLOCKCACHE_BLOCK_SIZE", 8 * 1024 * 1024))
+    blockcache_max_bytes: int = field(default_factory=lambda: _env_int("BLOCKCACHE_MAX_BYTES", 0))
+    blockcache_prune_interval_seconds: int = field(
+        default_factory=lambda: _env_int("BLOCKCACHE_PRUNE_INTERVAL_SECONDS", 60)
+    )
 
     # Test-only local slide fixtures
     test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))

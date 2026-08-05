@@ -30,7 +30,6 @@ services:
       WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-900}
       WSI_RESOURCE_INDEX_FILE: ${WSI_RESOURCE_INDEX_FILE:-}
       WSI_TEST_SLIDE_MAP_FILE: ${WSI_TEST_SLIDE_MAP_FILE:-}
-      WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
 
       # ── Tile settings ─────────────────────────────────────────────────────
@@ -40,6 +39,9 @@ services:
 
       # ── Redis cache ───────────────────────────────────────────────────────
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
+      REDIS_CONNECT_TIMEOUT_SECONDS: ${REDIS_CONNECT_TIMEOUT_SECONDS:-0.25}
+      REDIS_COMMAND_TIMEOUT_SECONDS: ${REDIS_COMMAND_TIMEOUT_SECONDS:-0.25}
+      REDIS_FAILURE_BACKOFF_SECONDS: ${REDIS_FAILURE_BACKOFF_SECONDS:-5}
       TILE_CACHE_TTL: ${TILE_CACHE_TTL:-86400}
       THUMBNAIL_CACHE_TTL: ${THUMBNAIL_CACHE_TTL:-86400}
       METADATA_CACHE_TTL: ${METADATA_CACHE_TTL:-86400}
@@ -58,6 +60,9 @@ services:
       # requests. Set BLOCKCACHE_PATH empty explicitly to disable it.
       BLOCKCACHE_PATH: ${BLOCKCACHE_PATH:-/cache/slide-blocks}
       BLOCKCACHE_BLOCK_SIZE: ${BLOCKCACHE_BLOCK_SIZE:-8388608}   # 8 MB
+      BLOCKCACHE_MAX_BYTES: ${BLOCKCACHE_MAX_BYTES:-19327352832} # 18 GiB of 20 GiB volume
+      BLOCKCACHE_PRUNE_INTERVAL_SECONDS: ${BLOCKCACHE_PRUNE_INTERVAL_SECONDS:-60}
+      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
     volumes:
       - slide_blocks:/cache/slide-blocks
       - ./tests/testdata:/app/testdata:ro

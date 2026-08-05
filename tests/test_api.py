@@ -375,10 +375,7 @@ class TestHealth:
             if fn is main_module.get_slide_dbmeta:
                 metadata_args.extend(args)
                 return {"image_id": args[0]}
-            return [
-                {"type": "patient", "id": "P-a"},
-                {"type": "patient", "id": "P-b"},
-            ]
+            return fn(*args)
 
         with patch.object(main_module, "_in_thread", new=fake_in_thread):
             raw_metadata = api_client.get(
@@ -391,6 +388,24 @@ class TestHealth:
         assert raw_metadata.status_code == 200
         assert metadata_args[2] == "P-a"
         assert [item["id"] for item in search.json()] == ["P-a"]
+
+    def test_authenticated_search_checks_cache_before_building_suggestions(
+        self, api_client, monkeypatch, tmp_path
+    ):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        token_a = make_wsi_token(secret, "study-a")
+        cached = [{"type": "patient", "id": "P-a", "label": "P-a", "sublabel": ""}]
+
+        with patch.object(cache_module, "get_raw", new=AsyncMock(return_value=cached)) as get_raw:
+            with patch.object(ResourceIndex, "suggestions", side_effect=AssertionError("cache miss")):
+                response = api_client.get(
+                    "/search?q=P-a", headers={"Authorization": f"Bearer {token_a}"}
+                )
+
+        assert response.status_code == 200
+        assert response.json() == cached
+        assert get_raw.await_count == 1
+        assert get_raw.await_args.args[0].startswith("search:study-a:")
 
 
 # ---------------------------------------------------------------------------
