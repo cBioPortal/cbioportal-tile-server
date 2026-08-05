@@ -10,6 +10,8 @@ The fixed workload is approximately:
 
 The request sequence is deterministic for `--seed`. Use the same slide IDs, study ID, request count, concurrency, seed, and timeout when comparing runs. `--warmup` requests are excluded from measurements.
 
+When `--max-zoom` and `--tile-grid` are omitted, the harness fetches each slide's metadata and generates in-bounds tile coordinates. Those options remain available as fallbacks for servers that do not expose metadata to the benchmark token. Results report both attempted and successful throughput, plus failure rate and latency by status.
+
 Example:
 
 ```bash

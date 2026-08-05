@@ -27,7 +27,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 RUN useradd --no-create-home --shell /bin/false appuser
 # A fresh named volume mounted at this path inherits this ownership.
-RUN mkdir -p /cache/slide-blocks && chown -R appuser:appuser /cache
+RUN mkdir -p /cache/slide-blocks /tmp/prometheus && chown -R appuser:appuser /cache /tmp/prometheus
+ENV PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
 USER appuser
 
 EXPOSE 8080

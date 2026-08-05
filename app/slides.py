@@ -14,15 +14,20 @@ this turns the p95 ~160 ms ECS latency into <1 ms NVMe reads.
 import logging
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Callable, Iterator, TypeVar
 
 from tiffslide import TiffSlide
 
 from .config import settings
+from .blockcache import cache_lease_for_slide, touch_slide_cache
 from .slide_store import SlideEntry as _Entry
 from .slide_store import close_entry as _close_entry
 from .slide_store import open_slide as _open_slide
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def _resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
@@ -49,72 +54,152 @@ def _resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     return bucket, key, opts
 
 
+@dataclass
+class _CacheEntry:
+    entry: _Entry
+    active: bool = False
+
+
+@dataclass
+class _OpenState:
+    event: threading.Event
+    error: BaseException | None = None
+
+
 class SlideCache:
-    """Thread-safe LRU cache of open TiffSlide objects."""
+    """Thread-safe LRU cache with exclusive leases for open TiffSlide objects."""
 
     def __init__(self, capacity: int) -> None:
         self._capacity = capacity
-        self._cache: OrderedDict[str, _Entry] = OrderedDict()
-        self._lock = threading.Lock()
-        # Per-slide locks prevent duplicate opens when many threads request
-        # the same cold slide simultaneously.
-        self._opening: dict[str, threading.Event] = {}
+        if capacity < 1:
+            raise ValueError("slide cache capacity must be at least one")
+        self._capacity = capacity
+        self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        self._condition = threading.Condition()
+        # Opening state coalesces cold opens without leaving waiters blocked
+        # when the opener fails.
+        self._opening: dict[str, _OpenState] = {}
+
+    def _acquire(self, slide_id: str) -> _CacheEntry:
+        while True:
+            opener: _OpenState | None = None
+            evicted: _CacheEntry | None = None
+            with self._condition:
+                cached = self._cache.get(slide_id)
+                if cached is not None:
+                    if cached.active:
+                        self._condition.wait()
+                        continue
+                    cached.active = True
+                    self._cache.move_to_end(slide_id)
+                    return cached
+
+                opener = self._opening.get(slide_id)
+                if opener is not None:
+                    # Wait outside the condition so the opener can publish its
+                    # result and wake all waiters.
+                    pass
+                else:
+                    # Capacity is strict: do not close a slide that another
+                    # request may still be using. Wait until an idle entry is
+                    # available before starting a new open.
+                    if len(self._cache) >= self._capacity:
+                        idle_key = next(
+                            (key for key, candidate in self._cache.items() if not candidate.active),
+                            None,
+                        )
+                        if idle_key is None:
+                            self._condition.wait()
+                            continue
+                        _, evicted = self._cache.popitem(last=False)
+
+                    opener = _OpenState(event=threading.Event())
+                    self._opening[slide_id] = opener
+
+            if opener is not None and slide_id in self._opening and evicted is None:
+                # If this state was already present, wait for its owner. The
+                # owner path below has evicted any idle entry before opening.
+                with self._condition:
+                    is_owner = self._opening.get(slide_id) is opener
+                if not is_owner:
+                    opener.event.wait()
+                    if opener.error is not None:
+                        raise opener.error
+                    continue
+
+            if evicted is not None:
+                _close_entry(evicted.entry)
+
+            cache_lease = cache_lease_for_slide(slide_id)
+            try:
+                if cache_lease is not None:
+                    cache_lease.__enter__()
+                slide, fileobj = _open_slide(slide_id, log)
+            except BaseException as exc:
+                if cache_lease is not None:
+                    cache_lease.__exit__(type(exc), exc, exc.__traceback__)
+                with self._condition:
+                    state = self._opening.pop(slide_id, None)
+                    if state is not None:
+                        state.error = exc
+                        state.event.set()
+                    self._condition.notify_all()
+                raise
+
+            with self._condition:
+                state = self._opening.pop(slide_id, None)
+                cached = _CacheEntry(
+                    _Entry(slide=slide, fileobj=fileobj, cache_lease=cache_lease),
+                    active=True,
+                )
+                self._cache[slide_id] = cached
+                touch_slide_cache(slide_id)
+                self._condition.notify_all()
+                if state is not None:
+                    state.event.set()
+                return cached
+
+    def _release(self, slide_id: str, entry: _CacheEntry) -> None:
+        with self._condition:
+            current = self._cache.get(slide_id)
+            if current is entry:
+                entry.active = False
+                self._cache.move_to_end(slide_id)
+                touch_slide_cache(slide_id)
+            self._condition.notify_all()
+
+    @contextmanager
+    def lease(self, slide_id: str) -> Iterator[TiffSlide]:
+        cached = self._acquire(slide_id)
+        try:
+            yield cached.entry.slide
+        finally:
+            self._release(slide_id, cached)
+
+    def run(self, slide_id: str, operation: Callable[..., T], *args) -> T:
+        with self.lease(slide_id) as slide:
+            return operation(slide, *args)
 
     def get(self, slide_id: str) -> TiffSlide:
-        # Fast path — slide already open
-        with self._lock:
-            if slide_id in self._cache:
-                self._cache.move_to_end(slide_id)
-                return self._cache[slide_id].slide
-
-            # If another thread is already opening this slide, wait for it
-            if slide_id in self._opening:
-                event = self._opening[slide_id]
-            else:
-                # Register intent to open; other threads will wait on the event
-                event = threading.Event()
-                self._opening[slide_id] = event
-                event = None  # sentinel: this thread is the opener
-
-        if event is not None:
-            # Another thread is opening — wait then return from cache
-            event.wait()
-            with self._lock:
-                if slide_id in self._cache:
-                    self._cache.move_to_end(slide_id)
-                    return self._cache[slide_id].slide
-            # Fallthrough: opener failed; try opening ourselves
-            return self.get(slide_id)
-
-        # This thread is responsible for opening — do it WITHOUT the lock
-        try:
-            slide, fileobj = _open_slide(slide_id, log)
-        except Exception:
-            with self._lock:
-                self._opening.pop(slide_id, None)
-            raise
-        finally:
-            # Always signal waiters even on error so they don't hang
-            with self._lock:
-                ev = self._opening.pop(slide_id, None)
-            if ev is not None:
-                ev.set()
-
-        with self._lock:
-            # Evict LRU if at capacity
-            if len(self._cache) >= self._capacity:
-                _, evicted = self._cache.popitem(last=False)
-                _close_entry(evicted)
-            self._cache[slide_id] = _Entry(slide=slide, fileobj=fileobj)
-            return slide
+        """Compatibility helper; callers performing work should use ``run``."""
+        cached = self._acquire(slide_id)
+        self._release(slide_id, cached)
+        return cached.entry.slide
 
     def invalidate(self, slide_id: str) -> None:
-        with self._lock:
-            if slide_id in self._cache:
-                _close_entry(self._cache.pop(slide_id))
+        entry = None
+        with self._condition:
+            cached = self._cache.get(slide_id)
+            if cached is not None and not cached.active:
+                entry = self._cache.pop(slide_id)
+                self._condition.notify_all()
+        if entry is not None:
+            _close_entry(entry.entry)
 
     def close_all(self) -> None:
-        with self._lock:
-            for entry in self._cache.values():
-                _close_entry(entry)
+        with self._condition:
+            entries = list(self._cache.values())
             self._cache.clear()
+            self._condition.notify_all()
+        for entry in entries:
+            _close_entry(entry.entry)

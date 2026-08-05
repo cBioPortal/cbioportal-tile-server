@@ -1,18 +1,50 @@
 # cbioportal-tile-server
 
-FastAPI tile server that streams SVS whole-slide images from Dell ECS (S3-compatible) to
-OpenSeadragon via ZXY tile requests.  Used as the backend for the cBioPortal H&E slide viewer.
+FastAPI tile server for cBioPortal whole-slide imaging (WSI). It serves slide
+tiles, thumbnails, and slide metadata to OpenSeadragon and related cBioPortal
+clients.
+
+This service is not the cBioPortal frontend and it is not the Spring backend.
+It is a separate runtime with its own storage, authorization, and deployment
+concerns.
+
+## Architecture at a glance
+
+For operators standing this up outside the MSK environment, the most important
+deployment boundary is:
+
+- `cBioPortal` authenticates the user, checks study access, and issues a
+  short-lived WSI Bearer token.
+- `cbioportal-tile-server` validates that token, enforces the trusted
+  study-to-resource index, and serves slide data.
+- an upstream data-preparation pipeline publishes the slide/resource index and
+  loads the corresponding WSI hierarchy release used by cBioPortal.
+
+Databricks is not a universal platform requirement for WSI. In this repository
+today:
+
+- tile and thumbnail authorization is driven by `WSI_RESOURCE_INDEX_FILE`
+- authenticated slide path resolution can come from the trusted index
+- unauthenticated search and fallback slide-path lookup use Databricks metadata
+- `/slides/{image_id}/dbmeta` returns a raw Databricks metadata row by design
+
+If your institution does not use Databricks, you can replace the upstream ETL
+platform, but you must still provide equivalent published inputs and either:
+
+- avoid the Databricks-dependent endpoints and flows, or
+- adapt this service to resolve metadata/search from your own source of truth
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness probe |
-| GET | `/slides/{image_id}/dbmeta` | Raw Databricks row for a slide |
+| GET | `/slides/{image_id}/dbmeta` | Raw metadata row for a slide; currently backed by Databricks |
 | GET | `/search?q=` | Autocomplete suggestions |
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
 | GET | `/tiles/{slide_id}/thumbnail` | JPEG thumbnail |
 | GET | `/tiles/{slide_id}/zxy/{z}/{x}/{y}` | ZXY tile (JPEG) |
+| GET | `/tiles/{slide_id}/warmup` | Prime overview reads for a slide |
 
 The same endpoints are also available under the explicit `/wsi` namespace,
 for example `/wsi/tiles/{slide_id}/...`.
@@ -30,6 +62,19 @@ valid `iat`/`exp` claims whose lifetime does not exceed `WSI_AUTH_MAX_TTL`.
 The `/wsi/health` alias is also unauthenticated for probes. Do not disable
 this check in production.
 
+## What this service needs
+
+At runtime, a production deployment needs:
+
+1. slide/image storage reachable by this service
+2. a trusted resource index published to `WSI_RESOURCE_INDEX_FILE`
+3. matching WSI token settings shared with cBioPortal
+4. any metadata backend required by the specific endpoints you expose
+
+Setting a tile-server URL in cBioPortal is not enough by itself. You must also
+publish the resource index, load the matching WSI hierarchy into cBioPortal's
+database, and configure slide storage access for this service.
+
 ## Quick start
 
 ```bash
@@ -38,18 +83,22 @@ printf 'WSI_AUTH_SECRET=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(op
 docker compose up --build
 ```
 
+The checked-in Docker Compose setup reflects the current MSK-oriented
+development environment. Treat it as a local rehearsal, not as a complete
+portable production recipe.
+
 ## Configuration
 
 All settings are environment variables (see `app/config.py`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AWS_ENDPOINT_URL` | — | Dell ECS endpoint |
-| `AWS_ACCESS_KEY_ID` | — | ECS access key |
-| `AWS_SECRET_ACCESS_KEY` | — | ECS secret key |
-| `DATABRICKS_HOST` | — | Databricks workspace URL |
-| `DATABRICKS_TOKEN` | — | Databricks PAT |
-| `DATABRICKS_WAREHOUSE_ID` | `0b49b7d78734ad5c` | SQL warehouse |
+| `AWS_ENDPOINT_URL` | — | S3-compatible object-store endpoint; Dell ECS in the current production deployment |
+| `AWS_ACCESS_KEY_ID` | — | Object-store access key |
+| `AWS_SECRET_ACCESS_KEY` | — | Object-store secret key |
+| `DATABRICKS_HOST` | — | Databricks workspace URL; required only for Databricks-backed metadata flows |
+| `DATABRICKS_TOKEN` | — | Databricks PAT; required only for Databricks-backed metadata flows |
+| `DATABRICKS_WAREHOUSE_ID` | `0b49b7d78734ad5c` | Databricks SQL warehouse for metadata/search queries |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with the cBioPortal capability issuer |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability-token audience |
 | `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for non-health routes |
@@ -82,6 +131,32 @@ overview-tile requests now return HTTP `422` with
 `{"error":"overview_requires_preprocessing"}` instead of attempting a
 memory-unsafe full-slide decode.
 
+## Dependency matrix
+
+The service does not use every backend for every route. The current behavior is:
+
+| Capability | Trusted resource index | Slide object storage | Databricks |
+|-----------|-------------------------|----------------------|------------|
+| authz for protected slide/patient/sample resources | required | no | no |
+| authenticated slide path resolution | required | yes | no |
+| tile and thumbnail serving | indirect | required | no |
+| `/tiles/{slide_id}/metadata` | indirect | required | no |
+| `/tiles/{slide_id}/warmup` | indirect | required | no |
+| authenticated `/search` | required | no | no |
+| unauthenticated `/search` | no | no | required |
+| `/slides/{image_id}/dbmeta` | authz guard only | no | required |
+| unauthenticated fallback slide-path lookup | no | no | required |
+
+This means:
+
+- a private-study production rollout must have the trusted resource index
+- tile serving itself does not require a live Databricks query path
+- the current implementation still uses Databricks for raw metadata and some
+  non-authenticated or fallback behaviors
+
+If you need a deployment with no Databricks dependency at all, plan to replace
+or remove the Databricks-backed endpoints and lookup paths.
+
 ## Study isolation contract
 
 Authenticated production mode (`WSI_AUTH_REQUIRED=true`) authorizes every
@@ -109,10 +184,26 @@ cache headers; Redis and an HTTP cache are never authorization boundaries.
 Unauthenticated local/development mode (`WSI_AUTH_REQUIRED=false`) is retained
 for public fixtures only. It must not be used for private-study deployment.
 
+## Bring-up checklist
+
+Before debugging viewer behavior, verify all of the following:
+
+1. cBioPortal can issue a WSI token for the target study.
+2. `WSI_AUTH_SECRET` and `WSI_AUTH_AUDIENCE` match the cBioPortal backend.
+3. `WSI_AUTH_MAX_TTL` is greater than or equal to the backend-issued token TTL.
+4. `WSI_RESOURCE_INDEX_FILE` exists and matches the WSI release loaded into
+   cBioPortal.
+5. this service can open the referenced slide files from object storage.
+6. any enabled metadata/search endpoints have their required backend configured.
+
+For private-study deployments, do not treat a missing resource index, missing
+slide path, or authorization mismatch as “no slides”. Those are deployment
+failures.
+
 ## Local file-backed test slides
 
-For CI-safe or laptop-local tile tests, the server can bypass Databricks/ECS for
-specific slide IDs by using `WSI_TEST_SLIDE_MAP_FILE`.
+For CI-safe or laptop-local tile tests, the server can bypass Databricks and
+object storage for specific slide IDs by using `WSI_TEST_SLIDE_MAP_FILE`.
 
 Example:
 
@@ -136,7 +227,22 @@ WSI_TEST_SLIDE_MAP_FILE=/app/testdata/local-slide-map.json docker compose up --b
 ```
 
 When a requested slide ID exists in the map, the tile server opens the local file
-directly. Other slide IDs continue to resolve through Databricks and ECS.
+directly. Other slide IDs continue to resolve through the normal configured
+backends.
+
+## Notes for non-MSK deployments
+
+This repository contains some MSK-specific assumptions in naming, examples, and
+local tooling. In particular, examples may reference Dell ECS, Databricks, and
+MSK deployment conventions.
+
+For a portable deployment, document and own these institution-specific pieces:
+
+1. where slide inventory and patient/sample/slide associations originate
+2. how the trusted resource index is generated and published
+3. how slide object storage is addressed and authenticated
+4. which metadata/search backend, if any, replaces the current Databricks flows
+5. how unreadable or unsafe slides are detected before publication
 
 ## Running tests
 

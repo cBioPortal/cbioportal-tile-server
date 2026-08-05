@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -5,6 +6,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 ACTIVE_IMAGE_OPERATIONS = Gauge(
     "tile_server_active_image_operations",
     "Number of image operations currently running inside a worker.",
+    multiprocess_mode="livesum",
 )
 DECODE_SOURCE_PIXELS = Histogram(
     "tile_server_decode_source_pixels",
@@ -26,6 +28,31 @@ COALESCED_CACHE_MISS_REQUESTS = Counter(
     "Requests that joined an in-flight extraction instead of starting a duplicate decode.",
     ("kind",),
 )
+CACHE_REQUESTS = Counter(
+    "tile_server_cache_requests_total",
+    "Cache requests by kind and result.",
+    ("kind", "result"),
+)
+REDIS_OPERATION_SECONDS = Histogram(
+    "tile_server_redis_operation_seconds",
+    "Redis operation latency.",
+    ("operation",),
+)
+REDIS_ERRORS = Counter(
+    "tile_server_redis_errors_total",
+    "Redis operation failures.",
+    ("operation",),
+)
+SLIDE_CACHE_EVENTS = Counter(
+    "tile_server_slide_cache_events_total",
+    "Slide-cache lifecycle events.",
+    ("event",),
+)
+IMAGE_OPERATION_SECONDS = Histogram(
+    "tile_server_image_operation_seconds",
+    "Blocking image operation latency.",
+    ("kind",),
+)
 
 
 @asynccontextmanager
@@ -38,4 +65,10 @@ async def track_image_operation():
 
 
 def metrics_payload() -> tuple[bytes, str]:
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        from prometheus_client import CollectorRegistry, multiprocess
+
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        return generate_latest(registry), CONTENT_TYPE_LATEST
     return generate_latest(), CONTENT_TYPE_LATEST

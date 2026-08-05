@@ -99,6 +99,7 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
 class SlideEntry:
     slide: TiffSlide
     fileobj: Any
+    cache_lease: Any = None
 
 
 def close_entry(entry: SlideEntry) -> None:
@@ -109,5 +110,10 @@ def close_entry(entry: SlideEntry) -> None:
     if entry.fileobj is not None:
         try:
             entry.fileobj.close()
+        except Exception:
+            pass
+    if entry.cache_lease is not None:
+        try:
+            entry.cache_lease.__exit__(None, None, None)
         except Exception:
             pass

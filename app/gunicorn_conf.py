@@ -6,3 +6,11 @@ workers = int(os.environ.get("N_WORKERS", "4"))
 preload_app = True
 timeout = int(os.environ.get("GUNICORN_TIMEOUT", "120"))
 loglevel = os.environ.get("GUNICORN_LOG_LEVEL", "info")
+
+
+def child_exit(server, worker):
+    """Remove dead worker metrics from Prometheus multiprocess gauges."""
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        from prometheus_client import multiprocess
+
+        multiprocess.mark_process_dead(worker.pid)
