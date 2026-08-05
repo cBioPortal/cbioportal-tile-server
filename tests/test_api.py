@@ -247,6 +247,21 @@ class TestHealth:
         assert "private" in allowed.headers["cache-control"]
         assert "public" not in allowed.headers["cache-control"]
 
+    def test_indexed_slide_without_source_returns_not_found(self, api_client, monkeypatch, tmp_path):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        resource_index = json.loads(
+            (tmp_path / "wsi-resource-index.json").read_text()
+        )
+        resource_index["studies"]["study-a"]["slides"]["1492807"]["source_path"] = None
+        (tmp_path / "wsi-resource-index.json").write_text(json.dumps(resource_index))
+
+        response = api_client.get(
+            "/tiles/1492807/metadata",
+            headers={"Authorization": f"Bearer {make_wsi_token(secret, 'study-a')}"},
+        )
+
+        assert response.status_code == 404
+
     def test_missing_resource_index_fails_closed(self, api_client, monkeypatch):
         secret = "wsi-test-secret-0123456789abcdef"
         monkeypatch.setattr(settings, "wsi_auth_required", True)

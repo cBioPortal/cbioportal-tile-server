@@ -144,6 +144,99 @@ def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
     assert "release_version" not in json.loads(part_body.decode().splitlines()[0])
 
 
+def test_flat_canonical_rows_coerce_databricks_boolean_strings(tmp_path):
+    snapshot = snapshot_file(
+        tmp_path,
+        [{
+            "study_id": "study",
+            "patient_id": "P-1",
+            "slides": [{
+                "image_id": "SLIDE-1",
+                "sample_id": "S-1",
+                "reference_sample_id": "S-1",
+                "part_key": "part:1",
+                "part_number": "1",
+                "block_key": "block:A",
+                "block_number": "A",
+                "match_level": "BLOCK",
+                "specimen_key": "block::1::A",
+                "is_hne": "true",
+                "is_ihc": "false",
+                "can_serve_tiles": "true",
+                "slide_path": "s3://test-bucket/SLIDE-1.svs",
+            }],
+        }],
+    )
+    clickhouse = RecordingClickHouse()
+
+    load(snapshot, 7, clickhouse)
+
+    slide = next(
+        json.loads(body.decode().splitlines()[0])
+        for query, body in clickhouse.calls
+        if query.startswith("INSERT INTO wsi_slide FORMAT")
+    )
+    assert slide["is_hne"] is True
+    assert slide["is_ihc"] is False
+    assert slide["can_serve_tiles"] is True
+
+
+def test_flat_canonical_rows_keep_slides_when_part_metadata_differs(tmp_path):
+    snapshot = snapshot_file(
+        tmp_path,
+        [{
+            "study_id": "study",
+            "patient_id": "P-1",
+            "slides": [
+                {
+                    "image_id": "SLIDE-1",
+                    "sample_id": "S-1",
+                    "part_key": "part:1",
+                    "part_number": "1",
+                    "part_type": "LIVER",
+                    "part_description": "Primary specimen",
+                    "block_key": "block:A",
+                    "block_number": "A",
+                    "match_level": "BLOCK",
+                    "specimen_key": "block::1::A",
+                    "can_serve_tiles": False,
+                },
+                {
+                    "image_id": "SLIDE-2",
+                    "sample_id": "S-1",
+                    "part_key": "part:1",
+                    "part_number": "1",
+                    "part_type": "SUBMITTED SLIDES",
+                    "part_description": "Primary specimen ",
+                    "block_key": "block:B",
+                    "block_number": "B",
+                    "match_level": "PART",
+                    "specimen_key": "part::1",
+                    "can_serve_tiles": False,
+                },
+            ],
+        }],
+    )
+    clickhouse = RecordingClickHouse()
+
+    load(snapshot, 7, clickhouse)
+
+    parts = [
+        json.loads(line)
+        for query, body in clickhouse.calls
+        if query.startswith("INSERT INTO wsi_part FORMAT")
+        for line in body.decode().splitlines()
+    ]
+    slides = [
+        json.loads(line)
+        for query, body in clickhouse.calls
+        if query.startswith("INSERT INTO wsi_slide FORMAT")
+        for line in body.decode().splitlines()
+    ]
+    assert len(parts) == 1
+    assert {slide["image_id"] for slide in slides} == {"SLIDE-1", "SLIDE-2"}
+
+
 def test_canonical_rows_preserve_multiple_parts_blocks_and_slide_bindings(tmp_path):
     snapshot = snapshot_file(
         tmp_path,

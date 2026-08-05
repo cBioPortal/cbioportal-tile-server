@@ -270,10 +270,12 @@ def _resolve_slide_id(image_id: str, study_id: str | None = None) -> str:
         return cache_path(test_path)
     if study_id:
         binding = get_resource_index(settings.wsi_resource_index_file).slide_binding(study_id, image_id)
-        if not binding or not binding.get("source_path"):
+        if binding is None:
             raise ResourceIndexUnavailable(
-                "study-qualified slide binding is missing a source path"
+                "study-qualified slide binding is missing"
             )
+        if not binding.get("source_path"):
+            raise FileNotFoundError(f"Slide not found: {image_id}")
         path = str(binding["source_path"])
         return cache_path(path)
     path = meta.get_slide_path(image_id, settings.databricks_warehouse_id)

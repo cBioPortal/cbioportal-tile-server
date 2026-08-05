@@ -57,3 +57,15 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
     ):
         assert column in sql
     assert "reference_sequencing_date" not in sql
+
+
+def test_canonical_pipeline_scopes_unmatched_parts_to_source_accessions():
+    sql_path = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_canonical_associations_pipeline.sql"
+    )
+    sql = sql_path.read_text(encoding="utf-8")
+
+    assert "part:unmatched:" in sql
+    assert "^(.+/[0-9]+)-[^/]+$" in sql

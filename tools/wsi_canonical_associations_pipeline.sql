@@ -119,8 +119,12 @@ block_matches AS (
         d.PATIENT_ID AS patient_id,
         d.sample_id,
         CAST(d.image_id AS STRING) AS image_id,
-        CONCAT('block:', COALESCE(CAST(d.block_id AS STRING), CONCAT('image:', CAST(d.image_id AS STRING)))) AS part_key,
-        CAST(NULL AS STRING) AS part_number,
+        CASE
+            WHEN CAST(d.block_id AS STRING) RLIKE '/[0-9]+-'
+                THEN CONCAT('part:', REGEXP_EXTRACT(CAST(d.block_id AS STRING), '/([0-9]+)-', 1))
+            ELSE CONCAT('part:image:', CAST(d.image_id AS STRING))
+        END AS part_key,
+        NULLIF(REGEXP_EXTRACT(CAST(d.block_id AS STRING), '/([0-9]+)-', 1), '') AS part_number,
         CAST(NULL AS STRING) AS part_designator,
         d.part_type,
         d.part_description,
@@ -191,8 +195,17 @@ slide_universe AS (
     SELECT DISTINCT
         mapping.patient_id,
         CAST(cleaned.image_id AS STRING) AS image_id,
-        CONCAT('block:', COALESCE(CAST(cleaned.block_id AS STRING), CONCAT('image:', CAST(cleaned.image_id AS STRING)))) AS part_key,
-        CAST(NULL AS STRING) AS part_number,
+        CASE
+            WHEN CAST(cleaned.block_id AS STRING) RLIKE '^.+/[0-9]+-[^/]+$'
+                THEN CONCAT(
+                    'part:unmatched:',
+                    REGEXP_EXTRACT(CAST(cleaned.block_id AS STRING), '^(.+/[0-9]+)-[^/]+$', 1)
+                )
+            WHEN cleaned.block_id IS NOT NULL
+                THEN CONCAT('part:unmatched:block:', CAST(cleaned.block_id AS STRING))
+            ELSE CONCAT('part:unmatched:image:', CAST(cleaned.image_id AS STRING))
+        END AS part_key,
+        NULLIF(REGEXP_EXTRACT(CAST(cleaned.block_id AS STRING), '/([0-9]+)-', 1), '') AS part_number,
         CAST(NULL AS STRING) AS part_designator,
         cleaned.part_type,
         cleaned.part_description,
@@ -272,6 +285,8 @@ canonical_associations AS (
     WHERE association_row_num = 1
 )
 SELECT
+    'canonical_slide_associations_v2' AS association_version,
+    CURRENT_TIMESTAMP() AS updated_at,
     association.match_level,
     association.patient_id,
     association.sample_id,

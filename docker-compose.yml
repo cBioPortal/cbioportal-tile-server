@@ -28,7 +28,7 @@ services:
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
       WSI_AUTH_REQUIRED: ${WSI_AUTH_REQUIRED:-true}
       WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-900}
-      WSI_RESOURCE_INDEX_FILE: ${WSI_RESOURCE_INDEX_FILE:-}
+      WSI_RESOURCE_INDEX_FILE: ${WSI_RESOURCE_INDEX_FILE:-/var/lib/wsi/wsi-resource-index.json}
       WSI_TEST_SLIDE_MAP_FILE: ${WSI_TEST_SLIDE_MAP_FILE:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
 
@@ -62,9 +62,10 @@ services:
       BLOCKCACHE_BLOCK_SIZE: ${BLOCKCACHE_BLOCK_SIZE:-8388608}   # 8 MB
       BLOCKCACHE_MAX_BYTES: ${BLOCKCACHE_MAX_BYTES:-19327352832} # 18 GiB of 20 GiB volume
       BLOCKCACHE_PRUNE_INTERVAL_SECONDS: ${BLOCKCACHE_PRUNE_INTERVAL_SECONDS:-60}
-      PROMETHEUS_MULTIPROC_DIR: /tmp/prometheus
+      PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-/cache/prometheus}
     volumes:
       - slide_blocks:/cache/slide-blocks
+      - ${WSI_RESOURCE_INDEX_DIR:-./data/wsi}:/var/lib/wsi:ro
       - ./tests/testdata:/app/testdata:ro
     depends_on:
       redis:

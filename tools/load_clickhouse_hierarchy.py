@@ -113,6 +113,20 @@ def _sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _coerce_bool(value: object, *, default: bool | None = None) -> bool | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0"}:
+            return False
+    raise ValueError(f"invalid boolean value: {value!r}")
+
+
 def _read_snapshot(snapshot: Path) -> list[tuple[str, str, dict]]:
     parsed: list[tuple[str, str, dict]] = []
     seen: set[tuple[str, str]] = set()
@@ -157,10 +171,11 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
             raise ValueError("canonical slide rows need a valid match_level")
         if not isinstance(row.get("specimen_key"), str) or not row["specimen_key"].strip():
             raise ValueError("canonical slide rows need a non-empty specimen_key")
-        if not isinstance(row.get("can_serve_tiles"), bool):
+        can_serve_tiles = _coerce_bool(row.get("can_serve_tiles"))
+        if can_serve_tiles is None:
             raise ValueError("canonical slide rows need a boolean can_serve_tiles")
         slide_path = row.get("slide_path")
-        if row["can_serve_tiles"] and (
+        if can_serve_tiles and (
             not isinstance(slide_path, str) or not slide_path.startswith("s3://")
         ):
             raise ValueError("tile-servable canonical slide rows need an s3:// slide_path")
@@ -184,16 +199,12 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
             "path_dx_title": row.get("path_dx_title"),
         }
         part = sample["parts"].setdefault(part_key, {**part_fields, "blocks": {}})
-        if {key: part.get(key) for key in part_fields} != part_fields:
-            raise ValueError(f"conflicting canonical part definition: {part_key}")
         block_fields = {
             "block_key": block_key,
             "block_number": row.get("block_number"),
             "block_label": row.get("block_label"),
         }
         block = part["blocks"].setdefault(block_key, {**block_fields, "slides": []})
-        if {key: block.get(key) for key in block_fields} != block_fields:
-            raise ValueError(f"conflicting canonical block definition: {block_key}")
         slide = {
             key: row.get(key)
             for key in (
@@ -202,6 +213,9 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
                 "slide_path",
             )
         }
+        slide["is_hne"] = _coerce_bool(slide.get("is_hne"), default=False)
+        slide["is_ihc"] = _coerce_bool(slide.get("is_ihc"), default=False)
+        slide["can_serve_tiles"] = can_serve_tiles
         block["slides"].append(slide)
         associations.append({
             key: row.get(key)
@@ -355,9 +369,8 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                     "part_description": part.get("part_description"), "subspecialty": part.get("subspecialty"),
                     "path_dx_title": part.get("path_dx_title"),
                 }
-                if part_key in parts and parts[part_key] != part_row:
-                    raise ValueError(f"conflicting part definition: {study_id}/{patient_id}/{part_key}")
-                parts[part_key] = part_row
+                # Source rows may repeat a key with variant descriptive metadata; placements remain lossless.
+                parts.setdefault(part_key, part_row)
                 for block in part.get("blocks", []):
                     block_number = block.get("block_number")
                     block_key = str(block["block_key"])
@@ -369,9 +382,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                         "block_label": block.get("block_label"),
                     }
                     block_identity = (part_key, block_key)
-                    if block_identity in blocks and blocks[block_identity] != block_row:
-                        raise ValueError(f"conflicting block definition: {study_id}/{patient_id}/{block_key}")
-                    blocks[block_identity] = block_row
+                    blocks.setdefault(block_identity, block_row)
                     for slide in block.get("slides", []):
                         image_id = str(slide.get("image_id")) if slide.get("image_id") is not None else ""
                         if not image_id:
