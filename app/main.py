@@ -41,7 +41,9 @@ from .metrics import (
     metrics_payload,
     track_image_operation,
 )
+from .associations import build_specimen_key, derive_block_fields
 from .meta import get_slide_dbmeta, search_suggestions
+from .meta_store import get_patient_association_rows
 from .rate_limit import EXPENSIVE_PATH_PREFIXES, rate_limiter
 from .resource_index import ResourceIndexUnavailable, get_resource_index
 from .slides import SlideCache
@@ -184,7 +186,9 @@ async def limit_expensive_requests(request: Request, call_next):
 @app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
     """Require a cBioPortal-issued capability for every non-health API request."""
-    if request.scope["path"] in ("/health", "/wsi/health"):
+    if request.scope["path"] in ("/health", "/wsi/health") or request.scope["path"].startswith(
+        "/internal/patient/"
+    ):
         return await call_next(request)
     if not settings.wsi_auth_required:
         return await call_next(request)
@@ -367,6 +371,208 @@ def _authenticated_search_context(request: Request):
         raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
 
 
+def _normalize_match_level(row: dict) -> str:
+    match_level = str(row.get("match_level") or "").upper()
+    if match_level in {"BLOCK", "PART", "UNMATCHED"}:
+        return match_level
+    sample_id = row.get("sample_id")
+    block_id = row.get("block_id")
+    if not sample_id:
+        return "UNMATCHED"
+    return "BLOCK" if block_id not in (None, "") else "PART"
+
+
+def _normalize_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
+
+
+def _normalize_slide_type(row: dict) -> str:
+    if _normalize_bool(row.get("is_ihc")):
+        return "IHC"
+    if _normalize_bool(row.get("is_hne")):
+        return "H&E"
+    stain_name = str(row.get("stain_name") or "")
+    stain_group = str(row.get("stain_group") or "")
+    haystack = f"{stain_name} {stain_group}".upper()
+    return "IHC" if "IHC" in haystack else "H&E"
+
+
+def _optional_int(row: dict, *keys: str) -> int | None:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return int(value)
+    return None
+
+
+def _hierarchy_keys(
+    row: dict, match_level: str, image_id: str
+) -> tuple[str, str, str, str, str, str]:
+    """Resolve normalized keys from either canonical association schema."""
+    block_id = row.get("block_id")
+    block_id = None if block_id in (None, "") else str(block_id)
+    part_number, block_number, derived_block_label = derive_block_fields(
+        block_id, row.get("block_label")
+    )
+
+    part_key = str(row.get("part_key") or "").strip()
+    if not part_key:
+        if block_id and "/" in block_id:
+            part_key = f"part::{block_id.rsplit('/', 1)[0]}"
+        elif part_number is not None:
+            part_key = f"part::{part_number}"
+        else:
+            part_key = f"{match_level.lower()}::{row.get('part_description') or image_id}"
+
+    block_key = str(row.get("block_key") or "").strip()
+    if not block_key:
+        block_key = f"block::{block_id or image_id}"
+
+    resolved_part_number = str(row.get("part_number") or "")
+    if not resolved_part_number and part_number is not None:
+        resolved_part_number = str(part_number)
+    resolved_block_number = str(row.get("block_number") or "")
+    if not resolved_block_number:
+        resolved_block_number = block_number or ""
+    resolved_block_label = str(row.get("block_label") or "")
+    if not resolved_block_label:
+        resolved_block_label = derived_block_label or resolved_block_number
+
+    specimen_key = str(row.get("specimen_key") or "").strip()
+    if not specimen_key:
+        specimen_key = build_specimen_key(match_level, part_number, resolved_block_number)
+
+    return (
+        part_key,
+        block_key,
+        resolved_part_number,
+        resolved_block_number,
+        resolved_block_label,
+        specimen_key,
+    )
+
+
+def _build_patient_hierarchy(rows: list[dict]) -> dict:
+    sample_groups: OrderedDict[str | None, dict] = OrderedDict()
+    reference_sample_id = None
+    seen_slides: set[str] = set()
+
+    for row in rows:
+        image_id = row.get("image_id")
+        if image_id is None:
+            continue
+        image_id = str(image_id)
+        if image_id in seen_slides:
+            continue
+        seen_slides.add(image_id)
+
+        match_level = _normalize_match_level(row)
+        sample_id = row.get("sample_id")
+        if match_level == "UNMATCHED" or sample_id in (None, "", "UNMATCHED"):
+            sample_id = None
+        else:
+            sample_id = str(sample_id)
+            if reference_sample_id is None:
+                reference_sample_id = sample_id
+
+        row_reference_sample_id = row.get("reference_sample_id")
+        if row_reference_sample_id not in (None, "", "UNMATCHED"):
+            reference_sample_id = str(row_reference_sample_id)
+
+        part_type = str(row.get("part_type") or "")
+        part_description = str(row.get("part_description") or "")
+        path_dx_title = str(row.get("path_dx_title") or part_description)
+        (
+            part_key,
+            block_key,
+            part_number,
+            block_number,
+            block_label,
+            specimen_key,
+        ) = _hierarchy_keys(row, match_level, image_id)
+
+        group = sample_groups.setdefault(
+            sample_id,
+            {
+                "sampleId": sample_id,
+                "partsByKey": OrderedDict(),
+            },
+        )
+        part = group["partsByKey"].setdefault(
+            part_key,
+            {
+                "partNumber": part_number,
+                "partDesignator": str(row.get("part_designator") or part_number),
+                "partType": part_type,
+                "partDescription": part_description,
+                "subspecialty": str(row.get("subspecialty") or ""),
+                "pathDxTitle": path_dx_title,
+                "blocksByKey": OrderedDict(),
+            },
+        )
+        block = part["blocksByKey"].setdefault(
+            block_key,
+            {
+                "blockNumber": block_number,
+                "blockLabel": block_label,
+                "slides": [],
+            },
+        )
+
+        slide_type = _normalize_slide_type(row)
+        slide_path = row.get("slide_path")
+        can_serve_tiles = (
+            _normalize_bool(row.get("can_serve_tiles"))
+            if row.get("can_serve_tiles") is not None
+            else isinstance(slide_path, str) and slide_path.startswith("s3://")
+        )
+
+        block["slides"].append(
+            {
+                "imageId": image_id,
+                "stainName": str(row.get("stain_name") or ""),
+                "stainGroup": str(row.get("stain_group") or ""),
+                "isHne": _normalize_bool(row.get("is_hne"))
+                if row.get("is_hne") is not None
+                else slide_type == "H&E",
+                "isIhc": _normalize_bool(row.get("is_ihc"))
+                if row.get("is_ihc") is not None
+                else slide_type == "IHC",
+                "magnification": str(row.get("magnification") or ""),
+                "fileSizeBytes": _optional_int(row, "file_size_bytes"),
+                "canServeTiles": can_serve_tiles,
+                "barcode": str(row.get("barcode") or ""),
+                "slideType": str(row.get("slide_type") or slide_type),
+                "sampleId": sample_id,
+                "matchLevel": match_level,
+                "specimenKey": specimen_key,
+                "procedureDateDays": _optional_int(
+                    row, "procedure_date_days", "slide_timepoint_days"
+                ),
+                "timepointSource": row.get("timepoint_source")
+                or row.get("slide_timepoint_source"),
+            }
+        )
+
+    normalized_groups = []
+    for group in sample_groups.values():
+        parts = []
+        for part in group["partsByKey"].values():
+            blocks = list(part.pop("blocksByKey").values())
+            part["blocks"] = blocks
+            parts.append(part)
+        normalized_groups.append({"sampleId": group["sampleId"], "parts": parts})
+
+    return {
+        "referenceSampleId": reference_sample_id,
+        "sampleGroups": normalized_groups,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -460,6 +666,29 @@ async def search(request: Request, q: str = ""):
     await tile_cache.set_raw(cache_key, results, ttl=300)
     return Response(content=json.dumps(results, default=str),
                     media_type="application/json", headers=PHI_CACHE_HEADERS)
+
+
+@app.get("/internal/patient/{patient_id}")
+async def patient_hierarchy(patient_id: str):
+    """Local/dev fallback hierarchy built from canonical pathology associations."""
+    try:
+        rows = await _in_thread(
+            get_patient_association_rows,
+            patient_id,
+            settings.databricks_warehouse_id,
+        )
+    except Exception:
+        logger.exception("Patient hierarchy query failed for %s", patient_id)
+        raise HTTPException(status_code=502, detail="Patient hierarchy query failed")
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    return Response(
+        content=json.dumps(_build_patient_hierarchy(rows), default=str),
+        media_type="application/json",
+        headers=PHI_CACHE_HEADERS,
+    )
 
 
 @app.get("/tiles/{slide_id}/metadata")

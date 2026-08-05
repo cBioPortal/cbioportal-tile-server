@@ -409,6 +409,56 @@ class TestHealth:
 
 
 # ---------------------------------------------------------------------------
+# /internal/patient/{patient_id}
+# ---------------------------------------------------------------------------
+
+class TestPatientHierarchy:
+    def test_internal_hierarchy_uses_canonical_associations(self, api_client):
+        rows = [
+            {
+                "match_level": "BLOCK",
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "reference_sample_id": "S-1",
+                "part_key": "part::1",
+                "part_number": "1",
+                "part_designator": "1",
+                "part_type": "COLON",
+                "part_description": "Tumor",
+                "path_dx_title": "Tumor",
+                "block_key": "block::1",
+                "block_number": "1",
+                "block_label": "1T",
+                "image_id": "slide-1",
+                "stain_name": "H&E, Initial",
+                "stain_group": "H&E (Initial)",
+                "is_hne": True,
+                "is_ihc": False,
+                "magnification": "20x",
+                "file_size_bytes": 10,
+                "can_serve_tiles": True,
+                "barcode": "",
+                "slide_type": "H&E",
+                "specimen_key": "block::1::1",
+                "procedure_date_days": -1,
+                "timepoint_source": "Procedure date",
+                "slide_path": "s3://slides/slide-1.svs",
+            }
+        ]
+
+        with patch.object(
+            main_module, "get_patient_association_rows", return_value=rows
+        ) as query:
+            response = api_client.get("/internal/patient/P-1?studyId=study-1")
+
+        assert response.status_code == 200
+        assert response.json()["sampleGroups"][0]["parts"][0]["blocks"][0]["slides"][0][
+            "imageId"
+        ] == "slide-1"
+        query.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # /tiles/{slide_id}/metadata
 # ---------------------------------------------------------------------------
 

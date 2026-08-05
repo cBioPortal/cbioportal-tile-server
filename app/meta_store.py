@@ -155,44 +155,15 @@ ORDER BY sample_id
 LIMIT 8
 """
 
+# The deployed canonical table has existed with two compatible schemas: the
+# older flat pathology schema and the newer normalized association schema.
+# Selecting the row preserves both versions; the bridge normalizes optional
+# columns before returning the cBioPortal hierarchy contract.
 CANONICAL_PATIENT_ASSOCIATIONS_SQL = f"""
-SELECT
-    match_level,
-    patient_id,
-    sample_id,
-    reference_sample_id,
-    part_key,
-    part_number,
-    part_designator,
-    part_type,
-    part_description,
-    subspecialty,
-    path_dx_title,
-    block_key,
-    block_number,
-    block_label,
-    image_id,
-    stain_name,
-    stain_group,
-    is_hne,
-    is_ihc,
-    magnification,
-    file_size_bytes,
-    can_serve_tiles,
-    barcode,
-    slide_type,
-    specimen_key,
-    procedure_date_days,
-    timepoint_source,
-    slide_path
+SELECT *
 FROM {_CANONICAL_ASSOCIATION_TABLE}
 WHERE patient_id = :patient_id
-ORDER BY
-    sample_id,
-    match_level,
-    part_key,
-    block_key,
-    image_id
+ORDER BY sample_id, image_id
 """
 
 
