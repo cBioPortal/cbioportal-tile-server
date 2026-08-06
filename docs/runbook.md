@@ -200,14 +200,35 @@ study-B resources, and metadata responses are not publicly cacheable.
 - Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
   explicitly for the resulting working set.
 
+## Thumbnail artifacts
+
+`GET /thumbnails/{slide_id}` normally serves a JPEG master from
+`THUMBNAIL_MANIFEST_URI` and downsizes it for smaller requests. If the manifest
+entry or artifact is missing, a bounded, process-isolated worker generates and
+stores the master on demand. The worker is capped by `MAX_IMAGE_OPERATIONS` and
+`THUMBNAIL_TIMEOUT_SEC`; timeout or failure returns a placeholder with
+`X-Thumbnail-Status: placeholder`.
+
+Run the batch generator on on-prem infrastructure as a separate Slurm array:
+
+```bash
+tools/run_thumbnail_pipeline_slurm.sh submit \
+  s3://my-bucket/wsi-thumbnails/manifest.json \
+  s3://my-bucket/wsi-thumbnails/masters 32 2
+```
+
+The batch path reads servable S3 paths from Databricks, stores publication state
+in `cdsi_prod.pathology_data_mining.slide_thumbnail_registry`, and keeps its
+temporary files, logs, and subprocess handoff data under the shared run
+directory rather than `/tmp`. Block cache is disabled for offline generation so
+one-time slide reads do not accumulate on GPFS.
+
 ## Overview decode guard
 
-Thumbnail and overview-tile requests are memory-bounded. If a slide lacks a
-safe overview pyramid level, the server returns HTTP `422` with
+Overview-tile requests remain memory-bounded. If a slide lacks a safe overview
+pyramid level, the server returns HTTP `422` with
 `{"error":"overview_requires_preprocessing"}` and logs the selected pyramid
 level, requested decode dimensions, requested pixel count, and decode limit.
-Prepare those slides offline by generating a proper low-resolution pyramid or
-a precomputed thumbnail before exposing them to the service.
 
 ## ETL and study operations
 

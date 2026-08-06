@@ -61,8 +61,8 @@ def run_smoke(host: str, patient_id: str, slide_id: str) -> bool:
     passed += int(ok); failed += int(not ok)
 
     # 3. Thumbnail
-    resp = s.get(f"{host}/tiles/{slide_id}/thumbnail?width=256&height=256")
-    ok = check(f"/tiles/{slide_id}/thumbnail", resp) and resp.headers.get("content-type", "").startswith("image/")
+    resp = s.get(f"{host}/thumbnails/{slide_id}?width=256&height=256")
+    ok = check(f"/thumbnails/{slide_id}", resp) and resp.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
     # 4. Tiles: z=0 (overview), z=1, and highest zoom if available

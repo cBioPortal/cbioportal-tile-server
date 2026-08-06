@@ -4,7 +4,7 @@ Tile server — FastAPI application.
 Endpoints:
   GET /health
   GET /tiles/{slide_id}/metadata
-  GET /tiles/{slide_id}/thumbnail?width=256&height=256
+  GET /thumbnails/{slide_id}?width=256&height=256
   GET /tiles/{slide_id}/zxy/{z}/{x}/{y}
 
 All tile and thumbnail responses carry long-lived Cache-Control headers so a
@@ -14,10 +14,13 @@ CDN or nginx proxy_cache can absorb the bulk of repeat requests.
 import asyncio
 import json
 import logging
+import os
+import sys
 import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 # Ensure app.* loggers emit to stderr alongside uvicorn's own loggers.
 # uvicorn's dictConfig only configures uvicorn.* — root logger has no handler
@@ -47,7 +50,14 @@ from .meta_store import get_patient_association_rows
 from .rate_limit import EXPENSIVE_PATH_PREFIXES, rate_limiter
 from .resource_index import ResourceIndexUnavailable, get_resource_index
 from .slides import SlideCache
-from .tiles import OverviewTooLarge, get_thumbnail_bytes, get_tile_bytes, render_tile_image, slide_metadata
+from .thumbnail_store import (
+    ThumbnailRecord,
+    get_persisted_generated_thumbnail_record,
+    get_thumbnail_record,
+    render_thumbnail_response,
+)
+from .tiles import OverviewTooLarge, get_tile_bytes, render_tile_image, slide_metadata
+from .tiles import get_placeholder_thumbnail_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +70,7 @@ _slides: SlideCache | None = None
 _path_cache: OrderedDict[str, str] = OrderedDict()
 _path_cache_lock = threading.Lock()
 _image_operation_semaphore: asyncio.Semaphore | None = None
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _SingleFlight:
@@ -222,6 +233,7 @@ TILE_CACHE_HEADERS  = {"Cache-Control": "private, max-age=3600", "Vary": "Author
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
 # Metadata and search responses contain patient/slide information.
 PHI_CACHE_HEADERS   = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
+THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL = 60
 
 
 async def _in_thread(fn, *args):
@@ -243,6 +255,41 @@ async def _run_image_operation(fn, *args, operation_kind: str = "image"):
                 return await _in_thread(fn, *args)
             finally:
                 IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
+
+
+def _thumbnail_status_headers(status: str, reason: str) -> dict[str, str]:
+    return {
+        "X-Thumbnail-Status": status,
+        "X-Thumbnail-Reason": reason,
+    }
+
+
+def _thumbnail_placeholder_ttl(reason: str) -> int | None:
+    if reason == "unavailable":
+        if settings.thumbnail_cache_ttl:
+            return min(settings.thumbnail_cache_ttl, THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL)
+        return THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL
+    return None
+
+
+def _log_thumbnail_outcome(
+    *,
+    slide_id: str,
+    width: int,
+    height: int,
+    elapsed_ms: float,
+    outcome: str,
+    reason: str,
+) -> None:
+    logger.info(
+        "thumbnail_request slide_id=%s width=%d height=%d elapsed_ms=%.1f outcome=%s reason=%s",
+        slide_id,
+        width,
+        height,
+        elapsed_ms,
+        outcome,
+        reason,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +381,74 @@ async def _run_slide_image_operation(
         *args,
         operation_kind=operation_kind,
     )
+
+
+async def _generate_thumbnail_record_on_demand(
+    image_id: str,
+    study_id: str | None,
+):
+    if not settings.thumbnail_manifest_uri.strip():
+        return None
+    try:
+        source_uri = await _in_thread(_resolve_slide_id, image_id, study_id)
+    except FileNotFoundError:
+        return None
+
+    if _image_operation_semaphore is None:
+        return await _run_thumbnail_worker(image_id, source_uri)
+    async with _image_operation_semaphore:
+        async with track_image_operation():
+            return await _run_thumbnail_worker(image_id, source_uri)
+
+
+async def _stop_thumbnail_worker(process) -> None:
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    await process.communicate()
+
+
+async def _run_thumbnail_worker(image_id: str, source_uri: str):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "app.thumbnail_worker",
+        "--image-id",
+        image_id,
+        "--source-uri",
+        source_uri,
+        "--master-size",
+        str(settings.thumbnail_master_size),
+        cwd=str(_REPOSITORY_ROOT),
+        env=os.environ.copy(),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=settings.thumbnail_timeout_sec,
+        )
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        await _stop_thumbnail_worker(process)
+        raise
+
+    if process.returncode != 0:
+        error = stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"thumbnail worker failed ({process.returncode}): {error}")
+    try:
+        payload = json.loads(stdout)
+        return ThumbnailRecord(
+            image_id=str(payload["image_id"]),
+            uri=str(payload["uri"]),
+            width=max(1, int(payload["width"])),
+            height=max(1, int(payload["height"])),
+            content_type=str(payload.get("content_type") or "image/jpeg"),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("thumbnail worker returned invalid metadata") from exc
 
 
 def _authorize_resource(request: Request, resource_type: str, resource_id: str) -> str | None:
@@ -741,7 +856,7 @@ async def warmup(request: Request, slide_id: str):
     )
 
 
-@app.get("/tiles/{slide_id}/thumbnail")
+@app.get("/thumbnails/{slide_id}")
 async def thumbnail(
     request: Request,
     slide_id: str,
@@ -755,40 +870,101 @@ async def thumbnail(
 
     cached = await tile_cache.get_thumbnail(cache_slide_id, width, height)
     if cached:
-        return Response(content=cached, media_type="image/jpeg",
-                        headers=THUMB_CACHE_HEADERS)
+        status = await tile_cache.get_thumbnail_status(cache_slide_id, width, height)
+        headers = dict(THUMB_CACHE_HEADERS)
+        if status:
+            headers.update(
+                _thumbnail_status_headers(
+                    str(status.get("status") or "ok"),
+                    str(status.get("reason") or "served"),
+                )
+            )
+        return Response(content=cached, media_type="image/jpeg", headers=headers)
 
     cache_key = tile_cache.thumbnail_cache_key(cache_slide_id, width, height)
+    started = time.perf_counter()
 
     async def _build_thumbnail():
-        image_bytes = await _run_slide_image_operation(
-            slide_id,
-            study_id,
-            get_thumbnail_bytes,
-            width,
-            height,
-            operation_kind="thumbnail",
-        )
-        await tile_cache.set_thumbnail(cache_slide_id, width, height, image_bytes)
-        return image_bytes
+        record = await _in_thread(get_thumbnail_record, slide_id)
+        if record is None:
+            record = await _in_thread(get_persisted_generated_thumbnail_record, slide_id)
+        if record is None:
+            record = await _generate_thumbnail_record_on_demand(slide_id, study_id)
+        if record is None:
+            data = get_placeholder_thumbnail_bytes(width, height)
+            status = {"status": "placeholder", "reason": "missing"}
+        else:
+            try:
+                data, status = await _in_thread(render_thumbnail_response, record, width, height)
+            except FileNotFoundError:
+                record = await _generate_thumbnail_record_on_demand(slide_id, study_id)
+                if record is None:
+                    raise
+                data, status = await _in_thread(render_thumbnail_response, record, width, height)
+        await tile_cache.set_thumbnail(cache_slide_id, width, height, data)
+        await tile_cache.set_thumbnail_status(cache_slide_id, width, height, status)
+        return data, status
 
     try:
-        data = await _singleflight.do(cache_key, "thumbnail", _build_thumbnail)
-    except OverviewTooLarge as exc:
-        logger.warning(
-            "Thumbnail overview rejected for slide %s level=%d read=%dx%d pixels=%d limit=%d",
-            slide_id,
-            exc.best_level,
-            exc.read_width,
-            exc.read_height,
-            exc.requested_pixels,
-            exc.max_decode_pixels,
+        data, status = await _singleflight.do(cache_key, "thumbnail", _build_thumbnail)
+    except asyncio.TimeoutError:
+        data = get_placeholder_thumbnail_bytes(width, height)
+        status = {"status": "placeholder", "reason": "decode_timeout"}
+        ttl = _thumbnail_placeholder_ttl(str(status["reason"]))
+        await tile_cache.set_thumbnail(cache_slide_id, width, height, data, ttl=ttl)
+        await tile_cache.set_thumbnail_status(cache_slide_id, width, height, status, ttl=ttl)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        _log_thumbnail_outcome(
+            slide_id=slide_id,
+            width=width,
+            height=height,
+            elapsed_ms=elapsed_ms,
+            outcome=str(status["status"]),
+            reason=str(status["reason"]),
         )
-        DECODE_SOURCE_PIXELS.observe(exc.requested_pixels)
-        OVERSIZED_DECODE_REJECTIONS.labels(kind="thumbnail").inc()
-        raise HTTPException(status_code=422, detail={"error": "overview_requires_preprocessing"})
-    return Response(content=data, media_type="image/jpeg",
-                    headers=THUMB_CACHE_HEADERS)
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers=dict(THUMB_CACHE_HEADERS)
+            | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+        )
+    except Exception:
+        data = get_placeholder_thumbnail_bytes(width, height)
+        status = {"status": "placeholder", "reason": "unavailable"}
+        ttl = _thumbnail_placeholder_ttl(str(status["reason"]))
+        await tile_cache.set_thumbnail(cache_slide_id, width, height, data, ttl=ttl)
+        await tile_cache.set_thumbnail_status(cache_slide_id, width, height, status, ttl=ttl)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        _log_thumbnail_outcome(
+            slide_id=slide_id,
+            width=width,
+            height=height,
+            elapsed_ms=elapsed_ms,
+            outcome=str(status["status"]),
+            reason=str(status["reason"]),
+        )
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers=dict(THUMB_CACHE_HEADERS)
+            | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+        )
+
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    _log_thumbnail_outcome(
+        slide_id=slide_id,
+        width=width,
+        height=height,
+        elapsed_ms=elapsed_ms,
+        outcome=str(status["status"]),
+        reason=str(status["reason"]),
+    )
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers=dict(THUMB_CACHE_HEADERS)
+        | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+    )
 
 
 @app.get("/tiles/{slide_id}/zxy/{z}/{x}/{y}")

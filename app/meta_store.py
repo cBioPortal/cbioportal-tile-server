@@ -5,6 +5,8 @@ Databricks SQL transport and raw query definitions for slide metadata.
 from __future__ import annotations
 
 import logging
+import json
+from urllib.request import urlopen
 from typing import Any
 
 from .constants import (
@@ -213,6 +215,85 @@ def run_query(sql: str, warehouse_id: str, params: list | None = None) -> list[d
 
     columns = [c.name for c in stmt.manifest.schema.columns]
     return [dict(zip(columns, row)) for row in (stmt.result.data_array or [])]
+
+
+def run_query_external(sql: str, warehouse_id: str, params: list | None = None) -> list[dict[str, Any]]:
+    """Run a Databricks query using paged external result links."""
+    import time
+
+    from databricks.sdk.service.sql import Disposition, Format, StatementState
+
+    stmt = client().statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        disposition=Disposition.EXTERNAL_LINKS,
+        format=Format.JSON_ARRAY,
+        parameters=params or [],
+        wait_timeout="50s",
+    )
+    poll_interval = 2
+    max_poll = 120
+    elapsed = 0
+    while stmt.status.state in (StatementState.RUNNING, StatementState.PENDING):
+        if elapsed >= max_poll:
+            try:
+                client().statement_execution.cancel_execution(stmt.statement_id)
+            except Exception:
+                pass
+            raise RuntimeError("Databricks query timed out")
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        stmt = client().statement_execution.get_statement(stmt.statement_id)
+
+    if stmt.status.state != StatementState.SUCCEEDED:
+        err = getattr(stmt.status, "error", None)
+        raise RuntimeError(f"Databricks query failed: {err}")
+
+    columns = [column.name for column in stmt.manifest.schema.columns]
+    rows: list[dict[str, Any]] = []
+    for chunk_index in range(int(stmt.manifest.total_chunk_count or 0)):
+        chunk = client().statement_execution.get_statement_result_chunk_n(
+            stmt.statement_id,
+            chunk_index,
+        )
+        links = chunk.external_links or []
+        if not links:
+            continue
+        with urlopen(links[0].external_link) as response:  # noqa: S310
+            payload = json.loads(response.read().decode("utf-8"))
+        rows.extend(dict(zip(columns, row)) for row in payload)
+    return rows
+
+
+def run_statement(sql: str, warehouse_id: str, params: list | None = None) -> None:
+    """Execute a Databricks statement and wait for completion."""
+    import time
+
+    from databricks.sdk.service.sql import StatementState
+
+    stmt = client().statement_execution.execute_statement(
+        warehouse_id=warehouse_id,
+        statement=sql,
+        parameters=params or [],
+        wait_timeout="50s",
+    )
+    poll_interval = 2
+    max_poll = 120
+    elapsed = 0
+    while stmt.status.state in (StatementState.RUNNING, StatementState.PENDING):
+        if elapsed >= max_poll:
+            try:
+                client().statement_execution.cancel_execution(stmt.statement_id)
+            except Exception:
+                pass
+            raise RuntimeError("Databricks statement timed out")
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        stmt = client().statement_execution.get_statement(stmt.statement_id)
+
+    if stmt.status.state != StatementState.SUCCEEDED:
+        err = getattr(stmt.status, "error", None)
+        raise RuntimeError(f"Databricks statement failed: {err}")
 
 
 def get_patient_rows(patient_id: str, warehouse_id: str) -> list[dict[str, Any]]:
