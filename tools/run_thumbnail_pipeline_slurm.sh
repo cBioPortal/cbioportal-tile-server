@@ -217,11 +217,13 @@ worker_mode() {
   source_env
   local meta_file="${SLURM_SHARED_RUN_DIR}/run-meta.json"
   local result_dir="${SLURM_SHARED_RUN_DIR}/results"
-  local summary_path="${LOG_DIR}/slide-thumbnail-summary-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}.json"
-  local failures_path="${LOG_DIR}/slide-thumbnail-failures-${SLURM_ARRAY_JOB_ID}-${SLURM_ARRAY_TASK_ID}.json"
+  local array_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID:-manual}}"
+  local array_task_id="${SLURM_ARRAY_TASK_ID:-0}"
+  local summary_path="${LOG_DIR}/slide-thumbnail-summary-${array_job_id}-${array_task_id}.json"
+  local failures_path="${LOG_DIR}/slide-thumbnail-failures-${array_job_id}-${array_task_id}.json"
 
   mkdir -p "$result_dir"
-  uv run python - <<'PY' "$meta_file" "$result_dir" "$summary_path" "$failures_path" "${SLURM_ARRAY_TASK_ID}"
+  uv run python - <<'PY' "$meta_file" "$result_dir" "$summary_path" "$failures_path" "$array_task_id"
 import json
 import sys
 from pathlib import Path
