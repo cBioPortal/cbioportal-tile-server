@@ -6,6 +6,7 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
 DEFAULT_WORKDIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 WORKDIR="${THUMBNAIL_WORKDIR:-${DEFAULT_WORKDIR}}"
 SHARED_ROOT="${SLURM_SHARED_DIR:-${WORKDIR}/.slurm-thumbnail-work}"
+PYTHON_BIN="${THUMBNAIL_PYTHON:-${WORKDIR}/.venv/bin/python}"
 LOG_DIR=""
 
 configure_paths() {
@@ -42,6 +43,8 @@ source_env() {
   if [[ -n "${SSL_CERT_FILE:-}" && ! -r "$SSL_CERT_FILE" ]]; then
     unset SSL_CERT_FILE
   fi
+  PYTHON_BIN="${THUMBNAIL_PYTHON:-${WORKDIR}/.venv/bin/python}"
+  [[ -x "$PYTHON_BIN" ]] || { echo "Python executable not found: $PYTHON_BIN" >&2; return 1; }
   configure_paths
   mkdir -p "$LOG_DIR" "$THUMBNAIL_TMPDIR" "$BLOCKCACHE_PATH"
   export PYTHONUNBUFFERED=1
@@ -110,7 +113,7 @@ prepare_candidates() {
 
   export THUMBNAIL_RUN_DIR="$run_dir"
   source_env
-  uv run python - <<'PY' "$candidate_dir" "$meta_file" "$manifest_uri" "$root_uri" "$slides_per_task" "$limit" "$mode"
+  "$PYTHON_BIN" - <<'PY' "$candidate_dir" "$meta_file" "$manifest_uri" "$root_uri" "$slides_per_task" "$limit" "$mode"
 import json
 import sys
 from datetime import UTC, datetime
@@ -171,7 +174,7 @@ submit_array() {
   local log_dir="${run_dir}/logs"
   local meta_file="${run_dir}/run-meta.json"
   local candidate_count
-  candidate_count="$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_count"])' "$meta_file")"
+  candidate_count="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["candidate_count"])' "$meta_file")"
   if [[ "$candidate_count" -eq 0 ]]; then
     echo "no thumbnail candidates discovered; publishing the current registry manifest"
     export SLURM_SHARED_RUN_DIR="$run_dir"
@@ -181,7 +184,7 @@ submit_array() {
   fi
 
   local actual_tasks
-  actual_tasks="$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1]))["task_count"])' "$meta_file")"
+  actual_tasks="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["task_count"])' "$meta_file")"
   local worker_job
   worker_job="$({
     sbatch --parsable \
@@ -226,7 +229,7 @@ worker_mode() {
   local failures_path="${LOG_DIR}/slide-thumbnail-failures-${array_job_id}-${array_task_id}.json"
 
   mkdir -p "$result_dir"
-  uv run python - <<'PY' "$meta_file" "$result_dir" "$summary_path" "$failures_path" "$array_task_id"
+  "$PYTHON_BIN" - <<'PY' "$meta_file" "$result_dir" "$summary_path" "$failures_path" "$array_task_id"
 import json
 import sys
 from pathlib import Path
@@ -271,7 +274,7 @@ publish_mode() {
   local publish_summary="${LOG_DIR}/slide-thumbnail-publish-summary-${SLURM_JOB_ID:-manual}.json"
   local publish_failures="${LOG_DIR}/slide-thumbnail-publish-failures-${SLURM_JOB_ID:-manual}.json"
 
-  uv run python - <<'PY' "$meta_file" "$publish_summary" "$publish_failures" "${SLURM_SHARED_RUN_DIR}"
+  "$PYTHON_BIN" - <<'PY' "$meta_file" "$publish_summary" "$publish_failures" "${SLURM_SHARED_RUN_DIR}"
 import json
 import sys
 from pathlib import Path
