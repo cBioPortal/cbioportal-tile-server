@@ -39,6 +39,9 @@ source_env() {
   set -a
   source .env >/dev/null 2>&1
   set +a
+  if [[ -n "${SSL_CERT_FILE:-}" && ! -r "$SSL_CERT_FILE" ]]; then
+    unset SSL_CERT_FILE
+  fi
   configure_paths
   mkdir -p "$LOG_DIR" "$THUMBNAIL_TMPDIR" "$BLOCKCACHE_PATH"
   export PYTHONUNBUFFERED=1
