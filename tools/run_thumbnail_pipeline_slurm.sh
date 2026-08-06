@@ -197,7 +197,7 @@ submit_array() {
       --export=ALL,SLURM_SHARED_RUN_DIR="$run_dir",SLURM_LOG_DIR="$log_dir" \
       --output="${log_dir}/slide-thumbnails-%A_%a.out" \
       --error="${log_dir}/slide-thumbnails-%A_%a.err" \
-      "$SCRIPT_PATH" worker
+      --wrap="exec bash '$SCRIPT_PATH' worker"
   })"
   local publish_job
   publish_job="$({
@@ -211,7 +211,7 @@ submit_array() {
       --export=ALL,SLURM_SHARED_RUN_DIR="$run_dir",SLURM_LOG_DIR="$log_dir" \
       --output="${log_dir}/slide-thumbnails-publish-%j.out" \
       --error="${log_dir}/slide-thumbnails-publish-%j.err" \
-      "$SCRIPT_PATH" publish
+      --wrap="exec bash '$SCRIPT_PATH' publish"
   })"
   echo "worker_job=${worker_job}"
   echo "publish_job=${publish_job}"
