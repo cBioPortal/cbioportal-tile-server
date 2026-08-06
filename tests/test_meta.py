@@ -1,6 +1,7 @@
 """Tests for Databricks metadata layer (app/meta.py)."""
 
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -34,6 +35,68 @@ class TestCoerce:
 
     def test_string_unchanged(self):
         assert _coerce("hello") == "hello"
+
+
+class TestExternalQuery:
+    def test_external_result_links_include_headers_and_timeout(self):
+        from databricks.sdk.service.sql import StatementState
+
+        statement = SimpleNamespace(
+            statement_id="statement-1",
+            status=SimpleNamespace(state=StatementState.SUCCEEDED),
+            manifest=SimpleNamespace(
+                schema=SimpleNamespace(columns=[SimpleNamespace(name="image_id")]),
+                total_chunk_count=2,
+            ),
+        )
+        chunks = [
+            SimpleNamespace(
+                external_links=[
+                    SimpleNamespace(
+                        external_link="https://result/0",
+                        http_headers={"X-Result-Key": "secret"},
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                external_links=[
+                    SimpleNamespace(external_link="https://result/1", http_headers=None)
+                ]
+            ),
+        ]
+        execution = SimpleNamespace(
+            execute_statement=lambda **kwargs: statement,
+            get_statement_result_chunk_n=lambda statement_id, chunk_index: chunks[chunk_index],
+        )
+        workspace = SimpleNamespace(statement_execution=execution)
+        calls = []
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return self.payload
+
+        def fake_urlopen(request, timeout):
+            calls.append((request, timeout))
+            payload = b'[["1492807"]]' if request.full_url.endswith("/0") else b'[["1492808"]]'
+            return Response(payload)
+
+        with patch.object(meta_store, "client", return_value=workspace), patch.object(
+            meta_store, "urlopen", side_effect=fake_urlopen
+        ):
+            rows = meta_store.run_query_external("SELECT image_id", "warehouse")
+
+        assert rows == [{"image_id": "1492807"}, {"image_id": "1492808"}]
+        assert calls[0][0].get_header("X-result-key") == "secret"
+        assert all(timeout == meta_store.EXTERNAL_LINK_TIMEOUT_SEC for _, timeout in calls)
 
 
 class TestInferStainFlags:

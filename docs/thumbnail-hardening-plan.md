@@ -75,7 +75,13 @@ Add a batch generator that:
 5. writes the manifest after the batch completes
 
 Failures should be recorded separately so the manifest contains only valid,
-published artifacts.
+published artifacts. Slurm workers should render into bounded task shards and
+write result files only; a dependent publisher should serialize registry
+updates and publish the manifest after all workers reach a terminal state.
+
+The default operational shape is 2,000 slides per task, at most 480 array
+tasks, two concurrent tasks, and a 600-second timeout per slide. Use an
+explicit retry run for rows whose registry status is `failed`.
 
 ### 4. Runtime serving rules
 

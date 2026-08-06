@@ -75,6 +75,10 @@ class TestOtherSettings:
         s = make_settings()
         assert s.thumbnail_timeout_sec == 8
 
+    def test_thumbnail_placeholder_cache_ttl_default(self):
+        s = make_settings()
+        assert s.thumbnail_placeholder_cache_ttl == 60
+
     def test_thumbnail_manifest_uri_default(self):
         s = make_settings()
         assert s.thumbnail_manifest_uri == ""
@@ -90,6 +94,14 @@ class TestOtherSettings:
     def test_thumbnail_generated_record_cache_capacity_default(self):
         s = make_settings()
         assert s.thumbnail_generated_record_cache_capacity == 4_096
+
+    def test_thumbnail_batch_timeout_default(self):
+        s = make_settings()
+        assert s.thumbnail_batch_timeout_sec == 600
+
+    def test_thumbnail_placeholder_cache_ttl_reads_environment(self):
+        s = make_settings(THUMBNAIL_PLACEHOLDER_CACHE_TTL="15")
+        assert s.thumbnail_placeholder_cache_ttl == 15
 
     def test_thumbnail_cache_ttl_default(self):
         s = make_settings()

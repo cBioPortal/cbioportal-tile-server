@@ -282,26 +282,46 @@ def get_thumbnail_bytes(slide: TiffSlide, width: int, height: int) -> bytes:
 def _plan_thumbnail_decode(
     slide: TiffSlide, width: int, height: int
 ) -> ThumbnailDecodePlan:
-    for level in range(slide.level_count - 1, -1, -1):
+    slide_width, slide_height = slide.dimensions
+    scale = min(width / slide_width, height / slide_height, 1.0)
+    target_width = max(1, min(slide_width, round(slide_width * scale)))
+    target_height = max(1, min(slide_height, round(slide_height * scale)))
+    safe_levels: list[tuple[int, int, int, int]] = []
+    for level in range(slide.level_count):
         level_width, level_height = slide.level_dimensions[level]
         requested_pixels = level_width * level_height
         if requested_pixels <= settings.thumbnail_max_decode_pixels:
+            safe_levels.append((level, level_width, level_height, requested_pixels))
+
+    if not safe_levels:
+        fallback_level = slide.level_count - 1
+        fallback_width, fallback_height = slide.level_dimensions[fallback_level]
+        raise NoSafeThumbnailOverview(
+            level=fallback_level,
+            level_width=fallback_width,
+            level_height=fallback_height,
+            requested_pixels=fallback_width * fallback_height,
+        )
+
+    for level, level_width, level_height, requested_pixels in reversed(safe_levels):
+        if level_width >= target_width and level_height >= target_height:
             return ThumbnailDecodePlan(
                 level=level,
                 read_width=level_width,
                 read_height=level_height,
                 requested_pixels=requested_pixels,
-                target_width=width,
-                target_height=height,
+                target_width=target_width,
+                target_height=target_height,
             )
 
-    fallback_level = slide.level_count - 1
-    fallback_width, fallback_height = slide.level_dimensions[fallback_level]
-    raise NoSafeThumbnailOverview(
-        level=fallback_level,
-        level_width=fallback_width,
-        level_height=fallback_height,
-        requested_pixels=fallback_width * fallback_height,
+    level, level_width, level_height, requested_pixels = safe_levels[0]
+    return ThumbnailDecodePlan(
+        level=level,
+        read_width=level_width,
+        read_height=level_height,
+        requested_pixels=requested_pixels,
+        target_width=target_width,
+        target_height=target_height,
     )
 
 

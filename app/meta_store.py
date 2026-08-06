@@ -4,10 +4,10 @@ Databricks SQL transport and raw query definitions for slide metadata.
 
 from __future__ import annotations
 
-import logging
 import json
-from urllib.request import urlopen
+import logging
 from typing import Any
+from urllib.request import Request, urlopen
 
 from .constants import (
     CANONICAL_ASSOCIATION_TABLE as _CANONICAL_ASSOCIATION_TABLE,
@@ -18,6 +18,7 @@ from .constants import (
 )
 
 logger = logging.getLogger(__name__)
+EXTERNAL_LINK_TIMEOUT_SEC = 120
 
 PATIENT_SQL = f"""
 WITH sample_sequencing AS (
@@ -259,7 +260,11 @@ def run_query_external(sql: str, warehouse_id: str, params: list | None = None) 
         links = chunk.external_links or []
         if not links:
             continue
-        with urlopen(links[0].external_link) as response:  # noqa: S310
+        link = links[0]
+        if not link.external_link:
+            raise RuntimeError(f"Databricks result chunk {chunk_index} has no external link")
+        request = Request(link.external_link, headers=link.http_headers or {})
+        with urlopen(request, timeout=EXTERNAL_LINK_TIMEOUT_SEC) as response:  # noqa: S310
             payload = json.loads(response.read().decode("utf-8"))
         rows.extend(dict(zip(columns, row)) for row in payload)
     return rows

@@ -109,11 +109,12 @@ All settings are environment variables (see `app/config.py`):
 | `MAX_DECODE_PIXELS` | `4194304` | Maximum source pixels a single on-demand decode may read before the request is rejected |
 | `THUMBNAIL_MAX_DECODE_PIXELS` | `16000000` | Maximum source pixels for a bounded thumbnail overview decode |
 | `THUMBNAIL_TIMEOUT_SEC` | `8` | Deadline for process-isolated on-demand thumbnail generation |
-| `THUMBNAIL_PLACEHOLDER_MODE` | `inline` | Placeholder strategy for unavailable thumbnail artifacts |
+| `THUMBNAIL_PLACEHOLDER_CACHE_TTL` | `60` | Redis/browser cache lifetime for placeholder thumbnails in seconds |
 | `THUMBNAIL_MANIFEST_URI` | — | JSON manifest listing available pre-rendered thumbnails |
 | `THUMBNAIL_MASTER_SIZE` | `1024` | Maximum edge length of generated thumbnail masters |
 | `THUMBNAIL_MANIFEST_REFRESH_SEC` | `300` | In-process manifest refresh interval in seconds |
 | `THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY` | `4096` | Maximum transient on-demand thumbnail records retained per worker |
+| `THUMBNAIL_BATCH_TIMEOUT_SEC` | `600` | Maximum time for one isolated offline slide render |
 | `REDIS_URL` | `redis://redis:6379` | Redis connection; use a password-protected URL in production |
 | `TILE_CACHE_TTL` | `86400` | Tile cache TTL in seconds; `0` means no expiry |
 | `THUMBNAIL_CACHE_TTL` | `86400` | Thumbnail cache TTL in seconds |

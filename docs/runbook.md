@@ -213,15 +213,26 @@ Run the batch generator on on-prem infrastructure as a separate Slurm array:
 
 ```bash
 tools/run_thumbnail_pipeline_slurm.sh submit \
-  s3://my-bucket/wsi-thumbnails/manifest.json \
-  s3://my-bucket/wsi-thumbnails/masters 32 2
+  --manifest-uri s3://my-bucket/wsi-thumbnails/manifest.json \
+  --root-uri s3://my-bucket/wsi-thumbnails/masters \
+  --slides-per-task 2000 --concurrency 2
+
+# Retry only rows recorded as failed by a prior run.
+tools/run_thumbnail_pipeline_slurm.sh retry \
+  --manifest-uri s3://my-bucket/wsi-thumbnails/manifest.json \
+  --root-uri s3://my-bucket/wsi-thumbnails/masters \
+  --slides-per-task 2000 --concurrency 2
 ```
 
 The batch path reads servable S3 paths from Databricks, stores publication state
 in `cdsi_prod.pathology_data_mining.slide_thumbnail_registry`, and keeps its
 temporary files, logs, and subprocess handoff data under the shared run
-directory rather than `/tmp`. Block cache is disabled for offline generation so
-one-time slide reads do not accumulate on GPFS.
+directory rather than `/tmp`. Array workers write result files only; the
+dependent publisher performs serialized registry updates and publishes the
+manifest even when individual slides fail. Block cache is disabled for offline
+generation so one-time slide reads do not accumulate on GPFS. Successful
+publication removes candidate, result, temporary, and block-cache directories
+while retaining summaries and failure logs.
 
 ## Overview decode guard
 

@@ -171,6 +171,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_methods=["GET"],
     allow_headers=["*"],
+    expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason"],
 )
 
 
@@ -233,7 +234,6 @@ TILE_CACHE_HEADERS  = {"Cache-Control": "private, max-age=3600", "Vary": "Author
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
 # Metadata and search responses contain patient/slide information.
 PHI_CACHE_HEADERS   = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
-THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL = 60
 
 
 async def _in_thread(fn, *args):
@@ -265,11 +265,21 @@ def _thumbnail_status_headers(status: str, reason: str) -> dict[str, str]:
 
 
 def _thumbnail_placeholder_ttl(reason: str) -> int | None:
-    if reason == "unavailable":
-        if settings.thumbnail_cache_ttl:
-            return min(settings.thumbnail_cache_ttl, THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL)
-        return THUMBNAIL_UNAVAILABLE_PLACEHOLDER_TTL
-    return None
+    if reason not in {"missing", "decode_timeout", "unavailable"}:
+        return None
+    configured = max(1, settings.thumbnail_placeholder_cache_ttl)
+    if settings.thumbnail_cache_ttl:
+        return min(settings.thumbnail_cache_ttl, configured)
+    return configured
+
+
+def _thumbnail_response_headers(status: str, reason: str) -> dict[str, str]:
+    headers = dict(THUMB_CACHE_HEADERS)
+    if status == "placeholder":
+        ttl = _thumbnail_placeholder_ttl(reason) or 1
+        headers["Cache-Control"] = f"private, max-age={ttl}"
+    headers.update(_thumbnail_status_headers(status, reason))
+    return headers
 
 
 def _log_thumbnail_outcome(
@@ -871,15 +881,13 @@ async def thumbnail(
     cached = await tile_cache.get_thumbnail(cache_slide_id, width, height)
     if cached:
         status = await tile_cache.get_thumbnail_status(cache_slide_id, width, height)
-        headers = dict(THUMB_CACHE_HEADERS)
-        if status:
-            headers.update(
-                _thumbnail_status_headers(
-                    str(status.get("status") or "ok"),
-                    str(status.get("reason") or "served"),
-                )
-            )
-        return Response(content=cached, media_type="image/jpeg", headers=headers)
+        cached_status = str(status.get("status") or "ok") if status else "ok"
+        cached_reason = str(status.get("reason") or "served") if status else "served"
+        return Response(
+            content=cached,
+            media_type="image/jpeg",
+            headers=_thumbnail_response_headers(cached_status, cached_reason),
+        )
 
     cache_key = tile_cache.thumbnail_cache_key(cache_slide_id, width, height)
     started = time.perf_counter()
@@ -901,8 +909,9 @@ async def thumbnail(
                 if record is None:
                     raise
                 data, status = await _in_thread(render_thumbnail_response, record, width, height)
-        await tile_cache.set_thumbnail(cache_slide_id, width, height, data)
-        await tile_cache.set_thumbnail_status(cache_slide_id, width, height, status)
+        ttl = _thumbnail_placeholder_ttl(str(status["reason"])) if status["status"] == "placeholder" else None
+        await tile_cache.set_thumbnail(cache_slide_id, width, height, data, ttl=ttl)
+        await tile_cache.set_thumbnail_status(cache_slide_id, width, height, status, ttl=ttl)
         return data, status
 
     try:
@@ -925,10 +934,10 @@ async def thumbnail(
         return Response(
             content=data,
             media_type="image/jpeg",
-            headers=dict(THUMB_CACHE_HEADERS)
-            | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+            headers=_thumbnail_response_headers(str(status["status"]), str(status["reason"])),
         )
     except Exception:
+        logger.exception("thumbnail_request_failed slide_id=%s", slide_id)
         data = get_placeholder_thumbnail_bytes(width, height)
         status = {"status": "placeholder", "reason": "unavailable"}
         ttl = _thumbnail_placeholder_ttl(str(status["reason"]))
@@ -946,8 +955,7 @@ async def thumbnail(
         return Response(
             content=data,
             media_type="image/jpeg",
-            headers=dict(THUMB_CACHE_HEADERS)
-            | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+            headers=_thumbnail_response_headers(str(status["status"]), str(status["reason"])),
         )
 
     elapsed_ms = (time.perf_counter() - started) * 1000
@@ -962,8 +970,7 @@ async def thumbnail(
     return Response(
         content=data,
         media_type="image/jpeg",
-        headers=dict(THUMB_CACHE_HEADERS)
-        | _thumbnail_status_headers(str(status["status"]), str(status["reason"])),
+        headers=_thumbnail_response_headers(str(status["status"]), str(status["reason"])),
     )
 
 

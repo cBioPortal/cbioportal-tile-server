@@ -613,6 +613,19 @@ class TestThumbnailRoute:
         resp = api_client.get("/thumbnails/1492807")
         assert "max-age" in resp.headers.get("cache-control", "")
 
+    def test_placeholder_cache_control_is_short_lived(self, api_client):
+        resp = api_client.get("/thumbnails/1492807")
+        assert resp.headers["x-thumbnail-status"] == "placeholder"
+        assert resp.headers["cache-control"] == "private, max-age=60"
+
+    def test_thumbnail_status_headers_are_exposed_to_allowed_origins(self, api_client):
+        resp = api_client.get(
+            "/thumbnails/1492807",
+            headers={"Origin": "https://cbioportal.mskcc.org"},
+        )
+        assert "X-Thumbnail-Status" in resp.headers["access-control-expose-headers"]
+        assert "X-Thumbnail-Reason" in resp.headers["access-control-expose-headers"]
+
     def test_missing_artifact_generates_on_demand(self, api_client):
         record = ThumbnailRecord(
             image_id="1492807",

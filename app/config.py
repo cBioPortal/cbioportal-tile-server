@@ -77,8 +77,8 @@ class Settings:
     thumbnail_timeout_sec: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_TIMEOUT_SEC", 8)
     )
-    thumbnail_placeholder_mode: str = field(
-        default_factory=lambda: _env_str("THUMBNAIL_PLACEHOLDER_MODE", "inline")
+    thumbnail_placeholder_cache_ttl: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_PLACEHOLDER_CACHE_TTL", 60)
     )
     thumbnail_manifest_uri: str = field(
         default_factory=lambda: _env_str("THUMBNAIL_MANIFEST_URI")
@@ -91,6 +91,9 @@ class Settings:
     )
     thumbnail_generated_record_cache_capacity: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY", 4096)
+    )
+    thumbnail_batch_timeout_sec: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_BATCH_TIMEOUT_SEC", 600)
     )
 
     # Redis tile cache

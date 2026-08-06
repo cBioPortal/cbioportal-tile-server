@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
+import subprocess
 from unittest.mock import MagicMock, patch
 
+import pytest
 from PIL import Image
 
 from app.tiles import NoSafeThumbnailOverview
@@ -67,6 +70,92 @@ class TestBuildThumbnailRecord:
         assert _jpeg_size(record["bytes"]) == (800, 600)
         assert record["level"] is None
         assert record["requested_pixels"] is None
+
+
+class TestBatchSafety:
+    def test_renderer_timeout_kills_process_group(self, monkeypatch):
+        class FakeProcess:
+            pid = 123
+
+            def __init__(self):
+                self.wait_calls = 0
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise subprocess.TimeoutExpired("thumbnail", timeout)
+                return -9
+
+        process = FakeProcess()
+        with (
+            patch.object(module.subprocess, "Popen", return_value=process),
+            patch.object(module.os, "killpg") as killpg,
+            patch.object(module, "settings") as settings,
+        ):
+            settings.thumbnail_batch_timeout_sec = 600
+            with pytest.raises(TimeoutError, match="1492807"):
+                module._render_candidate_artifact_subprocess(
+                    image_id="1492807",
+                    slide_uri="s3://bucket/1492807.svs",
+                    artifact_uri="s3://thumbs/1492807.jpg",
+                    master_size=1024,
+                    timeout_sec=1,
+                )
+
+        killpg.assert_called_once_with(123, module.signal.SIGKILL)
+
+    def test_candidate_shards_are_bounded(self, tmp_path):
+        rows = [module.InventoryRow(str(index), f"s3://bucket/{index}.svs") for index in range(11)]
+
+        task_count = module.write_candidate_shards(
+            str(tmp_path), rows, slides_per_task=3, max_tasks=4
+        )
+
+        assert task_count == 4
+        assert sum(1 for _ in tmp_path.glob("task-*.jsonl")) == 4
+        assert sum(1 for path in tmp_path.glob("task-*.jsonl") for _ in module.iter_candidate_rows(str(path))) == 11
+
+    def test_result_publisher_skips_truncated_line(self, tmp_path):
+        result_path = tmp_path / "task-0000.jsonl"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "image_id": "1492807",
+                    "source_path": "s3://bucket/1492807.svs",
+                    "artifact_uri": "s3://thumbs/1492807.jpg",
+                    "width": 1024,
+                    "height": 768,
+                    "content_type": "image/jpeg",
+                    "status": "success",
+                    "rendered_at": "2026-08-06 12:00:00",
+                    "error_message": None,
+                    "manifest_version": "v1",
+                }
+            )
+            + "\n{\"image_id\":",
+            encoding="utf-8",
+        )
+
+        with patch.object(module, "_upsert_registry_rows") as upsert:
+            stats = module.publish_registry_results("warehouse", [str(result_path)])
+
+        assert stats == {"success_count": 1, "failure_count": 0, "record_count": 1}
+        upsert.assert_called_once()
+
+    def test_cleanup_removes_only_ephemeral_run_directories(self, tmp_path):
+        for name in ("candidates", "results", "tmp", "blockcache", "logs"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "marker").write_text("x")
+        (tmp_path / "run-meta.json").write_text("{}")
+
+        module.cleanup_run_artifacts(str(tmp_path))
+
+        assert not (tmp_path / "candidates").exists()
+        assert not (tmp_path / "results").exists()
+        assert not (tmp_path / "tmp").exists()
+        assert not (tmp_path / "blockcache").exists()
+        assert (tmp_path / "logs" / "marker").exists()
+        assert (tmp_path / "run-meta.json").exists()
 
 
 class TestDeltaSelection:

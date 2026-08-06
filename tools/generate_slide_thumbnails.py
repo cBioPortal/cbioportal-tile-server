@@ -6,29 +6,33 @@ import argparse
 import json
 import logging
 import os
+import signal
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import fsspec
 from PIL import Image
 
 from app.config import settings
-from app.constants import INVENTORY_TABLE
-from app.constants import THUMBNAIL_REGISTRY_TABLE
+from app.constants import INVENTORY_TABLE, THUMBNAIL_REGISTRY_TABLE
 from app.meta_store import run_query_external, run_statement
 from app.slide_store import open_slide, s3_opts
-from app.tiles import NoSafeThumbnailOverview
-from app.tiles import get_thumbnail_bytes_with_plan
+from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan
 
 logger = logging.getLogger("thumbnail-generator")
-REGISTRY_UPSERT_BATCH_SIZE = 250
+
+REGISTRY_UPSERT_BATCH_SIZE = 1_000
+DEFAULT_SLIDES_PER_TASK = 2_000
+MAX_ARRAY_TASKS = 480
 
 SERVABLE_SLIDES_SQL = """
 SELECT image_id, path
@@ -158,15 +162,11 @@ def _sql_string(value: str) -> str:
 
 
 def _sql_nullable_string(value: str | None) -> str:
-    if value is None:
-        return "NULL"
-    return _sql_string(value)
+    return "NULL" if value is None else _sql_string(value)
 
 
 def _sql_nullable_int(value: int | None) -> str:
-    if value is None:
-        return "NULL"
-    return str(value)
+    return "NULL" if value is None else str(value)
 
 
 @contextmanager
@@ -179,15 +179,15 @@ def _without_blockcache():
         settings.blockcache_path = original
 
 
-def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> dict:
+def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> dict[str, Any]:
     with _without_blockcache():
         slide, fileobj = open_slide(slide_uri, logger)
     try:
         try:
             thumb_bytes, plan = get_thumbnail_bytes_with_plan(slide, master_size, master_size)
         except NoSafeThumbnailOverview:
-            # Offline generation is allowed to do heavier work so every servable
-            # slide can still receive a published thumbnail artifact.
+            # Offline generation may use the heavier fallback, but only in the
+            # isolated renderer process and never in the API process.
             image = slide.get_thumbnail((master_size, master_size)).convert("RGB")
             out = BytesIO()
             image.save(out, format="JPEG", quality=settings.jpeg_quality)
@@ -237,38 +237,62 @@ def _render_candidate_artifact(
     }
 
 
+def _thumbnail_temp_dir() -> str | None:
+    configured = os.environ.get("THUMBNAIL_TMPDIR")
+    if not configured:
+        return None
+    Path(configured).mkdir(parents=True, exist_ok=True)
+    return configured
+
+
 def _render_candidate_artifact_subprocess(
     *,
     image_id: str,
     slide_uri: str,
     artifact_uri: str,
     master_size: int,
+    timeout_sec: int | None = None,
 ) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(
         prefix=f"slide-thumbnail-{image_id}-",
         suffix=".json",
         delete=False,
+        dir=_thumbnail_temp_dir(),
     ) as handle:
         output_path = handle.name
+
+    command = [
+        sys.executable,
+        __file__,
+        "--render-single-image-id",
+        image_id,
+        "--render-single-source-path",
+        slide_uri,
+        "--render-single-artifact-uri",
+        artifact_uri,
+        "--render-single-master-size",
+        str(master_size),
+        "--render-single-output-path",
+        output_path,
+    ]
+    process = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        start_new_session=True,
+    )
+    limit = max(1, timeout_sec or settings.thumbnail_batch_timeout_sec)
     try:
-        subprocess.run(
-            [
-                sys.executable,
-                __file__,
-                "--render-single-image-id",
-                image_id,
-                "--render-single-source-path",
-                slide_uri,
-                "--render-single-artifact-uri",
-                artifact_uri,
-                "--render-single-master-size",
-                str(master_size),
-                "--render-single-output-path",
-                output_path,
-            ],
-            check=True,
-            env=os.environ.copy(),
-        )
+        try:
+            return_code = process.wait(timeout=limit)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise TimeoutError(f"thumbnail render timed out after {limit}s for {image_id}") from exc
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command)
         with open(output_path, "r", encoding="utf-8") as handle:
             return json.load(handle)
     finally:
@@ -283,23 +307,21 @@ def _normalize_inventory_rows(rows: list[dict[str, Any]]) -> list[InventoryRow]:
 
 
 def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
-    normalized: list[RegistryRow] = []
-    for row in rows:
-        normalized.append(
-            RegistryRow(
-                image_id=str(row["image_id"]),
-                source_path=str(row.get("source_path") or ""),
-                artifact_uri=str(row.get("artifact_uri") or ""),
-                width=int(row.get("width") or 0),
-                height=int(row.get("height") or 0),
-                content_type=str(row.get("content_type") or "image/jpeg"),
-                status=str(row.get("status") or ""),
-                rendered_at=str(row.get("rendered_at") or ""),
-                error_message=str(row.get("error_message") or ""),
-                manifest_version=str(row.get("manifest_version") or ""),
-            )
+    return [
+        RegistryRow(
+            image_id=str(row["image_id"]),
+            source_path=str(row.get("source_path") or ""),
+            artifact_uri=str(row.get("artifact_uri") or ""),
+            width=int(row.get("width") or 0),
+            height=int(row.get("height") or 0),
+            content_type=str(row.get("content_type") or "image/jpeg"),
+            status=str(row.get("status") or ""),
+            rendered_at=str(row.get("rendered_at") or ""),
+            error_message=str(row.get("error_message") or ""),
+            manifest_version=str(row.get("manifest_version") or ""),
         )
-    return normalized
+        for row in rows
+    ]
 
 
 def _fetch_inventory_rows(warehouse_id: str) -> list[InventoryRow]:
@@ -315,53 +337,14 @@ def _ensure_registry_table(warehouse_id: str) -> None:
 
 
 def _dedupe_inventory_rows(rows: list[InventoryRow]) -> list[InventoryRow]:
-    deduped_rows: list[InventoryRow] = []
-    seen_image_ids: set[str] = set()
+    deduped: list[InventoryRow] = []
+    seen: set[str] = set()
     for row in rows:
-        if row.image_id in seen_image_ids:
+        if row.image_id in seen:
             continue
-        seen_image_ids.add(row.image_id)
-        deduped_rows.append(row)
-    return deduped_rows
-
-
-def _slice_candidate_rows(
-    rows: list[InventoryRow],
-    *,
-    task_index: int,
-    task_count: int,
-) -> list[InventoryRow]:
-    if task_count <= 0:
-        raise ValueError("task_count must be positive")
-    if task_index < 0 or task_index >= task_count:
-        raise ValueError("task_index out of range")
-    return [row for index, row in enumerate(rows) if index % task_count == task_index]
-
-
-def write_candidate_rows(path: str, rows: list[InventoryRow]) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps({"image_id": row.image_id, "path": row.path}, sort_keys=True))
-            handle.write("\n")
-
-
-def read_candidate_rows(path: str) -> list[InventoryRow]:
-    rows: list[InventoryRow] = []
-    with Path(path).open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            payload = json.loads(line)
-            rows.append(
-                InventoryRow(
-                    image_id=str(payload["image_id"]),
-                    path=str(payload["path"]),
-                )
-            )
-    return rows
+        seen.add(row.image_id)
+        deduped.append(row)
+    return deduped
 
 
 def _registry_by_image_id(rows: list[RegistryRow]) -> dict[str, RegistryRow]:
@@ -373,10 +356,9 @@ def _registry_by_image_id(rows: list[RegistryRow]) -> dict[str, RegistryRow]:
             continue
         existing_priority = 0 if existing.status == "success" else 1
         row_priority = 0 if row.status == "success" else 1
-        if row_priority < existing_priority:
-            by_image_id[row.image_id] = row
-            continue
-        if row_priority == existing_priority and row.rendered_at > existing.rendered_at:
+        if row_priority < existing_priority or (
+            row_priority == existing_priority and row.rendered_at > existing.rendered_at
+        ):
             by_image_id[row.image_id] = row
     return by_image_id
 
@@ -417,9 +399,278 @@ def discover_candidate_rows(
         registry_rows,
         retry_failures_only=retry_failures_only,
     )
-    if limit is not None:
-        candidates = candidates[:limit]
-    return candidates
+    return candidates if limit is None else candidates[:limit]
+
+
+def write_candidate_rows(path: str, rows: Iterable[InventoryRow]) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps({"image_id": row.image_id, "path": row.path}, sort_keys=True))
+            handle.write("\n")
+
+
+def read_candidate_rows(path: str) -> list[InventoryRow]:
+    rows: list[InventoryRow] = []
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            rows.append(InventoryRow(image_id=str(payload["image_id"]), path=str(payload["path"])))
+    return rows
+
+
+def iter_candidate_rows(path: str) -> Iterable[InventoryRow]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            yield InventoryRow(image_id=str(payload["image_id"]), path=str(payload["path"]))
+
+
+def _slice_candidate_rows(
+    rows: list[InventoryRow],
+    *,
+    task_index: int,
+    task_count: int,
+) -> list[InventoryRow]:
+    if task_count <= 0:
+        raise ValueError("task_count must be positive")
+    if task_index < 0 or task_index >= task_count:
+        raise ValueError("task_index out of range")
+    return [row for index, row in enumerate(rows) if index % task_count == task_index]
+
+
+def write_candidate_shards(
+    directory: str,
+    rows: list[InventoryRow],
+    *,
+    slides_per_task: int = DEFAULT_SLIDES_PER_TASK,
+    max_tasks: int = MAX_ARRAY_TASKS,
+) -> int:
+    if slides_per_task <= 0 or max_tasks <= 0:
+        raise ValueError("slides_per_task and max_tasks must be positive")
+    destination = Path(directory)
+    destination.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return 0
+
+    task_count = min(max_tasks, (len(rows) + slides_per_task - 1) // slides_per_task)
+    rows_per_task = (len(rows) + task_count - 1) // task_count
+    handles = [
+        (destination / f"task-{task_index:04d}.jsonl").open("w", encoding="utf-8")
+        for task_index in range(task_count)
+    ]
+    try:
+        for index, row in enumerate(rows):
+            task_index = min(index // rows_per_task, task_count - 1)
+            handles[task_index].write(
+                json.dumps({"image_id": row.image_id, "path": row.path}, sort_keys=True) + "\n"
+            )
+    finally:
+        for handle in handles:
+            handle.close()
+    return task_count
+
+
+def _rendered_at() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _append_result(handle, record: dict[str, Any]) -> None:
+    if handle is None:
+        return
+    handle.write(json.dumps(record, sort_keys=True) + "\n")
+    handle.flush()
+
+
+def process_candidate_rows(
+    *,
+    warehouse_id: str,
+    root_uri: str,
+    master_size: int,
+    rows: Iterable[InventoryRow],
+    manifest_version: str,
+    result_path: str | None = None,
+    timeout_sec: int | None = None,
+) -> list[dict[str, Any]]:
+    del warehouse_id  # Registry writes are intentionally reserved for the finalizer.
+    failures: list[dict[str, Any]] = []
+    result_handle = None
+    if result_path:
+        result_file = Path(result_path)
+        result_file.parent.mkdir(parents=True, exist_ok=True)
+        result_handle = result_file.open("a", encoding="utf-8")
+
+    try:
+        for index, row in enumerate(rows, start=1):
+            logger.info("processing %s (%d)", row.image_id, index)
+            artifact_uri = _join_uri(root_uri, f"{row.image_id}.jpg")
+            try:
+                artifact = _render_candidate_artifact_subprocess(
+                    image_id=row.image_id,
+                    slide_uri=row.path,
+                    artifact_uri=artifact_uri,
+                    master_size=master_size,
+                    timeout_sec=timeout_sec,
+                )
+                _append_result(
+                    result_handle,
+                    {
+                        "image_id": artifact["image_id"],
+                        "source_path": artifact["source_path"],
+                        "artifact_uri": artifact["artifact_uri"],
+                        "width": int(artifact["width"]),
+                        "height": int(artifact["height"]),
+                        "content_type": artifact["content_type"],
+                        "status": "success",
+                        "rendered_at": _rendered_at(),
+                        "error_message": None,
+                        "manifest_version": manifest_version,
+                    },
+                )
+            except Exception as exc:
+                logger.exception("failed thumbnail generation for %s", row.image_id)
+                failure = {"image_id": row.image_id, "path": row.path, "error": str(exc)}
+                failures.append(failure)
+                _append_result(
+                    result_handle,
+                    {
+                        "image_id": row.image_id,
+                        "source_path": row.path,
+                        "artifact_uri": artifact_uri,
+                        "width": None,
+                        "height": None,
+                        "content_type": "image/jpeg",
+                        "status": "failed",
+                        "rendered_at": _rendered_at(),
+                        "error_message": str(exc),
+                        "manifest_version": manifest_version,
+                    },
+                )
+    finally:
+        if result_handle is not None:
+            result_handle.close()
+    return failures
+
+
+def _iter_result_records(paths: Iterable[str]) -> Iterable[dict[str, Any]]:
+    for path in sorted(paths):
+        with Path(path).open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning("ignoring incomplete result line path=%s line=%d", path, line_number)
+                    continue
+                if not isinstance(payload, dict) or not payload.get("image_id"):
+                    logger.warning("ignoring invalid result record path=%s line=%d", path, line_number)
+                    continue
+                yield payload
+
+
+def _batched(values: list[dict[str, Any]], batch_size: int) -> Iterable[list[dict[str, Any]]]:
+    for index in range(0, len(values), batch_size):
+        yield values[index : index + batch_size]
+
+
+def _registry_select_row_sql(row: dict[str, Any]) -> str:
+    return f"""
+SELECT
+    {_sql_string(str(row["image_id"]))} AS image_id,
+    {_sql_string(str(row["source_path"]))} AS source_path,
+    {_sql_string(str(row["artifact_uri"]))} AS artifact_uri,
+    {_sql_nullable_int(row.get("width"))} AS width,
+    {_sql_nullable_int(row.get("height"))} AS height,
+    {_sql_string(str(row.get("content_type") or "image/jpeg"))} AS content_type,
+    {_sql_string(str(row["status"]))} AS status,
+    CAST({_sql_string(str(row["rendered_at"]))} AS TIMESTAMP) AS rendered_at,
+    {_sql_nullable_string(row.get("error_message"))} AS error_message,
+    {_sql_string(str(row["manifest_version"]))} AS manifest_version
+"""
+
+
+def _upsert_registry_rows(warehouse_id: str, rows: list[dict[str, Any]]) -> None:
+    for batch in _batched(rows, REGISTRY_UPSERT_BATCH_SIZE):
+        source_sql = "\nUNION ALL\n".join(_registry_select_row_sql(row) for row in batch)
+        merge_sql = f"""
+MERGE INTO {THUMBNAIL_REGISTRY_TABLE} AS target
+USING (
+{source_sql}
+) AS source
+ON target.image_id = source.image_id
+WHEN MATCHED THEN UPDATE SET
+    target.source_path = source.source_path,
+    target.artifact_uri = source.artifact_uri,
+    target.width = source.width,
+    target.height = source.height,
+    target.content_type = source.content_type,
+    target.status = source.status,
+    target.rendered_at = source.rendered_at,
+    target.error_message = source.error_message,
+    target.manifest_version = source.manifest_version
+WHEN NOT MATCHED THEN INSERT (
+    image_id, source_path, artifact_uri, width, height, content_type,
+    status, rendered_at, error_message, manifest_version
+) VALUES (
+    source.image_id, source.source_path, source.artifact_uri, source.width,
+    source.height, source.content_type, source.status, source.rendered_at,
+    source.error_message, source.manifest_version
+)
+"""
+        run_statement(merge_sql, warehouse_id)
+
+
+def publish_registry_results(warehouse_id: str, result_paths: Iterable[str]) -> dict[str, int]:
+    batch: list[dict[str, Any]] = []
+    stats = {"success_count": 0, "failure_count": 0, "record_count": 0}
+    for record in _iter_result_records(result_paths):
+        batch.append(record)
+        stats["record_count"] += 1
+        if record.get("status") == "success":
+            stats["success_count"] += 1
+        else:
+            stats["failure_count"] += 1
+        if len(batch) >= REGISTRY_UPSERT_BATCH_SIZE:
+            _upsert_registry_batch_with_retries(warehouse_id, batch)
+            batch.clear()
+    if batch:
+        _upsert_registry_batch_with_retries(warehouse_id, batch)
+    return stats
+
+
+def cleanup_run_artifacts(run_dir: str) -> None:
+    run_path = Path(run_dir).resolve()
+    if run_path == Path("/") or run_path.name == "":
+        raise ValueError("refusing to clean an unsafe run directory")
+    for name in ("candidates", "results", "tmp", "blockcache"):
+        shutil.rmtree(run_path / name, ignore_errors=True)
+
+
+def _upsert_registry_batch_with_retries(
+    warehouse_id: str,
+    batch: list[dict[str, Any]],
+    *,
+    attempts: int = 3,
+) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            _upsert_registry_rows(warehouse_id, batch)
+            return
+        except Exception:
+            if attempt == attempts:
+                raise
+            delay = 2 ** (attempt - 1)
+            logger.warning("registry update failed; retrying in %ss", delay, exc_info=True)
+            time.sleep(delay)
 
 
 def _successful_registry_for_inventory(
@@ -427,17 +678,13 @@ def _successful_registry_for_inventory(
     registry_rows: list[RegistryRow],
 ) -> list[RegistryRow]:
     inventory_by_image_id = {row.image_id: row for row in inventory_rows}
-    successful_rows: list[RegistryRow] = []
-    for row in registry_rows:
-        inventory_row = inventory_by_image_id.get(row.image_id)
-        if inventory_row is None:
-            continue
-        if row.status != "success":
-            continue
-        if row.source_path != inventory_row.path:
-            continue
-        successful_rows.append(row)
-    return successful_rows
+    return [
+        row
+        for row in registry_rows
+        if row.status == "success"
+        and row.image_id in inventory_by_image_id
+        and row.source_path == inventory_by_image_id[row.image_id].path
+    ]
 
 
 def _build_manifest_from_registry(
@@ -446,15 +693,16 @@ def _build_manifest_from_registry(
     master_size: int,
     manifest_version: str,
 ) -> dict[str, Any]:
-    slides: dict[str, Any] = {}
-    for row in registry_rows:
-        slides[row.image_id] = {
+    slides = {
+        row.image_id: {
             "uri": row.artifact_uri,
             "width": row.width,
             "height": row.height,
             "content_type": row.content_type or "image/jpeg",
             "source_uri": row.source_path,
         }
+        for row in registry_rows
+    }
     return {
         "version": 1,
         "manifest_version": manifest_version,
@@ -475,142 +723,6 @@ def _publish_manifest(manifest_uri: str, manifest: dict[str, Any], manifest_vers
     _read_json(staged_uri)
     _copy_uri(staged_uri, manifest_uri)
     return staged_uri
-
-
-def _batched(values: list[dict[str, Any]], batch_size: int) -> list[list[dict[str, Any]]]:
-    return [values[index : index + batch_size] for index in range(0, len(values), batch_size)]
-
-
-def _registry_select_row_sql(row: dict[str, Any]) -> str:
-    rendered_at = str(row["rendered_at"])
-    return f"""
-SELECT
-    {_sql_string(str(row["image_id"]))} AS image_id,
-    {_sql_string(str(row["source_path"]))} AS source_path,
-    {_sql_string(str(row["artifact_uri"]))} AS artifact_uri,
-    {_sql_nullable_int(row.get("width"))} AS width,
-    {_sql_nullable_int(row.get("height"))} AS height,
-    {_sql_string(str(row.get("content_type") or "image/jpeg"))} AS content_type,
-    {_sql_string(str(row["status"]))} AS status,
-    CAST({_sql_string(rendered_at)} AS TIMESTAMP) AS rendered_at,
-    {_sql_nullable_string(row.get("error_message"))} AS error_message,
-    {_sql_string(str(row["manifest_version"]))} AS manifest_version
-"""
-
-
-def _upsert_registry_rows(warehouse_id: str, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    for batch in _batched(rows, REGISTRY_UPSERT_BATCH_SIZE):
-        source_sql = "\nUNION ALL\n".join(_registry_select_row_sql(row) for row in batch)
-        merge_sql = f"""
-MERGE INTO {THUMBNAIL_REGISTRY_TABLE} AS target
-USING (
-{source_sql}
-) AS source
-ON target.image_id = source.image_id
-WHEN MATCHED THEN UPDATE SET
-    target.source_path = source.source_path,
-    target.artifact_uri = source.artifact_uri,
-    target.width = source.width,
-    target.height = source.height,
-    target.content_type = source.content_type,
-    target.status = source.status,
-    target.rendered_at = source.rendered_at,
-    target.error_message = source.error_message,
-    target.manifest_version = source.manifest_version
-WHEN NOT MATCHED THEN INSERT (
-    image_id,
-    source_path,
-    artifact_uri,
-    width,
-    height,
-    content_type,
-    status,
-    rendered_at,
-    error_message,
-    manifest_version
-) VALUES (
-    source.image_id,
-    source.source_path,
-    source.artifact_uri,
-    source.width,
-    source.height,
-    source.content_type,
-    source.status,
-    source.rendered_at,
-    source.error_message,
-    source.manifest_version
-)
-"""
-        run_statement(merge_sql, warehouse_id)
-
-
-def process_candidate_rows(
-    *,
-    warehouse_id: str,
-    root_uri: str,
-    master_size: int,
-    rows: list[InventoryRow],
-    manifest_version: str,
-) -> list[dict[str, Any]]:
-    failures: list[dict[str, Any]] = []
-    registry_updates: list[dict[str, Any]] = []
-
-    for index, row in enumerate(rows, start=1):
-        logger.info("processing %s (%d/%d)", row.image_id, index, len(rows))
-        artifact_uri = _join_uri(root_uri, f"{row.image_id}.jpg")
-        try:
-            artifact = _render_candidate_artifact_subprocess(
-                image_id=row.image_id,
-                slide_uri=row.path,
-                artifact_uri=artifact_uri,
-                master_size=master_size,
-            )
-            registry_updates.append(
-                {
-                    "image_id": artifact["image_id"],
-                    "source_path": artifact["source_path"],
-                    "artifact_uri": artifact["artifact_uri"],
-                    "width": int(artifact["width"]),
-                    "height": int(artifact["height"]),
-                    "content_type": artifact["content_type"],
-                    "status": "success",
-                    "rendered_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
-                    "error_message": None,
-                    "manifest_version": manifest_version,
-                }
-            )
-        except Exception as exc:
-            logger.exception("failed thumbnail generation for %s", row.image_id)
-            failures.append(
-                {
-                    "image_id": row.image_id,
-                    "path": row.path,
-                    "error": str(exc),
-                }
-            )
-            registry_updates.append(
-                {
-                    "image_id": row.image_id,
-                    "source_path": row.path,
-                    "artifact_uri": artifact_uri,
-                    "width": None,
-                    "height": None,
-                    "content_type": "image/jpeg",
-                    "status": "failed",
-                    "rendered_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
-                    "error_message": str(exc),
-                    "manifest_version": manifest_version,
-                }
-            )
-        if len(registry_updates) >= REGISTRY_UPSERT_BATCH_SIZE:
-            _upsert_registry_rows(warehouse_id, registry_updates)
-            registry_updates.clear()
-
-    if registry_updates:
-        _upsert_registry_rows(warehouse_id, registry_updates)
-    return failures
 
 
 def publish_manifest_for_current_inventory(
@@ -647,18 +759,23 @@ def run_incremental_pipeline(
     candidates = discover_candidate_rows(
         warehouse_id=warehouse_id,
         retry_failures_only=retry_failures_only,
+        limit=limit,
     )
-    if limit is not None:
-        candidates = candidates[:limit]
-
     manifest_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-    failures = process_candidate_rows(
-        warehouse_id=warehouse_id,
-        root_uri=root_uri,
-        master_size=master_size,
-        rows=candidates,
-        manifest_version=manifest_version,
-    )
+    with tempfile.TemporaryDirectory(
+        prefix="thumbnail-results-",
+        dir=_thumbnail_temp_dir(),
+    ) as result_dir:
+        result_path = str(Path(result_dir) / "results.jsonl")
+        failures = process_candidate_rows(
+            warehouse_id=warehouse_id,
+            root_uri=root_uri,
+            master_size=master_size,
+            rows=candidates,
+            manifest_version=manifest_version,
+            result_path=result_path,
+        )
+        publish_registry_results(warehouse_id, [result_path])
     manifest = publish_manifest_for_current_inventory(
         warehouse_id=warehouse_id,
         manifest_uri=manifest_uri,
@@ -691,48 +808,14 @@ def main() -> int:
     parser.add_argument("--render-single-artifact-uri", default="")
     parser.add_argument("--render-single-master-size", type=int, default=0)
     parser.add_argument("--render-single-output-path", default="")
-    parser.add_argument(
-        "--manifest-uri",
-        default=settings.thumbnail_manifest_uri,
-        help="Where to publish the JSON manifest.",
-    )
-    parser.add_argument(
-        "--root-uri",
-        default="",
-        help="Object-store prefix for generated JPEG masters.",
-    )
-    parser.add_argument(
-        "--warehouse-id",
-        default=settings.databricks_warehouse_id,
-        help="Databricks SQL warehouse id.",
-    )
-    parser.add_argument(
-        "--master-size",
-        type=int,
-        default=settings.thumbnail_master_size,
-        help="Max edge length for generated JPEG masters.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Only process the first N candidate slides.",
-    )
-    parser.add_argument(
-        "--failures-path",
-        default="",
-        help="Optional local JSON file for generation failures.",
-    )
-    parser.add_argument(
-        "--retry-failures-only",
-        action="store_true",
-        help="Only retry registry rows whose last known status is not success.",
-    )
-    parser.add_argument(
-        "--summary-path",
-        default="",
-        help="Optional local JSON file for run summary metrics.",
-    )
+    parser.add_argument("--manifest-uri", default=settings.thumbnail_manifest_uri)
+    parser.add_argument("--root-uri", default="")
+    parser.add_argument("--warehouse-id", default=settings.databricks_warehouse_id)
+    parser.add_argument("--master-size", type=int, default=settings.thumbnail_master_size)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--failures-path", default="")
+    parser.add_argument("--retry-failures-only", action="store_true")
+    parser.add_argument("--summary-path", default="")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -761,19 +844,13 @@ def main() -> int:
         limit=args.limit,
         retry_failures_only=args.retry_failures_only,
     )
-    summary = _summary_payload(
-        manifest=manifest,
-        failures=failures,
-        candidates=candidates,
-    )
-
+    summary = _summary_payload(manifest=manifest, failures=failures, candidates=candidates)
     if args.failures_path:
         with open(args.failures_path, "w", encoding="utf-8") as handle:
             json.dump(failures, handle, indent=2, sort_keys=True)
     if args.summary_path:
         with open(args.summary_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
-
     logger.info(
         "published manifest=%s slides=%d candidates=%d failures=%d",
         args.manifest_uri,
@@ -781,8 +858,6 @@ def main() -> int:
         len(candidates),
         len(failures),
     )
-    if failures:
-        logger.warning("completed with failures=%d; failed rows remain in registry for explicit retry mode", len(failures))
     return 0
 
 

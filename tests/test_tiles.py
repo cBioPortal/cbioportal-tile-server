@@ -173,13 +173,23 @@ class TestGetTileBytes:
 
 
 class TestThumbnailBytes:
-    def test_thumbnail_selects_coarsest_safe_level(self, monkeypatch):
+    def test_thumbnail_selects_best_safe_level_for_requested_size(self, monkeypatch):
         slide = make_mock_slide(4096, 4096, levels=5)
         monkeypatch.setattr("app.tiles.settings.thumbnail_max_decode_pixels", 1_000_000)
 
-        _, plan = get_thumbnail_bytes_with_plan(slide, 256, 256)
+        _, plan = get_thumbnail_bytes_with_plan(slide, 1024, 1024)
 
         assert plan.requested_pixels <= 1_000_000
+        assert plan.level == 3
+
+    def test_thumbnail_uses_aspect_ratio_when_selecting_level(self, monkeypatch):
+        slide = make_mock_slide(4096, 1024, levels=5)
+        monkeypatch.setattr("app.tiles.settings.thumbnail_max_decode_pixels", 4_194_304)
+
+        _, plan = get_thumbnail_bytes_with_plan(slide, 1024, 1024)
+
+        assert plan.level == 2
+        assert (plan.target_width, plan.target_height) == (1024, 256)
 
     def test_thumbnail_raises_when_no_safe_overview_exists(self, monkeypatch):
         slide = make_mock_slide(4096, 4096, levels=1)
