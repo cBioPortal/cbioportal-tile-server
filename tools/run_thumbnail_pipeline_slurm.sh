@@ -200,7 +200,7 @@ submit_array() {
       --wrap="exec bash '$SCRIPT_PATH' worker"
   })"
   local publish_job
-  publish_job="$({
+  if ! publish_job="$({
     sbatch --parsable \
       --job-name=slide-thumbnails-publish \
       --partition=hpc \
@@ -212,7 +212,11 @@ submit_array() {
       --output="${log_dir}/slide-thumbnails-publish-%j.out" \
       --error="${log_dir}/slide-thumbnails-publish-%j.err" \
       --wrap="exec bash '$SCRIPT_PATH' publish"
-  })"
+  })"; then
+    echo "publisher submission failed; canceling worker array ${worker_job}" >&2
+    scancel "$worker_job" || true
+    return 1
+  fi
   echo "worker_job=${worker_job}"
   echo "publish_job=${publish_job}"
   echo "run_dir=${run_dir}"
