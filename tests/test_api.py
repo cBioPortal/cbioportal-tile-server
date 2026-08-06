@@ -19,6 +19,7 @@ import app.meta as meta_module
 from app.config import settings
 from app.rate_limit import RequestRateLimiter
 from app.resource_index import ResourceIndex
+from app.thumbnail_store import ThumbnailRecord
 from app.tiles import TILE_SIZE
 from tests.test_auth import make_token
 from tests.conftest import make_mock_slide
@@ -118,7 +119,9 @@ def api_client():
         patch.object(cache_module, "get_tile",      _noop_get),
         patch.object(cache_module, "set_tile",      _noop_set),
         patch.object(cache_module, "get_thumbnail", _noop_get),
+        patch.object(cache_module, "get_thumbnail_status", _noop_get),
         patch.object(cache_module, "set_thumbnail", _noop_set),
+        patch.object(cache_module, "set_thumbnail_status", _noop_set),
         patch.object(cache_module, "get_metadata",  _noop_get),
         patch.object(cache_module, "set_metadata",  _noop_set),
         patch.object(cache_module, "get_raw",       _noop_get),
@@ -562,30 +565,122 @@ class TestTileRoute:
 
 
 # ---------------------------------------------------------------------------
-# /tiles/{slide_id}/thumbnail
+# /thumbnails/{slide_id}
 # ---------------------------------------------------------------------------
 
 class TestThumbnailRoute:
     def test_returns_jpeg(self, api_client):
-        resp = api_client.get("/tiles/1492807/thumbnail?width=256&height=256")
+        record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=record),
+            patch.object(
+                main_module,
+                "render_thumbnail_response",
+                return_value=(b"\xff\xd8thumb", {"status": "ok", "reason": "resized"}),
+            ),
+        ):
+            resp = api_client.get("/thumbnails/1492807?width=256&height=256")
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "image/jpeg"
         assert resp.content[:2] == b"\xff\xd8"
+        assert resp.headers["x-thumbnail-status"] == "ok"
 
     def test_width_clamped_to_max(self, api_client):
-        # 9999 > 2048 max; should still return 200 (clamped internally)
-        resp = api_client.get("/tiles/1492807/thumbnail?width=9999&height=256")
+        record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=record),
+            patch.object(
+                main_module,
+                "render_thumbnail_response",
+                return_value=(b"\xff\xd8thumb", {"status": "ok", "reason": "master"}),
+            ) as render,
+        ):
+            resp = api_client.get("/thumbnails/1492807?width=9999&height=256")
         assert resp.status_code == 200
+        render.assert_called_once_with(record, 2048, 256)
 
     def test_cache_control_present(self, api_client):
-        resp = api_client.get("/tiles/1492807/thumbnail")
+        resp = api_client.get("/thumbnails/1492807")
         assert "max-age" in resp.headers.get("cache-control", "")
 
-    def test_oversized_thumbnail_returns_422(self, api_client):
-        main_module._slides.get.return_value = make_mock_slide(4096, 4096, levels=1)
+    def test_placeholder_cache_control_is_short_lived(self, api_client):
+        resp = api_client.get("/thumbnails/1492807")
+        assert resp.headers["x-thumbnail-status"] == "placeholder"
+        assert resp.headers["cache-control"] == "private, max-age=60"
+
+    def test_thumbnail_status_headers_are_exposed_to_allowed_origins(self, api_client):
+        resp = api_client.get(
+            "/thumbnails/1492807",
+            headers={"Origin": "https://cbioportal.mskcc.org"},
+        )
+        assert "X-Thumbnail-Status" in resp.headers["access-control-expose-headers"]
+        assert "X-Thumbnail-Reason" in resp.headers["access-control-expose-headers"]
+
+    def test_missing_artifact_generates_on_demand(self, api_client):
+        record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=None),
+            patch.object(main_module, "get_persisted_generated_thumbnail_record", return_value=None),
+            patch.object(main_module, "_generate_thumbnail_record_on_demand", new=AsyncMock(return_value=record)),
+            patch.object(
+                main_module,
+                "render_thumbnail_response",
+                return_value=(b"\xff\xd8thumb", {"status": "ok", "reason": "master"}),
+            ),
+        ):
+            resp = api_client.get("/thumbnails/1492807?width=256&height=256")
+        assert resp.status_code == 200
+        assert resp.headers["x-thumbnail-status"] == "ok"
+
+    def test_stale_manifest_artifact_generates_replacement(self, api_client):
+        manifest_record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/old/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        generated_record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/masters/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=manifest_record),
+            patch.object(main_module, "render_thumbnail_response", side_effect=[
+                FileNotFoundError("old artifact"),
+                (b"\xff\xd8thumb", {"status": "ok", "reason": "master"}),
+            ]),
+            patch.object(
+                main_module,
+                "_generate_thumbnail_record_on_demand",
+                new=AsyncMock(return_value=generated_record),
+            ) as generate,
+        ):
+            resp = api_client.get("/thumbnails/1492807?width=256&height=256")
+
+        assert resp.status_code == 200
+        generate.assert_awaited_once_with("1492807", None)
+        assert resp.headers["x-thumbnail-status"] == "ok"
+
+    def test_legacy_thumbnail_route_removed(self, api_client):
         resp = api_client.get("/tiles/1492807/thumbnail?width=256&height=256")
-        assert resp.status_code == 422
-        assert resp.json()["detail"]["error"] == "overview_requires_preprocessing"
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

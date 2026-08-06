@@ -52,6 +52,40 @@ class TestImageOperationGate:
         assert peak == 2
 
 
+class TestThumbnailWorker:
+    @pytest.mark.asyncio
+    async def test_timeout_terminates_child_process(self, monkeypatch):
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.killed = False
+
+            async def communicate(self):
+                if self.killed:
+                    self.returncode = -9
+                    return b"", b""
+                await asyncio.sleep(60)
+
+            def kill(self):
+                self.killed = True
+
+        process = FakeProcess()
+
+        async def fake_create_process(*args, **kwargs):
+            return process
+
+        monkeypatch.setattr(main_module.asyncio, "create_subprocess_exec", fake_create_process)
+        monkeypatch.setattr(main_module.settings, "thumbnail_timeout_sec", 0.01)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await main_module._run_thumbnail_worker(
+                "1492807",
+                "s3://bucket/1492807.svs",
+            )
+
+        assert process.killed is True
+
+
 class TestPathCache:
     def test_path_cache_evicts_least_recently_used_entry(self, monkeypatch):
         main_module._path_cache.clear()

@@ -13,7 +13,7 @@ import io
 import math
 from dataclasses import dataclass
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from tiffslide import TiffSlide
 
 from .config import settings
@@ -54,6 +54,29 @@ class OverviewTooLarge(RuntimeError):
         )
 
 
+class NoSafeThumbnailOverview(RuntimeError):
+    """Raised when no thumbnail overview level fits the configured budget."""
+
+    def __init__(
+        self,
+        *,
+        level: int,
+        level_width: int,
+        level_height: int,
+        requested_pixels: int,
+    ) -> None:
+        self.level = level
+        self.level_width = level_width
+        self.level_height = level_height
+        self.requested_pixels = requested_pixels
+        self.max_decode_pixels = settings.thumbnail_max_decode_pixels
+        super().__init__(
+            "thumbnail overview requires preprocessing "
+            f"(level={level} read={level_width}x{level_height} "
+            f"pixels={requested_pixels} limit={self.max_decode_pixels})"
+        )
+
+
 @dataclass(frozen=True)
 class DecodePlan:
     z: int
@@ -68,6 +91,16 @@ class DecodePlan:
     read_width: int
     read_height: int
     requested_pixels: int
+
+
+@dataclass(frozen=True)
+class ThumbnailDecodePlan:
+    level: int
+    read_width: int
+    read_height: int
+    requested_pixels: int
+    target_width: int
+    target_height: int
 
 
 def max_zoom(slide: TiffSlide) -> int:
@@ -243,6 +276,80 @@ def get_thumbnail_bytes(slide: TiffSlide, width: int, height: int) -> bytes:
     image, _ = render_overview_image(slide)
     image = image.copy()
     image.thumbnail((width, height), Image.Resampling.LANCZOS)
+    return _encode_jpeg(image)
+
+
+def _plan_thumbnail_decode(
+    slide: TiffSlide, width: int, height: int
+) -> ThumbnailDecodePlan:
+    slide_width, slide_height = slide.dimensions
+    scale = min(width / slide_width, height / slide_height, 1.0)
+    target_width = max(1, min(slide_width, round(slide_width * scale)))
+    target_height = max(1, min(slide_height, round(slide_height * scale)))
+    safe_levels: list[tuple[int, int, int, int]] = []
+    for level in range(slide.level_count):
+        level_width, level_height = slide.level_dimensions[level]
+        requested_pixels = level_width * level_height
+        if requested_pixels <= settings.thumbnail_max_decode_pixels:
+            safe_levels.append((level, level_width, level_height, requested_pixels))
+
+    if not safe_levels:
+        fallback_level = slide.level_count - 1
+        fallback_width, fallback_height = slide.level_dimensions[fallback_level]
+        raise NoSafeThumbnailOverview(
+            level=fallback_level,
+            level_width=fallback_width,
+            level_height=fallback_height,
+            requested_pixels=fallback_width * fallback_height,
+        )
+
+    for level, level_width, level_height, requested_pixels in reversed(safe_levels):
+        if level_width >= target_width and level_height >= target_height:
+            return ThumbnailDecodePlan(
+                level=level,
+                read_width=level_width,
+                read_height=level_height,
+                requested_pixels=requested_pixels,
+                target_width=target_width,
+                target_height=target_height,
+            )
+
+    level, level_width, level_height, requested_pixels = safe_levels[0]
+    return ThumbnailDecodePlan(
+        level=level,
+        read_width=level_width,
+        read_height=level_height,
+        requested_pixels=requested_pixels,
+        target_width=target_width,
+        target_height=target_height,
+    )
+
+
+def render_thumbnail_image(
+    slide: TiffSlide, width: int, height: int
+) -> tuple[Image.Image, ThumbnailDecodePlan]:
+    plan = _plan_thumbnail_decode(slide, width, height)
+    DECODE_SOURCE_PIXELS.observe(plan.requested_pixels)
+    region = slide.read_region((0, 0), plan.level, (plan.read_width, plan.read_height))
+    region = region.convert("RGB")
+    region.thumbnail((width, height), Image.Resampling.LANCZOS)
+    return region, plan
+
+
+def get_thumbnail_bytes_with_plan(
+    slide: TiffSlide, width: int, height: int
+) -> tuple[bytes, ThumbnailDecodePlan]:
+    image, plan = render_thumbnail_image(slide, width, height)
+    return _encode_jpeg(image), plan
+
+
+def get_placeholder_thumbnail_bytes(width: int, height: int) -> bytes:
+    image = Image.new("RGB", (width, height), (236, 236, 236))
+    draw = ImageDraw.Draw(image)
+    border = max(1, min(width, height) // 32)
+    draw.rectangle((0, 0, width - 1, height - 1), outline=(190, 190, 190), width=border)
+    draw.line((0, 0, width - 1, height - 1), fill=(210, 210, 210), width=border)
+    draw.line((0, height - 1, width - 1, 0), fill=(210, 210, 210), width=border)
     return _encode_jpeg(image)
 
 

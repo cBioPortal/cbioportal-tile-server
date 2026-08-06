@@ -25,3 +25,6 @@ SUMMARY_TABLE = "cdsi_prod.pathology_data_mining.sample_wsi_summary"
 
 #: Canonical patient/sample/slide association table (written nightly by the Asset Bundle job)
 CANONICAL_ASSOCIATION_TABLE = "cdsi_prod.pathology_data_mining.canonical_slide_associations"
+
+# Incremental thumbnail publication registry used by the on-prem renderer.
+THUMBNAIL_REGISTRY_TABLE = "cdsi_prod.pathology_data_mining.slide_thumbnail_registry"

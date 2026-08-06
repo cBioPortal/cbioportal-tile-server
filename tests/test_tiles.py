@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from app.tiles import (
+    NoSafeThumbnailOverview,
     OverviewTooLarge,
     TILE_SIZE,
     _resize_and_pad,
@@ -14,6 +15,7 @@ from app.tiles import (
     _tile_geometry,
     get_tile_bytes,
     get_thumbnail_bytes,
+    get_thumbnail_bytes_with_plan,
     max_zoom,
     slide_metadata,
 )
@@ -171,6 +173,31 @@ class TestGetTileBytes:
 
 
 class TestThumbnailBytes:
+    def test_thumbnail_selects_best_safe_level_for_requested_size(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=5)
+        monkeypatch.setattr("app.tiles.settings.thumbnail_max_decode_pixels", 1_000_000)
+
+        _, plan = get_thumbnail_bytes_with_plan(slide, 1024, 1024)
+
+        assert plan.requested_pixels <= 1_000_000
+        assert plan.level == 3
+
+    def test_thumbnail_uses_aspect_ratio_when_selecting_level(self, monkeypatch):
+        slide = make_mock_slide(4096, 1024, levels=5)
+        monkeypatch.setattr("app.tiles.settings.thumbnail_max_decode_pixels", 4_194_304)
+
+        _, plan = get_thumbnail_bytes_with_plan(slide, 1024, 1024)
+
+        assert plan.level == 2
+        assert (plan.target_width, plan.target_height) == (1024, 256)
+
+    def test_thumbnail_raises_when_no_safe_overview_exists(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=1)
+        monkeypatch.setattr("app.tiles.settings.thumbnail_max_decode_pixels", 4_194_304)
+
+        with pytest.raises(NoSafeThumbnailOverview):
+            get_thumbnail_bytes_with_plan(slide, 256, 256)
+
     def test_thumbnail_preserves_slide_aspect_ratio(self):
         slide = make_mock_slide(4096, 1024, levels=5)
         result = get_thumbnail_bytes(slide, 256, 256)

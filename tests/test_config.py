@@ -67,6 +67,42 @@ class TestOtherSettings:
         s = make_settings()
         assert s.max_decode_pixels == 4_194_304
 
+    def test_thumbnail_max_decode_pixels_default(self):
+        s = make_settings()
+        assert s.thumbnail_max_decode_pixels == 16_000_000
+
+    def test_thumbnail_timeout_default(self):
+        s = make_settings()
+        assert s.thumbnail_timeout_sec == 8
+
+    def test_thumbnail_placeholder_cache_ttl_default(self):
+        s = make_settings()
+        assert s.thumbnail_placeholder_cache_ttl == 60
+
+    def test_thumbnail_manifest_uri_default(self):
+        s = make_settings()
+        assert s.thumbnail_manifest_uri == ""
+
+    def test_thumbnail_master_size_default(self):
+        s = make_settings()
+        assert s.thumbnail_master_size == 1024
+
+    def test_thumbnail_manifest_refresh_sec_default(self):
+        s = make_settings()
+        assert s.thumbnail_manifest_refresh_sec == 300
+
+    def test_thumbnail_generated_record_cache_capacity_default(self):
+        s = make_settings()
+        assert s.thumbnail_generated_record_cache_capacity == 4_096
+
+    def test_thumbnail_batch_timeout_default(self):
+        s = make_settings()
+        assert s.thumbnail_batch_timeout_sec == 600
+
+    def test_thumbnail_placeholder_cache_ttl_reads_environment(self):
+        s = make_settings(THUMBNAIL_PLACEHOLDER_CACHE_TTL="15")
+        assert s.thumbnail_placeholder_cache_ttl == 15
+
     def test_thumbnail_cache_ttl_default(self):
         s = make_settings()
         assert s.thumbnail_cache_ttl == 86_400

@@ -42,7 +42,7 @@ platform, but you must still provide equivalent published inputs and either:
 | GET | `/slides/{image_id}/dbmeta` | Raw metadata row for a slide; currently backed by Databricks |
 | GET | `/search?q=` | Autocomplete suggestions |
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
-| GET | `/tiles/{slide_id}/thumbnail` | JPEG thumbnail |
+| GET | `/thumbnails/{slide_id}` | JPEG thumbnail from a pre-rendered artifact |
 | GET | `/tiles/{slide_id}/zxy/{z}/{x}/{y}` | ZXY tile (JPEG) |
 | GET | `/tiles/{slide_id}/warmup` | Prime overview reads for a slide |
 
@@ -107,6 +107,14 @@ All settings are environment variables (see `app/config.py`):
 | `TILE_SIZE` | `256` | Tile edge length in pixels |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `4194304` | Maximum source pixels a single on-demand decode may read before the request is rejected |
+| `THUMBNAIL_MAX_DECODE_PIXELS` | `16000000` | Maximum source pixels for a bounded thumbnail overview decode |
+| `THUMBNAIL_TIMEOUT_SEC` | `8` | Deadline for process-isolated on-demand thumbnail generation |
+| `THUMBNAIL_PLACEHOLDER_CACHE_TTL` | `60` | Redis/browser cache lifetime for placeholder thumbnails in seconds |
+| `THUMBNAIL_MANIFEST_URI` | — | JSON manifest listing available pre-rendered thumbnails |
+| `THUMBNAIL_MASTER_SIZE` | `1024` | Maximum edge length of generated thumbnail masters |
+| `THUMBNAIL_MANIFEST_REFRESH_SEC` | `300` | In-process manifest refresh interval in seconds |
+| `THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY` | `4096` | Maximum transient on-demand thumbnail records retained per worker |
+| `THUMBNAIL_BATCH_TIMEOUT_SEC` | `600` | Maximum time for one isolated offline slide render |
 | `REDIS_URL` | `redis://redis:6379` | Redis connection; use a password-protected URL in production |
 | `TILE_CACHE_TTL` | `86400` | Tile cache TTL in seconds; `0` means no expiry |
 | `THUMBNAIL_CACHE_TTL` | `86400` | Thumbnail cache TTL in seconds |
@@ -126,10 +134,18 @@ Tile and thumbnail responses are private-cacheable (`max-age=3600` and
 are `private, no-store` because they may contain PHI. Redis is an optimization
 only; requests must continue to work if the cache is unavailable.
 
-If a slide lacks a sufficiently downsampled overview pyramid, thumbnail and
-overview-tile requests now return HTTP `422` with
-`{"error":"overview_requires_preprocessing"}` instead of attempting a
-memory-unsafe full-slide decode.
+Thumbnail requests normally resolve a pre-rendered JPEG master from
+`THUMBNAIL_MANIFEST_URI` and downsize it when the request is smaller than the
+stored master. On a cache miss, the server starts one short-lived,
+concurrency-capped worker process to generate and persist the master. The
+worker may use the heavier fallback needed for slides without a safe overview;
+that fallback never runs inside the API process. Timeouts and failures return a
+placeholder JPEG with `X-Thumbnail-Status` and `X-Thumbnail-Reason` headers.
+
+If a slide lacks a sufficiently downsampled overview pyramid, overview-tile
+requests still return HTTP `422` with
+`{"error":"overview_requires_preprocessing"}`. Thumbnail misses are handled
+by the isolated worker described above.
 
 ## Dependency matrix
 

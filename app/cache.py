@@ -40,6 +40,10 @@ def _meta_key(slide_id: str) -> str:
     return f"meta:{slide_id}"
 
 
+def _thumbnail_status_key(slide_id: str, width: int, height: int) -> str:
+    return f"thumbnail-status:{slide_id}:{width}:{height}"
+
+
 def tile_cache_key(slide_id: str, z: int, x: int, y: int) -> str:
     return _tile_key(slide_id, z, x, y)
 
@@ -176,8 +180,37 @@ async def get_thumbnail(slide_id: str, width: int, height: int) -> bytes | None:
     return value
 
 
-async def set_thumbnail(slide_id: str, width: int, height: int, data: bytes) -> None:
-    await _redis_set(_thumb_key(slide_id, width, height), data, ttl=settings.thumbnail_cache_ttl)
+async def set_thumbnail(
+    slide_id: str,
+    width: int,
+    height: int,
+    data: bytes,
+    ttl: int | None = None,
+) -> None:
+    await _redis_set(
+        _thumb_key(slide_id, width, height),
+        data,
+        ttl=settings.thumbnail_cache_ttl if ttl is None else ttl,
+    )
+
+
+async def get_thumbnail_status(slide_id: str, width: int, height: int) -> dict | None:
+    value = await _redis_get_json(_thumbnail_status_key(slide_id, width, height))
+    return value if isinstance(value, dict) else None
+
+
+async def set_thumbnail_status(
+    slide_id: str,
+    width: int,
+    height: int,
+    status: dict,
+    ttl: int | None = None,
+) -> None:
+    await _redis_set_json(
+        _thumbnail_status_key(slide_id, width, height),
+        status,
+        ttl=settings.thumbnail_cache_ttl if ttl is None else ttl,
+    )
 
 
 # ---------------------------------------------------------------------------
