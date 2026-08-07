@@ -161,6 +161,19 @@ class TestHealth:
         assert isinstance(data["n_workers"], int)
         assert data["n_workers"] > 0
 
+    def test_thumbnail_generation_is_degraded_without_manifest(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "thumbnail_manifest_uri", "")
+        data = api_client.get("/health").json()
+        assert data["thumbnail_generation"] == {
+            "status": "degraded",
+            "reason": "thumbnail_manifest_uri_missing",
+        }
+
+    def test_thumbnail_generation_is_ready_with_manifest(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "thumbnail_manifest_uri", "s3://bucket/manifest.json")
+        data = api_client.get("/health").json()
+        assert data["thumbnail_generation"] == {"status": "ready"}
+
     def test_wsi_namespace_health(self, api_client):
         resp = api_client.get("/wsi/health")
         assert resp.status_code == 200
