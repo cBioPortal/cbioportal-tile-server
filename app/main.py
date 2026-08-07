@@ -139,6 +139,10 @@ async def lifespan(app: FastAPI):
             "AWS_ENDPOINT_URL is not set — S3 requests will go to public AWS "
             "(set this to your Dell ECS endpoint in production)"
         )
+    if not settings.thumbnail_manifest_uri.strip():
+        logger.warning(
+            "THUMBNAIL_MANIFEST_URI is not set; missing thumbnail artifacts cannot be generated on demand"
+        )
     logger.info(
         "Tile server ready. max_open_slides=%d endpoint=%s",
         settings.max_open_slides,
@@ -171,7 +175,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_methods=["GET"],
     allow_headers=["*"],
-    expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason"],
+    expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason", "Retry-After"],
 )
 
 
@@ -706,7 +710,19 @@ def _build_patient_hierarchy(rows: list[dict]) -> dict:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "n_workers": settings.n_workers}
+    thumbnail_generation = (
+        {"status": "ready"}
+        if settings.thumbnail_manifest_uri.strip()
+        else {
+            "status": "degraded",
+            "reason": "thumbnail_manifest_uri_missing",
+        }
+    )
+    return {
+        "status": "ok",
+        "n_workers": settings.n_workers,
+        "thumbnail_generation": thumbnail_generation,
+    }
 
 
 @app.get("/metrics", include_in_schema=False)
