@@ -104,7 +104,7 @@ All settings are environment variables (see `app/config.py`):
 | `DATABRICKS_WAREHOUSE_ID` | `0b49b7d78734ad5c` | Databricks SQL warehouse for metadata/search queries |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with the cBioPortal capability issuer |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability-token audience |
-| `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for non-health routes |
+| `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for protected routes; `/health` and `/ready` remain public |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum WSI token lifetime in seconds |
 | `WSI_RESOURCE_INDEX_FILE` | — | Loader-published version-2 study/resource binding; required when auth is enabled |
 | `TILE_SIZE` | `256` | Tile edge length in pixels |

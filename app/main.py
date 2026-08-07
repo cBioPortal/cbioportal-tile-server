@@ -33,7 +33,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import cache as tile_cache
 from . import meta
-from .auth import InvalidWsiToken, validate_wsi_token
+from .auth import (
+    InvalidWsiToken,
+    validate_wsi_auth_configuration,
+    validate_wsi_token,
+)
 from .blockcache import get_blockcache_manager
 from .config import settings
 from .metrics import (
@@ -200,7 +204,7 @@ async def limit_expensive_requests(request: Request, call_next):
 
 @app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
-    """Require a cBioPortal-issued capability for every non-health API request."""
+    """Require a cBioPortal-issued capability for every protected API request."""
     if request.scope["path"] in ("/health", "/ready"):
         return await call_next(request)
     if not settings.wsi_auth_required:
@@ -492,10 +496,19 @@ def _readiness_status() -> tuple[int, dict]:
     if not settings.wsi_auth_required:
         return 200, payload
     try:
+        validate_wsi_auth_configuration(
+            settings.wsi_auth_secret,
+            settings.wsi_auth_audience,
+            settings.wsi_auth_max_ttl,
+        )
         payload["resource_index_revision"] = get_resource_index(
             settings.wsi_resource_index_file
         ).revision()
         return 200, payload
+    except InvalidWsiToken:
+        payload["status"] = "unavailable"
+        payload["reason"] = "WSI authentication is not configured"
+        return 503, payload
     except ResourceIndexUnavailable as exc:
         payload["status"] = "unavailable"
         payload["reason"] = f"trusted WSI resource index is unavailable: {exc}"

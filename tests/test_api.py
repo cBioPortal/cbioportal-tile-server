@@ -194,6 +194,9 @@ class TestHealth:
         self, api_client, monkeypatch
     ):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
+        monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
         monkeypatch.setattr(settings, "wsi_resource_index_file", "")
         resp = api_client.get("/ready")
         assert resp.status_code == 503
@@ -215,6 +218,30 @@ class TestHealth:
         assert resp.json()["resource_index_revision"] == expected_revision
         assert alias_resp.status_code == 200
         assert alias_resp.json()["resource_index_revision"] == expected_revision
+
+    @pytest.mark.parametrize(
+        ("setting", "value"),
+        [
+            ("wsi_auth_secret", "s" * 31),
+            ("wsi_auth_audience", "   "),
+            ("wsi_auth_max_ttl", 0),
+        ],
+    )
+    def test_ready_reports_invalid_auth_configuration(
+        self, api_client, monkeypatch, tmp_path, setting, value
+    ):
+        configure_resource_auth(monkeypatch, tmp_path)
+        monkeypatch.setattr(settings, setting, value)
+
+        resp = api_client.get("/ready")
+
+        assert resp.status_code == 503
+        assert resp.json() == {
+            "status": "unavailable",
+            "auth_required": True,
+            "n_workers": settings.n_workers,
+            "reason": "WSI authentication is not configured",
+        }
 
     def test_wsi_data_requires_capability(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)

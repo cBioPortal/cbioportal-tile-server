@@ -6,7 +6,11 @@ import time
 
 import pytest
 
-from app.auth import InvalidWsiToken, validate_wsi_token
+from app.auth import (
+    InvalidWsiToken,
+    validate_wsi_auth_configuration,
+    validate_wsi_token,
+)
 
 
 def make_token(secret: str, **claims) -> str:
@@ -55,6 +59,19 @@ def test_valid_wsi_token():
     assert validate_wsi_token(
         make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
     )["sub"] == "user@example.org"
+
+
+@pytest.mark.parametrize(
+    ("secret", "audience", "max_ttl"),
+    [
+        ("s" * 31, "cbioportal-wsi", 300),
+        ("s" * 32, "   ", 300),
+        ("s" * 32, "cbioportal-wsi", 0),
+    ],
+)
+def test_invalid_wsi_auth_configuration_is_rejected(secret, audience, max_ttl):
+    with pytest.raises(InvalidWsiToken, match="not configured"):
+        validate_wsi_auth_configuration(secret, audience, max_ttl)
 
 
 @pytest.mark.parametrize("change", [

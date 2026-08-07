@@ -45,12 +45,17 @@ Do not create or document that CNAME unless the infrastructure/DNS owner
 explicitly introduces it. The existing production route does not require a
 new CNAME.
 
-The current deployment is one replica on `workload-class: x86-general`, with
-4 GiB memory requested, 16 GiB limited, and a 20 GiB `emptyDir` block cache.
-Liveness uses `/health`; readiness uses `/ready` so auth-enabled deployments
-stay out of rotation until the trusted resource index is available. The
-NetworkPolicy in the deployment repository permits ingress only from the
-`ingress-nginx` namespace.
+The coordinated 16 GiB rollout profile is one replica on
+`workload-class: x86-general`, with 4 GiB memory requested, 16 GiB limited,
+and a 20 GiB `emptyDir` block cache. Liveness uses `/health`; readiness uses
+`/ready` so auth-enabled deployments stay out of rotation until the trusted
+resource index is available. The NetworkPolicy in the deployment repository
+permits ingress only from the `ingress-nginx` namespace.
+
+Apply this profile only after publishing an image that contains the readiness
+endpoint and mounting the loader-published trusted resource index. The
+deployment repository is authoritative for the currently applied image,
+resource limits, probes, and volumes.
 
 The deployed image is currently named `cbioportal/cbioportal-slide-viewer`
 with a CI/CD-managed tag. Keep that legacy image/release name aligned with the
@@ -58,7 +63,7 @@ deployment repository; do not silently rename it when publishing this service.
 
 ## Production configuration
 
-The current ConfigMap sets:
+The rollout ConfigMap should set:
 
 ```text
 AWS_ENDPOINT_URL=http://pmindecs.mskcc.org:9020
