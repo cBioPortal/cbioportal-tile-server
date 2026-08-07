@@ -46,9 +46,11 @@ explicitly introduces it. The existing production route does not require a
 new CNAME.
 
 The current deployment is one replica on `workload-class: x86-general`, with
-3 GiB memory requested, 4 GiB limited, and a 20 GiB `emptyDir` block cache.
-Readiness and liveness both use `/health`. The NetworkPolicy in the deployment
-repository permits ingress only from the `ingress-nginx` namespace.
+4 GiB memory requested, 16 GiB limited, and a 20 GiB `emptyDir` block cache.
+Liveness uses `/health`; readiness uses `/ready` so auth-enabled deployments
+stay out of rotation until the trusted resource index is available. The
+NetworkPolicy in the deployment repository permits ingress only from the
+`ingress-nginx` namespace.
 
 The deployed image is currently named `cbioportal/cbioportal-slide-viewer`
 with a CI/CD-managed tag. Keep that legacy image/release name aligned with the
@@ -61,12 +63,12 @@ The current ConfigMap sets:
 ```text
 AWS_ENDPOINT_URL=http://pmindecs.mskcc.org:9020
 DATABRICKS_WAREHOUSE_ID=0b49b7d78734ad5c
-KEYCLOAK_JWKS_URL=<MSK Keycloak JWKS endpoint>
-ANNOTATION_AUTH_ENABLED=true
 TILE_CACHE_TTL=86400
 THUMBNAIL_CACHE_TTL=86400
 METADATA_CACHE_TTL=86400
-MAX_DECODE_PIXELS=4194304
+MAX_DECODE_PIXELS=16777216
+THUMBNAIL_MAX_DECODE_PIXELS=16000000
+THUMBNAIL_TIMEOUT_SEC=8
 BLOCKCACHE_PATH=/cache/slide-blocks
 BLOCKCACHE_BLOCK_SIZE=8388608
 BLOCKCACHE_MAX_BYTES=19327352832
@@ -74,10 +76,9 @@ BLOCKCACHE_PRUNE_INTERVAL_SECONDS=60
 REDIS_CONNECT_TIMEOUT_SECONDS=0.25
 REDIS_COMMAND_TIMEOUT_SECONDS=0.25
 REDIS_FAILURE_BACKOFF_SECONDS=5
-PROMETHEUS_MULTIPROC_DIR=/cache/prometheus
-MAX_OPEN_SLIDES=1
-MAX_IMAGE_OPERATIONS=2
-N_WORKERS=2
+MAX_OPEN_SLIDES=8
+MAX_IMAGE_OPERATIONS=1
+N_WORKERS=4
 TILE_SIZE=256
 JPEG_QUALITY=85
 CORS_ORIGINS=https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org
@@ -89,14 +90,14 @@ Credentials are supplied by the `slide-viewer-secrets` Secret:
 server receives `WSI_AUTH_SECRET` from the `cbioportal-msk-blue` Secret.
 The blue and green cBioPortal backend deployments are configured with the
 same secret and with audience `cbioportal-wsi` and a 300-second token TTL.
-`WSI_AUTH_REQUIRED` is `true`, `WSI_AUTH_MAX_TTL` is `900`, and
+`WSI_AUTH_REQUIRED` is `true`, `WSI_AUTH_MAX_TTL` is `300`, and
 `WSI_RESOURCE_INDEX_FILE` points to the loader-published trusted resource
 index in production. The secret and audience must match exactly, and the
 backend TTL must not exceed the tile-server maximum.
 
-The production values above are the memory-bound starting point for a 4 GiB
-pod. Increase `N_WORKERS`, `MAX_OPEN_SLIDES`, or `MAX_IMAGE_OPERATIONS` only
-after measuring RSS under representative slide load.
+The production values above are the memory-bound starting point for a
+16 GiB-limited pod. Decrease the memory limit only after collecting
+production telemetry with the bounded decode and concurrency settings above.
 
 Use a password-protected Redis URL in shared environments. Redis is a cache,
 not an authorization boundary. Keep it private and do not place WSI metadata
@@ -138,8 +139,8 @@ The loader and tile server reject ambiguous patient, sample, or slide
 identifiers that are listed under more than one study, because the underlying
 metadata APIs are ID-addressed and cannot safely disambiguate such a resource.
 
-`/health` is public for Kubernetes probes. All other routes require a valid
-Bearer token when `WSI_AUTH_REQUIRED=true`.
+`/health` and `/ready` are public for Kubernetes probes. All other routes
+require a valid Bearer token when `WSI_AUTH_REQUIRED=true`.
 
 ## Local integration
 
@@ -172,22 +173,24 @@ Local health checks:
 
 ```bash
 curl -fsS http://localhost:8081/health
+curl -fsS http://localhost:8081/ready
 curl -fsS http://localhost:3001/wsi/health
+curl -fsS http://localhost:3001/wsi/ready
 ```
 
-For production, use the deployment repository's smoke test. It requires a
-short-lived capability and explicit paths:
+For production, use the deployment repository's smoke test. The scheduled
+check verifies readiness and unauthenticated rejection of a protected route:
 
 ```bash
 cd ../knowledgesystems-k8s-deployment
 export CBIOPORTAL_URL=https://cbioportal.mskcc.org
-export WSI_TILE_PATH=/wsi/tiles/<slide-id>/zxy/4/0/0
-export WSI_BEARER_TOKEN='<short-lived-token>'
 tests/smoke/slide-viewer-routing.sh
 ```
 
-The test first requires unauthenticated tile requests to return `401` or `403`,
-then verifies the tile route succeeds with the Bearer token.
+The test requires `/wsi/ready` to return `200`, then requires an
+unauthenticated protected request to return `401` or `403`. Run a separate,
+fresh-token manual check before rollout if you need to verify an authenticated
+tile or thumbnail route end to end.
 Also verify anonymous token requests return `401`, unauthorized studies
 return `403`, tokens are cached per study, study-A tokens cannot access
 study-B resources, and metadata responses are not publicly cacheable.

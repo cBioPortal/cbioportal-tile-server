@@ -178,6 +178,44 @@ class TestHealth:
         resp = api_client.get("/wsi/health")
         assert resp.status_code == 200
 
+    def test_ready_is_ok_without_auth(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", False)
+        resp = api_client.get("/ready")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert resp.json()["auth_required"] is False
+
+    def test_wsi_namespace_ready(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", False)
+        resp = api_client.get("/wsi/ready")
+        assert resp.status_code == 200
+
+    def test_ready_reports_missing_resource_index_when_auth_required(
+        self, api_client, monkeypatch
+    ):
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_resource_index_file", "")
+        resp = api_client.get("/ready")
+        assert resp.status_code == 503
+        assert resp.json()["status"] == "unavailable"
+        assert "resource index" in resp.json()["reason"]
+
+    def test_ready_is_ok_with_valid_resource_index(
+        self, api_client, monkeypatch, tmp_path
+    ):
+        configure_resource_auth(monkeypatch, tmp_path)
+        expected_revision = ResourceIndex(settings.wsi_resource_index_file).revision()
+
+        resp = api_client.get("/ready")
+        alias_resp = api_client.get("/wsi/ready")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "ok"
+        assert resp.json()["auth_required"] is True
+        assert resp.json()["resource_index_revision"] == expected_revision
+        assert alias_resp.status_code == 200
+        assert alias_resp.json()["resource_index_revision"] == expected_revision
+
     def test_wsi_data_requires_capability(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
@@ -200,6 +238,8 @@ class TestHealth:
         monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
         assert api_client.get("/health").status_code == 200
         assert api_client.get("/health").status_code == 200
+        assert api_client.get("/ready").status_code in (200, 503)
+        assert api_client.get("/ready").status_code in (200, 503)
 
     def test_unauthenticated_expensive_requests_do_not_consume_quota(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
