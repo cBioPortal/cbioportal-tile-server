@@ -509,7 +509,7 @@ def process_candidate_rows(
 
     try:
         for index, row in enumerate(rows, start=1):
-            logger.info("processing %s (%d)", row.image_id, index)
+            logger.info("processing thumbnail candidate index=%d", index)
             artifact_uri = _join_uri(root_uri, f"{row.image_id}.jpg")
             try:
                 artifact = _render_candidate_artifact_subprocess(
@@ -535,7 +535,10 @@ def process_candidate_rows(
                     },
                 )
             except Exception as exc:
-                logger.exception("failed thumbnail generation for %s", row.image_id)
+                logger.error(
+                    "thumbnail generation failed; error_type=%s",
+                    type(exc).__name__,
+                )
                 failure = {"image_id": row.image_id, "path": row.path, "error": str(exc)}
                 failures.append(failure)
                 _append_result(
@@ -569,10 +572,10 @@ def _iter_result_records(paths: Iterable[str]) -> Iterable[dict[str, Any]]:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
-                    logger.warning("ignoring incomplete result line path=%s line=%d", path, line_number)
+                    logger.warning("ignoring incomplete result line=%d", line_number)
                     continue
                 if not isinstance(payload, dict) or not payload.get("image_id"):
-                    logger.warning("ignoring invalid result record path=%s line=%d", path, line_number)
+                    logger.warning("ignoring invalid result record line=%d", line_number)
                     continue
                 yield payload
 
@@ -665,11 +668,15 @@ def _upsert_registry_batch_with_retries(
         try:
             _upsert_registry_rows(warehouse_id, batch)
             return
-        except Exception:
+        except Exception as exc:
             if attempt == attempts:
                 raise
             delay = 2 ** (attempt - 1)
-            logger.warning("registry update failed; retrying in %ss", delay, exc_info=True)
+            logger.warning(
+                "registry update failed; retrying in %ss error_type=%s",
+                delay,
+                type(exc).__name__,
+            )
             time.sleep(delay)
 
 
@@ -852,8 +859,7 @@ def main() -> int:
         with open(args.summary_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
     logger.info(
-        "published manifest=%s slides=%d candidates=%d failures=%d",
-        args.manifest_uri,
+        "published thumbnail manifest slides=%d candidates=%d failures=%d",
         len(manifest["slides"]),
         len(candidates),
         len(failures),

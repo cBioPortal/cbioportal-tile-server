@@ -1,23 +1,18 @@
-"""
-Databricks SQL transport and raw query definitions for slide metadata.
-"""
+"""Databricks SQL transport and query definitions for slide metadata."""
 
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any
 from urllib.request import Request, urlopen
 
 from .constants import (
-    CANONICAL_ASSOCIATION_TABLE as _CANONICAL_ASSOCIATION_TABLE,
     CLEANED_SLIDE_TABLE as _CLEANED_TABLE,
     DEID_TABLE as _TABLE,
     INVENTORY_TABLE as _INVENTORY,
     SUMMARY_TABLE as _SUMMARY,
 )
 
-logger = logging.getLogger(__name__)
 EXTERNAL_LINK_TIMEOUT_SEC = 120
 
 PATIENT_SQL = f"""
@@ -109,14 +104,14 @@ ORDER BY d.sample_id, d.block_id, d.image_id
 """
 
 SLIDE_SQL = f"""
-SELECT *
+SELECT image_id, stain_name, stain_group, magnification, file_size_bytes
 FROM {_TABLE}
 WHERE image_id = :image_id
 LIMIT 1
 """
 
 SLIDE_SCOPED_SQL = f"""
-SELECT *
+SELECT image_id, stain_name, stain_group, magnification, file_size_bytes
 FROM {_TABLE}
 WHERE image_id = :image_id
   AND PATIENT_ID = :patient_id
@@ -157,18 +152,6 @@ GROUP BY sample_id, patient_id
 ORDER BY sample_id
 LIMIT 8
 """
-
-# The deployed canonical table has existed with two compatible schemas: the
-# older flat pathology schema and the newer normalized association schema.
-# Selecting the row preserves both versions; the bridge normalizes optional
-# columns before returning the cBioPortal hierarchy contract.
-CANONICAL_PATIENT_ASSOCIATIONS_SQL = f"""
-SELECT *
-FROM {_CANONICAL_ASSOCIATION_TABLE}
-WHERE patient_id = :patient_id
-ORDER BY sample_id, image_id
-"""
-
 
 def param(name: str, value: str, ptype: str = "STRING"):
     from databricks.sdk.service.sql import StatementParameterListItem  # noqa: PLC0415
@@ -344,12 +327,3 @@ WHERE sample_id IN ({placeholders})
 ORDER BY sample_id
 """
     return run_query(sql, warehouse_id)
-
-
-def get_patient_association_rows(patient_id: str, warehouse_id: str) -> list[dict[str, Any]]:
-    logger.info("Querying canonical association table for patient %s", patient_id)
-    return run_query(
-        CANONICAL_PATIENT_ASSOCIATIONS_SQL,
-        warehouse_id,
-        [param("patient_id", patient_id)],
-    )

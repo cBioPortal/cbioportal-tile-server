@@ -128,10 +128,11 @@ Production ingress should apply distributed rate limits as well.
 The tile server validates the signature, algorithm, audience, scope, subject,
 authorization-contract version, issued-at time, expiry, and maximum lifetime.
 It then validates the token's `study_id` against the loader-published mapping
-for every patient, sample, and slide resource. The mapping covers patient
-slide metadata, thumbnails, tiles, warmup, raw slide metadata, and
-search. A client-supplied `studyId` query parameter is only a consistency
-check and cannot widen access. A missing mapping fails closed; it is not
+for patient, sample, and slide resources used by protected endpoints. The
+cBioPortal backend owns patient hierarchy responses; the mapping covers slide metadata, thumbnails, tiles,
+warmup, restricted diagnostic slide metadata, and search. A client-supplied `studyId` query parameter is only a consistency
+check and cannot widen access. Patient hierarchy is not exposed through a
+tile-server fallback route. A missing mapping fails closed; it is not
 interpreted as “no slides”.
 The loader and tile server reject ambiguous patient, sample, or slide
 identifiers that are listed under more than one study, because the underlying
@@ -195,10 +196,15 @@ study-B resources, and metadata responses are not publicly cacheable.
 
 - Tiles: `private, max-age=3600`.
 - Thumbnails: `private, max-age=300`.
-- Slide metadata and search: `private, no-store`.
+- Slide metadata, diagnostic metadata, and search: `private, no-store`.
 - Thumbnails and metadata now use 24-hour Redis TTLs by default.
 - Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
   explicitly for the resulting working set.
+
+Application logs must not contain patient IDs, slide IDs, search terms, S3 paths,
+or exception text that may contain those values. Keep only operation type,
+dimensions, status/reason, timing, and exception class. Review ingress and proxy
+access-log policies separately because they are owned by the deployment repository.
 
 ## Thumbnail artifacts
 

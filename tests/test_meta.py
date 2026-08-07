@@ -10,6 +10,7 @@ from app import meta_store
 from app.meta import (
     _coerce,
     _infer_stain_flags,
+    get_slide_dbmeta,
     get_slide_path,
     search_suggestions,
 )
@@ -224,6 +225,39 @@ class TestGetSlidePath:
         assert self._call([{"path": None}]) is None
 
 
+class TestGetSlideDbmeta:
+    def test_returns_only_normalized_diagnostic_fields(self):
+        rows = [{
+            "image_id": 1492807,
+            "stain_name": "H&E",
+            "stain_group": "H&E (Initial)",
+            "magnification": 20,
+            "file_size_bytes": "1234",
+            "patient_id": "P-SECRET",
+        }]
+        with patch("app.meta._run_query", return_value=rows) as mock_rq:
+            result = get_slide_dbmeta("1492807", "wh-test", patient_id="P-1")
+
+        assert result == {
+            "image_id": "1492807",
+            "stain_name": "H&E",
+            "stain_group": "H&E (Initial)",
+            "magnification": "20",
+            "file_size_bytes": 1234,
+        }
+        sql = mock_rq.call_args.args[0]
+        assert "SELECT *" not in sql
+        assert "AND PATIENT_ID = :patient_id" in sql
+        assert "SELECT *" not in meta_store.SLIDE_SQL
+        assert "patient_id" not in result
+
+    def test_preserves_zero_image_id(self):
+        with patch("app.meta._run_query", return_value=[{"image_id": 0}]):
+            result = get_slide_dbmeta("0", "wh-test")
+
+        assert result["image_id"] == "0"
+
+
 # ---------------------------------------------------------------------------
 # get_sample_slide_summary
 # ---------------------------------------------------------------------------
@@ -411,21 +445,3 @@ def test_live_summary_uses_patient_slide_universe():
     assert "non_viewable_patient_summary AS" in sql
     assert "GROUP BY d.patient_id" in sql
     assert "m.image_id" not in sql
-
-
-class TestPatientAssociationRows:
-    def test_prefers_canonical_association_table(self):
-        with patch("app.meta_store.run_query", return_value=[{"image_id": "1"}]) as mock_rq:
-            rows = meta_store.get_patient_association_rows("P-0001", "wh-test")
-
-        assert rows == [{"image_id": "1"}]
-        sql = mock_rq.call_args_list[0].args[0]
-        assert meta_store._CANONICAL_ASSOCIATION_TABLE in sql
-
-    def test_canonical_query_errors_propagate(self):
-        with patch(
-            "app.meta_store.run_query",
-            side_effect=RuntimeError("Databricks query timed out"),
-        ):
-            with pytest.raises(RuntimeError, match="timed out"):
-                meta_store.get_patient_association_rows("P-0001", "wh-test")
