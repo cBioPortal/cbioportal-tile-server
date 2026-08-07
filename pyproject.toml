@@ -27,7 +27,7 @@ dependencies = [
     "boto3>=1.34.0",
 
     # Image encoding
-    "Pillow>=10.3.0",
+    "Pillow>=12.3.0",
 
     # Tile cache (asyncio support is built-in since redis 5)
     "redis>=5.0.0",
