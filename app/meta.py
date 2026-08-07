@@ -35,6 +35,15 @@ def _coerce(v: Any) -> Any:
     return v
 
 
+def _optional_int(v: Any) -> int | None:
+    if v in (None, ""):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _format_patient_suggestions(rows: list[dict[str, Any]]) -> list[dict]:
     return [
         {
@@ -84,7 +93,17 @@ def get_slide_dbmeta(
     rows = _run_query(sql, warehouse_id, params)
     if not rows:
         return None
-    return {k: _coerce(v) for k, v in rows[0].items()}
+    row = rows[0]
+    image_value = row.get("image_id")
+    return {
+        "image_id": "" if image_value is None else str(image_value),
+        "stain_name": None if row.get("stain_name") is None else str(row["stain_name"]),
+        "stain_group": None if row.get("stain_group") is None else str(row["stain_group"]),
+        "magnification": (
+            None if row.get("magnification") is None else str(row["magnification"])
+        ),
+        "file_size_bytes": _optional_int(row.get("file_size_bytes")),
+    }
 
 
 def get_slide_path(image_id: str, warehouse_id: str) -> str | None:

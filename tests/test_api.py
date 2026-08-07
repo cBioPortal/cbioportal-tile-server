@@ -4,9 +4,9 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import time
 from io import BytesIO
-import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -184,6 +184,16 @@ class TestHealth:
         resp = api_client.get("/wsi/tiles/1/metadata")
         assert resp.status_code == 401
 
+    def test_removed_patient_fallback_is_not_registered(self, api_client, monkeypatch, tmp_path):
+        assert api_client.get("/internal/patient/P-1").status_code == 404
+        assert api_client.get("/wsi/internal/patient/P-1").status_code == 404
+
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        token = make_wsi_token(secret, "study-a")
+        headers = {"Authorization": f"Bearer {token}"}
+        assert api_client.get("/internal/patient/P-1", headers=headers).status_code == 404
+        assert api_client.get("/wsi/internal/patient/P-1", headers=headers).status_code == 404
+
     def test_health_is_exempt_from_rate_limit(self, api_client, monkeypatch):
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
@@ -242,6 +252,34 @@ class TestHealth:
         assert limited.status_code == 429
         assert limited.headers["retry-after"] == "60"
         assert other_subject.status_code == 200
+
+    def test_thumbnail_requests_are_rate_limited_per_subject(
+        self, api_client, monkeypatch, tmp_path
+    ):
+        secret = configure_resource_auth(monkeypatch, tmp_path)
+        monkeypatch.setattr(settings, "rate_limit_per_minute", 1)
+        monkeypatch.setattr(main_module, "rate_limiter", RequestRateLimiter())
+        token = make_wsi_token(secret, "study-a")
+        headers = {"Authorization": f"Bearer {token}"}
+
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=None),
+            patch.object(main_module, "get_persisted_generated_thumbnail_record", return_value=None),
+            patch.object(main_module, "_generate_thumbnail_record_on_demand", new=AsyncMock(return_value=None)),
+        ):
+            assert api_client.get("/thumbnails/1492807", headers=headers).status_code == 200
+            limited = api_client.get("/thumbnails/1492807", headers=headers)
+            other_subject = api_client.get(
+                "/thumbnails/1492807",
+                headers={
+                    "Authorization": f"Bearer {make_wsi_token(secret, 'study-a', sub='other-user')}"
+                },
+            )
+
+        assert limited.status_code == 429
+        assert limited.headers["retry-after"] == "60"
+        assert other_subject.status_code == 200
+
     def test_study_capability_binds_slide_resources(self, api_client, monkeypatch, tmp_path):
         secret = configure_resource_auth(monkeypatch, tmp_path)
         token_a = make_wsi_token(secret, "study-a")
@@ -405,7 +443,13 @@ class TestHealth:
         async def fake_in_thread(fn, *args):
             if fn is main_module.get_slide_dbmeta:
                 metadata_args.extend(args)
-                return {"image_id": args[0]}
+                return {
+                    "image_id": args[0],
+                    "stain_name": None,
+                    "stain_group": None,
+                    "magnification": None,
+                    "file_size_bytes": None,
+                }
             return fn(*args)
 
         with patch.object(main_module, "_in_thread", new=fake_in_thread):
@@ -417,8 +461,27 @@ class TestHealth:
             )
 
         assert raw_metadata.status_code == 200
+        assert set(raw_metadata.json()) == {
+            "image_id",
+            "stain_name",
+            "stain_group",
+            "magnification",
+            "file_size_bytes",
+        }
         assert metadata_args[2] == "P-a"
         assert [item["id"] for item in search.json()] == ["P-a"]
+
+        forbidden = api_client.get(
+            "/slides/2492807/dbmeta",
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert forbidden.status_code == 403
+
+    def test_raw_metadata_requires_capability(self, api_client, monkeypatch):
+        monkeypatch.setattr(settings, "wsi_auth_required", True)
+        monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
+        response = api_client.get("/slides/1492807/dbmeta")
+        assert response.status_code == 401
 
     def test_authenticated_search_checks_cache_before_building_suggestions(
         self, api_client, monkeypatch, tmp_path
@@ -437,56 +500,6 @@ class TestHealth:
         assert response.json() == cached
         assert get_raw.await_count == 1
         assert get_raw.await_args.args[0].startswith("search:study-a:")
-
-
-# ---------------------------------------------------------------------------
-# /internal/patient/{patient_id}
-# ---------------------------------------------------------------------------
-
-class TestPatientHierarchy:
-    def test_internal_hierarchy_uses_canonical_associations(self, api_client):
-        rows = [
-            {
-                "match_level": "BLOCK",
-                "patient_id": "P-1",
-                "sample_id": "S-1",
-                "reference_sample_id": "S-1",
-                "part_key": "part::1",
-                "part_number": "1",
-                "part_designator": "1",
-                "part_type": "COLON",
-                "part_description": "Tumor",
-                "path_dx_title": "Tumor",
-                "block_key": "block::1",
-                "block_number": "1",
-                "block_label": "1T",
-                "image_id": "slide-1",
-                "stain_name": "H&E, Initial",
-                "stain_group": "H&E (Initial)",
-                "is_hne": True,
-                "is_ihc": False,
-                "magnification": "20x",
-                "file_size_bytes": 10,
-                "can_serve_tiles": True,
-                "barcode": "",
-                "slide_type": "H&E",
-                "specimen_key": "block::1::1",
-                "procedure_date_days": -1,
-                "timepoint_source": "Procedure date",
-                "slide_path": "s3://slides/slide-1.svs",
-            }
-        ]
-
-        with patch.object(
-            main_module, "get_patient_association_rows", return_value=rows
-        ) as query:
-            response = api_client.get("/internal/patient/P-1?studyId=study-1")
-
-        assert response.status_code == 200
-        assert response.json()["sampleGroups"][0]["parts"][0]["blocks"][0]["slides"][0][
-            "imageId"
-        ] == "slide-1"
-        query.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +595,27 @@ class TestTileRoute:
 # ---------------------------------------------------------------------------
 
 class TestThumbnailRoute:
+    def test_thumbnail_logs_do_not_include_slide_id(self, api_client, caplog):
+        record = ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+        )
+        caplog.set_level(logging.INFO, logger=main_module.__name__)
+        with (
+            patch.object(main_module, "get_thumbnail_record", return_value=record),
+            patch.object(
+                main_module,
+                "render_thumbnail_response",
+                return_value=(b"\xff\xd8thumb", {"status": "ok", "reason": "resized"}),
+            ),
+        ):
+            response = api_client.get("/thumbnails/1492807?width=256&height=256")
+
+        assert response.status_code == 200
+        assert "1492807" not in caplog.text
+
     def test_returns_jpeg(self, api_client):
         record = ThumbnailRecord(
             image_id="1492807",
@@ -716,8 +750,20 @@ class TestSearchRoute:
 
     def test_search_error_returns_502(self, api_client):
         async def _raise(*a, **k):
-            raise RuntimeError("Search failed")
+            raise RuntimeError("Search failed for P-SECRET at /private/path")
 
         with patch("app.main._in_thread", new=_raise):
             resp = api_client.get("/search?q=P-1234")
         assert resp.status_code == 502
+
+    def test_search_error_log_excludes_query_and_exception_text(self, api_client, caplog):
+        async def _raise(*a, **k):
+            raise RuntimeError("Search failed for P-SECRET at /private/path")
+
+        caplog.set_level(logging.INFO, logger=main_module.__name__)
+        with patch("app.main._in_thread", new=_raise):
+            resp = api_client.get("/search?q=P-SECRET")
+
+        assert resp.status_code == 502
+        assert "P-SECRET" not in caplog.text
+        assert "/private/path" not in caplog.text
