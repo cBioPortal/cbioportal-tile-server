@@ -41,6 +41,7 @@ platform, but you must still provide equivalent published inputs and either:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness probe |
+| GET | `/ready` | Readiness probe; returns `503` when auth is enabled but the trusted resource index is unavailable |
 | GET | `/slides/{image_id}/dbmeta` | Restricted diagnostic metadata for a slide |
 | GET | `/search?q=` | Autocomplete suggestions |
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
@@ -51,7 +52,7 @@ platform, but you must still provide equivalent published inputs and either:
 The same endpoints are also available under the explicit `/wsi` namespace,
 for example `/wsi/tiles/{slide_id}/...`.
 
-All endpoints except `/health` require a cBioPortal-issued short-lived WSI
+All endpoints except `/health` and `/ready` require a cBioPortal-issued short-lived WSI
 capability in the header:
 
 ```text
@@ -61,8 +62,8 @@ Authorization: Bearer <token>
 The token must be an HMAC-SHA256 JWT with the configured audience,
 `scope=wsi:read`, a non-empty subject, `study_id`, `wsi_auth_version=1`, and
 valid `iat`/`exp` claims whose lifetime does not exceed `WSI_AUTH_MAX_TTL`.
-The `/wsi/health` ingress alias is rewritten to `/health` for probes. Do not
-disable this check in production.
+The `/wsi/health` and `/wsi/ready` ingress aliases are rewritten to the probe
+routes. Do not disable these checks in production.
 
 ## What this service needs
 
@@ -103,7 +104,7 @@ All settings are environment variables (see `app/config.py`):
 | `DATABRICKS_WAREHOUSE_ID` | `0b49b7d78734ad5c` | Databricks SQL warehouse for metadata/search queries |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with the cBioPortal capability issuer |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability-token audience |
-| `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for non-health routes |
+| `WSI_AUTH_REQUIRED` | `true` | Require Bearer capabilities for protected routes; `/health` and `/ready` remain public |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum WSI token lifetime in seconds |
 | `WSI_RESOURCE_INDEX_FILE` | — | Loader-published version-2 study/resource binding; required when auth is enabled |
 | `TILE_SIZE` | `256` | Tile edge length in pixels |

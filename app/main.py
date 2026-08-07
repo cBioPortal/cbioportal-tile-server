@@ -3,6 +3,7 @@ Tile server — FastAPI application.
 
 Endpoints:
   GET /health
+  GET /ready
   GET /tiles/{slide_id}/metadata
   GET /thumbnails/{slide_id}?width=256&height=256
   GET /tiles/{slide_id}/zxy/{z}/{x}/{y}
@@ -32,7 +33,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import cache as tile_cache
 from . import meta
-from .auth import InvalidWsiToken, validate_wsi_token
+from .auth import (
+    InvalidWsiToken,
+    validate_wsi_auth_configuration,
+    validate_wsi_token,
+)
 from .blockcache import get_blockcache_manager
 from .config import settings
 from .metrics import (
@@ -199,8 +204,8 @@ async def limit_expensive_requests(request: Request, call_next):
 
 @app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
-    """Require a cBioPortal-issued capability for every non-health API request."""
-    if request.scope["path"] == "/health":
+    """Require a cBioPortal-issued capability for every protected API request."""
+    if request.scope["path"] in ("/health", "/ready"):
         return await call_next(request)
     if not settings.wsi_auth_required:
         return await call_next(request)
@@ -482,6 +487,34 @@ def _authenticated_search_context(request: Request):
         raise HTTPException(status_code=503, detail="WSI resource authorization is unavailable")
 
 
+def _readiness_status() -> tuple[int, dict]:
+    payload = {
+        "status": "ok",
+        "auth_required": settings.wsi_auth_required,
+        "n_workers": settings.n_workers,
+    }
+    if not settings.wsi_auth_required:
+        return 200, payload
+    try:
+        validate_wsi_auth_configuration(
+            settings.wsi_auth_secret,
+            settings.wsi_auth_audience,
+            settings.wsi_auth_max_ttl,
+        )
+        payload["resource_index_revision"] = get_resource_index(
+            settings.wsi_resource_index_file
+        ).revision()
+        return 200, payload
+    except InvalidWsiToken:
+        payload["status"] = "unavailable"
+        payload["reason"] = "WSI authentication is not configured"
+        return 503, payload
+    except ResourceIndexUnavailable as exc:
+        payload["status"] = "unavailable"
+        payload["reason"] = f"trusted WSI resource index is unavailable: {exc}"
+        return 503, payload
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -501,6 +534,17 @@ def health():
         "n_workers": settings.n_workers,
         "thumbnail_generation": thumbnail_generation,
     }
+
+
+@app.get("/ready")
+def ready():
+    status_code, payload = _readiness_status()
+    return Response(
+        content=json.dumps(payload),
+        media_type="application/json",
+        headers=PHI_CACHE_HEADERS,
+        status_code=status_code,
+    )
 
 
 @app.get("/metrics", include_in_schema=False)
