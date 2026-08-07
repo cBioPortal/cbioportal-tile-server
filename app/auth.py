@@ -21,7 +21,7 @@ def _b64decode(value: str) -> bytes:
 def validate_wsi_auth_configuration(secret: str, audience: str, max_ttl: int) -> None:
     if not secret or len(secret.encode()) < 32:
         raise InvalidWsiToken("WSI authentication is not configured")
-    if not audience or not audience.strip() or max_ttl < 1:
+    if not audience or not audience.strip() or not 1 <= max_ttl <= 300:
         raise InvalidWsiToken("WSI authentication is not configured")
 
 

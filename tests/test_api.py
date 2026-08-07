@@ -83,7 +83,7 @@ def configure_resource_auth(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "wsi_auth_required", True)
     monkeypatch.setattr(settings, "wsi_auth_secret", secret)
     monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
-    monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+    monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
     monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
     return secret
 
@@ -225,6 +225,8 @@ class TestHealth:
             ("wsi_auth_secret", "s" * 31),
             ("wsi_auth_audience", "   "),
             ("wsi_auth_max_ttl", 0),
+            ("wsi_auth_max_ttl", 301),
+            ("wsi_auth_max_ttl", 900),
         ],
     )
     def test_ready_reports_invalid_auth_configuration(
@@ -388,7 +390,7 @@ class TestHealth:
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", secret)
         monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
-        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
         monkeypatch.setattr(settings, "wsi_resource_index_file", "")
 
         response = api_client.get(
@@ -407,7 +409,7 @@ class TestHealth:
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", secret)
         monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
-        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
         monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
 
         response = api_client.get(
@@ -434,7 +436,7 @@ class TestHealth:
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", secret)
         monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
-        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
         monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
 
         response = api_client.get(
@@ -483,7 +485,7 @@ class TestHealth:
         monkeypatch.setattr(settings, "wsi_auth_required", True)
         monkeypatch.setattr(settings, "wsi_auth_secret", secret)
         monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
-        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 900)
+        monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
         monkeypatch.setattr(settings, "wsi_resource_index_file", str(resource_index))
 
         response_a = api_client.get(

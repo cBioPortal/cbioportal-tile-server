@@ -67,6 +67,8 @@ def test_valid_wsi_token():
         ("s" * 31, "cbioportal-wsi", 300),
         ("s" * 32, "   ", 300),
         ("s" * 32, "cbioportal-wsi", 0),
+        ("s" * 32, "cbioportal-wsi", 301),
+        ("s" * 32, "cbioportal-wsi", 900),
     ],
 )
 def test_invalid_wsi_auth_configuration_is_rejected(secret, audience, max_ttl):

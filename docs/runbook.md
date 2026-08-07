@@ -13,15 +13,20 @@ Use these repositories together when changing WSI:
   `/api/wsi/access-token?studyId=<study>` and sends it on WSI requests.
 - `../cbioportal` authenticates the user, checks study-read permission, and
   issues the capability.
-- `../knowledgesystems-k8s-deployment` owns the production Kubernetes
-  deployment, ingress, secrets wiring, and smoke test.
+- [`knowledgesystems/knowledgesystems-k8s-deployment`](https://github.com/knowledgesystems/knowledgesystems-k8s-deployment)
+  owns the production Kubernetes deployment, ingress, secrets wiring, and
+  smoke test.
 - `../cbioportal-docker-compose` provides the local nginx rehearsal.
 
 The production manifests are under:
 
 ```text
-../knowledgesystems-k8s-deployment/argocd/aws/666628074417/clusters/cbioportal-prod/apps/slide-viewer/
+argocd/aws/666628074417/clusters/cbioportal-prod/apps/slide-viewer/
 ```
+
+The isolated MSK triage rehearsal uses the parallel
+`slide-viewer-triage/` manifests and the `triage-beta.cbioportal.aws.mskcc.org`
+hostname; it does not share the production Service or PVC.
 
 Do not edit those manifests from this repository, and preserve any unrelated
 working-tree changes in that deployment repository.
@@ -46,7 +51,7 @@ explicitly introduces it. The existing production route does not require a
 new CNAME.
 
 The coordinated 16 GiB rollout profile is one replica on
-`workload-class: x86-general`, with 4 GiB memory requested, 16 GiB limited,
+`workload: cbioportal`, with 4 GiB memory requested, 16 GiB limited,
 and a 20 GiB `emptyDir` block cache. Liveness uses `/health`; readiness uses
 `/ready` so auth-enabled deployments stay out of rotation until the trusted
 resource index is available. The NetworkPolicy in the deployment repository
@@ -92,7 +97,7 @@ CORS_ORIGINS=https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org
 Credentials are supplied by the `slide-viewer-secrets` Secret:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `DATABRICKS_HOST`,
 `DATABRICKS_TOKEN`, `REDIS_URL`, and `ANNOTATION_DATABASE_URL`. The tile
-server receives `WSI_AUTH_SECRET` from the `cbioportal-msk-blue` Secret.
+server receives `WSI_AUTH_SECRET` from the `cbioportal-wsi-auth` Secret.
 The blue and green cBioPortal backend deployments are configured with the
 same secret and with audience `cbioportal-wsi` and a 300-second token TTL.
 `WSI_AUTH_REQUIRED` is `true`, `WSI_AUTH_MAX_TTL` is `300`, and
@@ -183,11 +188,11 @@ curl -fsS http://localhost:3001/wsi/health
 curl -fsS http://localhost:3001/wsi/ready
 ```
 
-For production, use the deployment repository's smoke test. The scheduled
-check verifies readiness and unauthenticated rejection of a protected route:
+For production, run the deployment repository's smoke test from that
+repository's root. The scheduled check verifies readiness and unauthenticated
+rejection of a protected route:
 
 ```bash
-cd ../knowledgesystems-k8s-deployment
 export CBIOPORTAL_URL=https://cbioportal.mskcc.org
 tests/smoke/slide-viewer-routing.sh
 ```
