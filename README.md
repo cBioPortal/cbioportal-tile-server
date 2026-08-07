@@ -17,6 +17,8 @@ deployment boundary is:
   short-lived WSI Bearer token.
 - `cbioportal-tile-server` validates that token, enforces the trusted
   study-to-resource index, and serves slide data.
+- patient hierarchy is served by the authenticated cBioPortal backend, not by
+  a tile-server fallback route.
 - an upstream data-preparation pipeline publishes the slide/resource index and
   loads the corresponding WSI hierarchy release used by cBioPortal.
 
@@ -26,7 +28,7 @@ today:
 - tile and thumbnail authorization is driven by `WSI_RESOURCE_INDEX_FILE`
 - authenticated slide path resolution can come from the trusted index
 - unauthenticated search and fallback slide-path lookup use Databricks metadata
-- `/slides/{image_id}/dbmeta` returns a raw Databricks metadata row by design
+- `/slides/{image_id}/dbmeta` returns a restricted diagnostic metadata subset
 
 If your institution does not use Databricks, you can replace the upstream ETL
 platform, but you must still provide equivalent published inputs and either:
@@ -39,7 +41,7 @@ platform, but you must still provide equivalent published inputs and either:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness probe |
-| GET | `/slides/{image_id}/dbmeta` | Raw metadata row for a slide; currently backed by Databricks |
+| GET | `/slides/{image_id}/dbmeta` | Restricted diagnostic metadata for a slide |
 | GET | `/search?q=` | Autocomplete suggestions |
 | GET | `/tiles/{slide_id}/metadata` | Slide dimensions, zoom levels, MPP |
 | GET | `/thumbnails/{slide_id}` | JPEG thumbnail from a pre-rendered artifact |
@@ -59,8 +61,8 @@ Authorization: Bearer <token>
 The token must be an HMAC-SHA256 JWT with the configured audience,
 `scope=wsi:read`, a non-empty subject, `study_id`, `wsi_auth_version=1`, and
 valid `iat`/`exp` claims whose lifetime does not exceed `WSI_AUTH_MAX_TTL`.
-The `/wsi/health` alias is also unauthenticated for probes. Do not disable
-this check in production.
+The `/wsi/health` ingress alias is rewritten to `/health` for probes. Do not
+disable this check in production.
 
 ## What this service needs
 
@@ -153,7 +155,7 @@ The service does not use every backend for every route. The current behavior is:
 
 | Capability | Trusted resource index | Slide object storage | Databricks |
 |-----------|-------------------------|----------------------|------------|
-| authz for protected slide/patient/sample resources | required | no | no |
+| authz for protected slide/sample resources and patient search suggestions | required | no | no |
 | authenticated slide path resolution | required | yes | no |
 | tile and thumbnail serving | indirect | required | no |
 | `/tiles/{slide_id}/metadata` | indirect | required | no |
@@ -167,8 +169,9 @@ This means:
 
 - a private-study production rollout must have the trusted resource index
 - tile serving itself does not require a live Databricks query path
-- the current implementation still uses Databricks for raw metadata and some
-  non-authenticated or fallback behaviors
+- the cBioPortal backend owns patient hierarchy authorization and responses
+- the current implementation still uses Databricks for restricted diagnostic metadata and
+  unauthenticated development fallback behavior
 
 If you need a deployment with no Databricks dependency at all, plan to replace
 or remove the Databricks-backed endpoints and lookup paths.
@@ -182,7 +185,7 @@ snapshot. The token's `study_id` is authoritative. A `studyId` query parameter
 may be supplied by the frontend only as a consistency check and is never
 trusted on its own.
 
-The mapping is required for slide metadata, thumbnails, tiles, warmup, raw
+The mapping is required for slide metadata, thumbnails, tiles, warmup, restricted
 `/slides/{id}/dbmeta`, and `/search`. A token
 for study A must return `403` for a patient or slide bound only to study B;
 missing or invalid capabilities return `401`. A missing or invalid trusted
@@ -199,6 +202,14 @@ cache headers; Redis and an HTTP cache are never authorization boundaries.
 
 Unauthenticated local/development mode (`WSI_AUTH_REQUIRED=false`) is retained
 for public fixtures only. It must not be used for private-study deployment.
+
+## PHI-safe logging
+
+Application logs must not contain patient IDs, slide IDs, search terms, S3 paths,
+or exception text that may contain those values. Request outcome logs may retain
+operation type, dimensions, status/reason, timing, and exception class. Review
+ingress and proxy access-log policies separately because they are owned by the
+deployment repository.
 
 ## Bring-up checklist
 

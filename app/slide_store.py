@@ -66,8 +66,7 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
 
             if slide.level_count < 2:
                 logger.warning(
-                    "slide %s opened with level_count=%d — stale blockcache suspected; clearing cache dir and retrying",
-                    slide_id,
+                    "slide opened with level_count=%d — stale blockcache suspected; clearing cache dir and retrying",
                     slide.level_count,
                 )
                 try:
@@ -78,7 +77,7 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
                 shutil.rmtree(cache_dir, ignore_errors=True)
                 os.makedirs(cache_dir, exist_ok=True)
                 slide, fileobj = _open_with_cache(cache_dir)
-                logger.info("slide %s re-opened: level_count=%d", slide_id, slide.level_count)
+                logger.info("slide re-opened: level_count=%d", slide.level_count)
 
             return slide, fileobj
 
