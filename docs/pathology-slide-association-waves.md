@@ -1,9 +1,10 @@
 # Normalized WSI release flow
 
 The upstream pathology association dataset remains the source for pathology
-structure and slide facts. The tile server loader resolves its stable study,
-patient, and sample identifiers against cBioPortal, validates all references,
-and writes one append-only release to the normalized ClickHouse tables:
+structure and slide facts. The Databricks/export pipeline emits the canonical
+study files; cBioPortal core resolves stable study, patient, and sample
+identifiers, validates all references, and writes one append-only release to
+the normalized ClickHouse tables:
 
 - `wsi_release`
 - `wsi_release_patient`
@@ -31,12 +32,12 @@ does not assemble or cache patient hierarchies; it serves source-bound tiles and
 thumbnail artifacts. cBioPortal returns intrinsic tile metadata and exact
 source URLs in the per-slide access bundle.
 
-Run the loader with the validated cBioPortal WSI study files:
+Import the validated cBioPortal WSI study files through cBioPortal core:
 
 ```bash
-python3 tools/load_clickhouse_hierarchy.py /path/to/study/meta_wsi.txt \
-  --version 20260723030000
+metaImport.py -s /path/to/study
 ```
 
-Focused loader and API checks are available with `uv run pytest`; the complete
-tile-server suite should pass before publishing a new release.
+The tile server does not write ClickHouse. Focused API checks are available
+with `uv run pytest`; the complete tile-server suite should pass after the
+core import has published a release.

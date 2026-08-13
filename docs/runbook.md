@@ -73,7 +73,7 @@ thumbnail_width, thumbnail_height, thumbnail_content_type
 ```
 
 The thumbnail generator writes the artifact and intrinsic metadata to the
-thumbnail registry. The loader publishes `can_serve_tiles=true` only when all
+thumbnail registry. The cBioPortal core importer publishes `can_serve_tiles=true` only when all
 fields are complete; otherwise the hierarchy reports the slide as unavailable.
 No registry or manifest is mounted into the online tile-server pod.
 
@@ -100,5 +100,5 @@ testing a pixel request.
 
 Run `tools/generate_slide_thumbnails.py` (usually through the Slurm wrapper)
 outside the API process. It writes immutable artifacts and registry rows; a
-successful batch must be followed by the ClickHouse hierarchy loader before a
+successful batch must be followed by a cBioPortal core study import before a
 slide becomes servable.

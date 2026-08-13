@@ -92,7 +92,7 @@ The backend data pipeline publishes one WSI release containing hierarchy rows
 plus the pixel contract fields (`source_url`, `tile_metadata_json`,
 `thumbnail_url`, dimensions, and content type). The thumbnail generator uses
 the same intrinsic tile metadata when creating the registry artifact. The
-loader and SQL pipeline are intentionally offline tooling; none of their
+exporter and SQL pipeline are intentionally offline tooling; none of their
 metadata clients are imported by the FastAPI runtime.
 
 The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
@@ -104,12 +104,19 @@ python3 tools/export_materialized_hierarchy_snapshot.py \
   --study-id study_id
 ```
 
-Load the validated files into cBioPortal ClickHouse with:
+Load the exported files through the standard cBioPortal importer. The core
+importer validates and resolves the complete snapshot, writes the normalized
+ClickHouse hierarchy, and publishes its release manifest last:
 
 ```bash
-python3 tools/load_clickhouse_hierarchy.py /path/to/study/meta_wsi.txt \
-  --version 20260811030000
+metaImport.py -s /path/to/study
+# or, for a complete replacement snapshot:
+metaImport.py -d /path/to/wsi-update
 ```
+
+The tile server is deliberately not a ClickHouse writer. It receives source
+URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
+authorized pixel and thumbnail requests.
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
 issue a v2 capability whose source URL is the mounted file URI. The normal

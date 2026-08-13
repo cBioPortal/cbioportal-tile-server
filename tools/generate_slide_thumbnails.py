@@ -193,7 +193,7 @@ def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> 
     try:
         # A real OpenSlide object always exposes the intrinsic pyramid.  Keep
         # the renderer's artifact path usable for legacy/test doubles that do
-        # not implement those fields; the loader/backend will fail closed when
+        # not implement those fields; the core importer/backend will fail closed when
         # the resulting metadata JSON is not a valid tile contract.
         try:
             metadata = slide_metadata(slide)

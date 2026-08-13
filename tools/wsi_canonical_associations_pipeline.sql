@@ -1,7 +1,7 @@
 -- WSI Canonical Association Pipeline
 --
--- The output of this job is the normalized input contract consumed by
--- tools/load_clickhouse_hierarchy.py. It contains pathology-only structure,
+-- The output of this job is the normalized input contract consumed by the
+-- cBioPortal core WSI importer. It contains pathology-only structure,
 -- slide facts, and placement facts; portal clinical data stays in cBioPortal.
 
 CREATE OR REPLACE TABLE cdsi_prod.pathology_data_mining.canonical_slide_associations AS
