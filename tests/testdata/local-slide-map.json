@@ -1,9 +1,6 @@
 {
   "3020691": "/app/testdata/CMU-1-Small-Region.svs",
-  "3020726": "/app/testdata/948176.svs",
-  "4116658": "/app/testdata/CMU-1-Small-Region.svs",
-  "4116667": "/app/testdata/948176.svs",
+  "3020726": "/app/testdata/CMU-1-Small-Region.svs",
   "openslide-small": "/app/testdata/CMU-1-Small-Region.svs",
-  "mussel-small": "/app/testdata/948176.svs",
   "missing-local": "/app/testdata/DOES-NOT-EXIST.svs"
 }

@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
-import json
 from collections import defaultdict
 from pathlib import Path
 
 from app.config import settings
 from app.constants import CANONICAL_ASSOCIATION_TABLE
 from app.meta_store import run_query
+
+try:
+    from tools.wsi_study_format import read_wsi_study
+except ModuleNotFoundError:  # Direct execution from the tools directory.
+    from wsi_study_format import read_wsi_study
 
 
 ATTRIBUTE_COLUMNS = [
@@ -35,7 +39,10 @@ ATTRIBUTE_COLUMNS = [
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--study-id", required=True, help="Cancer study identifier.")
-    parser.add_argument("--snapshot", help="Input canonical WSI association JSONL snapshot.")
+    parser.add_argument(
+        "--wsi-meta",
+        help="Input meta_wsi.txt; its data_wsi.txt supplies the WSI associations.",
+    )
     parser.add_argument("--study-dir", required=True, help="Target study directory.")
     parser.add_argument(
         "--warehouse-id",
@@ -73,30 +80,23 @@ def _empty_counts() -> dict[str, int]:
     }
 
 
-def _load_counts(snapshot: Path, study_id: str) -> dict[str, dict[str, int]]:
+def _load_counts(meta_path: Path, study_id: str) -> dict[str, dict[str, int]]:
     counts: dict[str, dict[str, int]] = defaultdict(_empty_counts)
-    with snapshot.open(encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("study_id") != study_id:
-                continue
-            slides = row.get("slides")
-            if not isinstance(slides, list):
-                raise ValueError("canonical snapshot rows need a slides list")
-            for slide in slides:
-                if not isinstance(slide, dict):
-                    raise ValueError("canonical snapshot slides must be objects")
-                sample_id = slide.get("sample_id")
-                if not sample_id:
-                    continue
-                counts[sample_id]["WSI_SAMPLE_SLIDE_COUNT"] += 1
-                match_level = (slide.get("match_level") or "").upper()
-                if match_level == "PART":
-                    counts[sample_id]["WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT"] += 1
-                elif match_level == "BLOCK":
-                    counts[sample_id]["WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT"] += 1
+    file_study_id, slides = read_wsi_study(meta_path)
+    if file_study_id != study_id:
+        raise ValueError(
+            f"WSI study identifier {file_study_id!r} does not match {study_id!r}"
+        )
+    for slide in slides:
+        sample_id = slide.get("sample_id")
+        if not sample_id:
+            continue
+        counts[str(sample_id)]["WSI_SAMPLE_SLIDE_COUNT"] += 1
+        match_level = str(slide.get("match_level") or "").upper()
+        if match_level == "PART":
+            counts[str(sample_id)]["WSI_SAMPLE_PART_MATCHED_SLIDE_COUNT"] += 1
+        elif match_level == "BLOCK":
+            counts[str(sample_id)]["WSI_SAMPLE_BLOCK_MATCHED_SLIDE_COUNT"] += 1
     return counts
 
 
@@ -223,9 +223,9 @@ def main() -> int:
     study_dir = Path(args.study_dir).expanduser().resolve()
     meta_path = study_dir / args.meta_filename
     data_path = study_dir / args.data_filename
-    if args.snapshot:
-        snapshot = Path(args.snapshot).expanduser().resolve()
-        counts = _load_counts(snapshot, args.study_id)
+    if args.wsi_meta:
+        meta_path = Path(args.wsi_meta).expanduser().resolve()
+        counts = _load_counts(meta_path, args.study_id)
     else:
         sample_ids = _read_study_sample_ids(study_dir / args.sample_file)
         counts = _load_counts_from_live_canonical(sample_ids, args.warehouse_id)

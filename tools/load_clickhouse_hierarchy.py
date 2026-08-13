@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Load canonical normalized WSI associations into cBioPortal ClickHouse.
+"""Load canonical WSI study files into cBioPortal ClickHouse.
 
-Each JSONL row contains a study, patient, and flat canonical slide rows. Its
-portal identifiers are resolved to cBioPortal internal IDs and only
-pathology-specific rows are written. Every table insert uses one release ID;
-the release insert is the visibility boundary.
+The input is the versioned ``meta_wsi.txt`` + ``data_wsi.txt`` pair kept with
+the rest of a cBioPortal study. Portal identifiers are resolved to internal
+IDs and every table insert uses one release ID; the release insert is the
+visibility boundary.
 """
 
 from __future__ import annotations
@@ -19,6 +19,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from tools.wsi_study_format import read_wsi_study
+except ModuleNotFoundError:  # Direct execution: python tools/load_clickhouse_hierarchy.py
+    from wsi_study_format import read_wsi_study
 
 
 TABLE_DDL = """
@@ -49,8 +54,17 @@ CREATE TABLE IF NOT EXISTS wsi_slide (
     image_id String, stain_name Nullable(String),
     stain_group Nullable(String), is_hne Bool, is_ihc Bool,
     magnification Nullable(String), file_size_bytes Nullable(UInt64),
-    can_serve_tiles Bool, barcode Nullable(String), slide_type Nullable(String)
+    can_serve_tiles Bool, barcode Nullable(String), slide_type Nullable(String),
+    source_url Nullable(String), tile_metadata_json Nullable(String),
+    thumbnail_url Nullable(String), thumbnail_width Nullable(UInt32),
+    thumbnail_height Nullable(UInt32), thumbnail_content_type Nullable(String)
 ) ENGINE = MergeTree() ORDER BY (cancer_study_id, release_id, patient_id, image_id);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS source_url Nullable(String);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS tile_metadata_json Nullable(String);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS thumbnail_url Nullable(String);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS thumbnail_width Nullable(UInt32);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS thumbnail_height Nullable(UInt32);
+ALTER TABLE wsi_slide ADD COLUMN IF NOT EXISTS thumbnail_content_type Nullable(String);
 CREATE TABLE IF NOT EXISTS wsi_slide_placement (
     cancer_study_id Int64, release_id String, patient_id Int64,
     image_id String, part_key String, block_key String,
@@ -70,16 +84,12 @@ INSERT_TABLES = (
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("input", type=Path, help="Canonical WSI association JSONL snapshot")
+    parser.add_argument("input", type=Path, help="Path to the study's meta_wsi.txt")
     parser.add_argument("--version", type=int, required=True)
     parser.add_argument("--url", default=os.getenv("CLICKHOUSE_URL", "http://localhost:8123"))
     parser.add_argument("--database", default=os.getenv("CLICKHOUSE_DATABASE", "cbioportal"))
     parser.add_argument("--user", default=os.getenv("CLICKHOUSE_USER", "default"))
     parser.add_argument("--password", default=os.getenv("CLICKHOUSE_PASSWORD", ""))
-    parser.add_argument("--resource-index", type=Path, default=(
-        Path(os.environ["WSI_RESOURCE_INDEX_FILE"])
-        if os.getenv("WSI_RESOURCE_INDEX_FILE") else None
-    ))
     return parser.parse_args()
 
 
@@ -127,29 +137,16 @@ def _coerce_bool(value: object, *, default: bool | None = None) -> bool | None:
     raise ValueError(f"invalid boolean value: {value!r}")
 
 
-def _read_snapshot(snapshot: Path) -> list[tuple[str, str, dict]]:
-    parsed: list[tuple[str, str, dict]] = []
-    seen: set[tuple[str, str]] = set()
-    with snapshot.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            try:
-                value = json.loads(line)
-                study_id, patient_id = value.get("study_id"), value.get("patient_id")
-                slides = value.get("slides")
-                if not isinstance(study_id, str) or not study_id.strip() or not isinstance(patient_id, str) or not patient_id.strip() or not isinstance(slides, list):
-                    raise ValueError("snapshot row needs non-empty string study_id, patient_id, and slides")
-                hierarchy = _hierarchy_from_canonical_rows(slides)
-                if (study_id, patient_id) in seen:
-                    raise ValueError(f"duplicate study_id/patient_id in snapshot: {study_id}/{patient_id}")
-                seen.add((study_id, patient_id))
-                parsed.append((study_id, patient_id, hierarchy))
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                raise ValueError(f"Invalid snapshot line {line_number}: {error}") from error
-    if not parsed:
-        raise ValueError("snapshot must contain at least one hierarchy row")
-    return parsed
+def _read_study(meta_path: Path) -> list[tuple[str, str, dict]]:
+    study_id, rows = read_wsi_study(meta_path)
+    by_patient: dict[str, list[dict]] = {}
+    for row in rows:
+        patient_id = str(row["patient_id"])
+        by_patient.setdefault(patient_id, []).append(row)
+    return [
+        (study_id, patient_id, _hierarchy_from_canonical_rows(patient_rows))
+        for patient_id, patient_rows in sorted(by_patient.items())
+    ]
 
 
 def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
@@ -174,11 +171,6 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
         can_serve_tiles = _coerce_bool(row.get("can_serve_tiles"))
         if can_serve_tiles is None:
             raise ValueError("canonical slide rows need a boolean can_serve_tiles")
-        slide_path = row.get("slide_path")
-        if can_serve_tiles and (
-            not isinstance(slide_path, str) or not slide_path.startswith("s3://")
-        ):
-            raise ValueError("tile-servable canonical slide rows need an s3:// slide_path")
         reference_sample = row.get("reference_sample_id")
         if reference_sample not in (None, "", "UNMATCHED"):
             reference_samples.add(str(reference_sample))
@@ -210,7 +202,8 @@ def _hierarchy_from_canonical_rows(rows: list[dict]) -> dict:
             for key in (
                 "image_id", "stain_name", "stain_group", "is_hne", "is_ihc",
                 "magnification", "file_size_bytes", "can_serve_tiles", "barcode", "slide_type",
-                "slide_path",
+                "slide_path", "tile_metadata", "tile_metadata_json", "thumbnail_url",
+                "thumbnail_width", "thumbnail_height", "thumbnail_content_type",
             )
         }
         slide["is_hne"] = _coerce_bool(slide.get("is_hne"), default=False)
@@ -318,9 +311,12 @@ def _resolve_identities(clickhouse: ClickHouse, parsed: list[tuple[str, str, dic
     return identities
 
 
-def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, str], dict], version: int, release_id: str) -> tuple[dict[str, list[dict]], dict[str, dict[str, dict[str, set[str]]]], set[int]]:
+def _normalize(
+    parsed: list[tuple[str, str, dict]],
+    identities: dict[tuple[str, str], dict],
+    release_id: str,
+) -> tuple[dict[str, list[dict]], set[int]]:
     tables = {table: [] for table in INSERT_TABLES}
-    resource_rows: list[tuple[str, str, dict]] = []
     studies: set[int] = set()
     for study_id, patient_id, hierarchy in parsed:
         identity = identities[(study_id, patient_id)]
@@ -399,6 +395,15 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                             raise ValueError(
                                 f"association sample does not match slide placement: {study_id}/{patient_id}/{image_id}"
                             )
+                        tile_metadata = slide.get("tile_metadata")
+                        tile_metadata_json = slide.get("tile_metadata_json")
+                        if tile_metadata_json in (None, "") and isinstance(tile_metadata, dict):
+                            tile_metadata_json = json.dumps(tile_metadata, separators=(",", ":"))
+                        thumbnail_url = slide.get("thumbnail_url")
+                        thumbnail_width = slide.get("thumbnail_width")
+                        thumbnail_height = slide.get("thumbnail_height")
+                        thumbnail_content_type = slide.get("thumbnail_content_type")
+                        can_serve_tiles = bool(slide.get("can_serve_tiles", False))
                         slide_row = {
                             "cancer_study_id": study_internal, "release_id": release_id,
                             "patient_id": patient_internal,
@@ -406,8 +411,18 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
                             "stain_group": slide.get("stain_group"), "is_hne": bool(slide.get("is_hne", False)),
                             "is_ihc": bool(slide.get("is_ihc", False)), "magnification": slide.get("magnification"),
                             "file_size_bytes": int(slide["file_size_bytes"]) if slide.get("file_size_bytes") not in (None, "") else None,
-                            "can_serve_tiles": bool(slide.get("can_serve_tiles", False)),
+                            "can_serve_tiles": can_serve_tiles,
                             "barcode": slide.get("barcode"), "slide_type": slide.get("slide_type"),
+                            "source_url": slide.get("slide_path") if can_serve_tiles else None,
+                            "tile_metadata_json": tile_metadata_json if can_serve_tiles else None,
+                            "thumbnail_url": thumbnail_url if can_serve_tiles else None,
+                            "thumbnail_width": int(thumbnail_width)
+                            if can_serve_tiles and isinstance(thumbnail_width, (int, float))
+                            else None,
+                            "thumbnail_height": int(thumbnail_height)
+                            if can_serve_tiles and isinstance(thumbnail_height, (int, float))
+                            else None,
+                            "thumbnail_content_type": thumbnail_content_type if can_serve_tiles else None,
                         }
                         if image_id in slides and slides[image_id] != slide_row:
                             raise ValueError(f"duplicate/conflicting slide: {study_id}/{patient_id}/{image_id}")
@@ -438,92 +453,7 @@ def _normalize(parsed: list[tuple[str, str, dict]], identities: dict[tuple[str, 
             raise ValueError(
                 f"slide association references unknown slide: {study_id}/{patient_id}/{sorted(unknown_associations)[0]}"
             )
-        resource_rows.append((study_id, patient_id, hierarchy))
-    return tables, _resource_index_rows(resource_rows), studies
-
-
-def _resource_index_rows(parsed: list[tuple[str, str, dict]]) -> dict[str, dict[str, object]]:
-    studies: dict[str, dict[str, object]] = {}
-    for study_id, patient_id, hierarchy in parsed:
-        resources = studies.setdefault(
-            study_id,
-            {"patients": set(), "samples": set(), "slides": {}},
-        )
-        resources["patients"].add(patient_id)  # type: ignore[union-attr]
-        reference_sample = hierarchy.get(
-            "reference_sample_id", hierarchy.get("referenceSampleId")
-        )
-        if reference_sample not in (None, "", "UNMATCHED"):
-            resources["samples"].add(str(reference_sample))  # type: ignore[union-attr]
-        for sample in hierarchy.get("samples", []):
-            if isinstance(sample, dict) and sample.get("sample_id") not in (None, "", "UNMATCHED"):
-                resources["samples"].add(str(sample["sample_id"]))  # type: ignore[union-attr]
-            for part in sample.get("parts", []) if isinstance(sample, dict) else []:
-                for block in part.get("blocks", []) if isinstance(part, dict) else []:
-                    for slide in block.get("slides", []) if isinstance(block, dict) else []:
-                        if slide.get("image_id") is not None:
-                            image_id = str(slide["image_id"])
-                            binding = {
-                                "patient_id": patient_id,
-                                "source_path": slide.get("slide_path"),
-                            }
-                            slides = resources["slides"]  # type: ignore[assignment]
-                            previous = slides.get(image_id)
-                            if previous is not None and previous != binding:
-                                raise ValueError(
-                                    f"conflicting slide binding: {study_id}/{image_id}"
-                                )
-                            slides[image_id] = binding
-    return studies
-
-
-def _read_resource_index(path: Path | None) -> dict | None:
-    if path is None or not path.exists():
-        return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or value.get("version") != 2:
-        raise ValueError("resource index must be a version 2 JSON object")
-    return value
-
-
-def _merge_resource_index(rows: dict[str, dict[str, object]], release_id: str, existing: dict | None) -> dict:
-    studies = {
-        str(study_id): {
-            resource_type: {str(value) for value in (resources.get(resource_type) or [])}
-            for resource_type in ("patients", "samples")
-        } | {
-            "slides": {
-                str(image_id): dict(binding)
-                for image_id, binding in (resources.get("slides") or {}).items()
-                if isinstance(binding, dict)
-            }
-        }
-        for study_id, resources in ((existing or {}).get("studies") or {}).items()
-        if isinstance(resources, dict)
-    }
-    studies.update(rows)
-    return {
-        "version": 2, "release_id": release_id,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "studies": {
-            study_id: {
-                resource_type: (
-                    sorted(values)
-                    if resource_type != "slides"
-                    else {key: values[key] for key in sorted(values)}
-                )
-                for resource_type, values in resources.items()
-            }
-            for study_id, resources in sorted(studies.items())
-        },
-    }
-
-
-def _publish_resource_index(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    return tables, studies
 
 
 def _insert_rows(clickhouse: ClickHouse, table: str, rows: list[dict]) -> None:
@@ -535,42 +465,36 @@ def _insert_rows(clickhouse: ClickHouse, table: str, rows: list[dict]) -> None:
     )
 
 
-def load(snapshot: Path, version: int, clickhouse: ClickHouse, resource_index_path: Path | None = None) -> tuple[int, set[str]]:
+def load(meta_path: Path, version: int, clickhouse: ClickHouse) -> tuple[int, set[str]]:
     if version < 1:
         raise ValueError("version must be positive")
-    parsed = _read_snapshot(snapshot)
+    parsed = _read_study(meta_path)
     release_id = _release_id()
     identities = _resolve_identities(clickhouse, parsed)
-    tables, resource_rows, study_internal_ids = _normalize(parsed, identities, version, release_id)
-    previous_index = _read_resource_index(resource_index_path)
-    index_payload = _merge_resource_index(resource_rows, release_id, previous_index) if resource_index_path else None
+    tables, study_internal_ids = _normalize(parsed, identities, release_id)
     for statement in TABLE_DDL.split(";"):
         if statement.strip():
             clickhouse.execute(statement)
     for table in INSERT_TABLES:
         _insert_rows(clickhouse, table, tables[table])
-    old_index_bytes = resource_index_path.read_bytes() if resource_index_path and resource_index_path.exists() else None
-    if resource_index_path and index_payload:
-        _publish_resource_index(resource_index_path, index_payload)
-    try:
-        _insert_rows(clickhouse, "wsi_release", [
-            {"cancer_study_id": study_id, "release_id": release_id, "release_version": version, "released_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
-            for study_id in sorted(study_internal_ids)
-        ])
-    except Exception:
-        if resource_index_path:
-            if old_index_bytes is None:
-                resource_index_path.unlink(missing_ok=True)
-            else:
-                resource_index_path.write_bytes(old_index_bytes)
-        raise
+    _insert_rows(clickhouse, "wsi_release", [
+        {"cancer_study_id": study_id, "release_id": release_id, "release_version": version, "released_at": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")}
+        for study_id in sorted(study_internal_ids)
+    ])
     return len(parsed), set(study for study, _, _ in parsed)
 
 
 def main() -> None:
     args = _args()
-    count, studies = load(args.input, args.version, ClickHouse(args.url, args.database, args.user, args.password), args.resource_index)
-    print(f"Published normalized ClickHouse WSI snapshot {args.version}: {count} patients across {len(studies)} studies")
+    count, studies = load(
+        args.input,
+        args.version,
+        ClickHouse(args.url, args.database, args.user, args.password),
+    )
+    print(
+        f"Published WSI study files version {args.version}: "
+        f"{count} patients across {len(studies)} studies"
+    )
 
 
 if __name__ == "__main__":

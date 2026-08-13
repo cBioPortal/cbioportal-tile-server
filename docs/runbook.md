@@ -1,316 +1,104 @@
 # cBioPortal WSI tile-server runbook
 
-This repository contains the standalone WSI tile service. It serves pathology
-slides and metadata to cBioPortal; it is not the cBioPortal frontend or the
-Spring backend. The Kubernetes deployment is currently named `slide-viewer`
-for compatibility, although the service implementation lives here.
+This service is a source-bound pixel reader. cBioPortal owns authentication,
+study authorization, hierarchy, and the slide access bundle. The tile server
+does not resolve image IDs, query Databricks, read a resource index, search,
+or expose clinical metadata.
 
 ## Source of truth
 
-Use these repositories together when changing WSI:
+- `../cbioportal` serves `/api/wsi/v2/hierarchy/{studyId}/{patientId}` and
+  `/api/wsi/v2/slides/{studyId}/{imageId}/access` from ClickHouse.
+- `../cbioportal-frontend` requests that access bundle and sends its exact
+  URLs plus the returned Bearer capability to this service.
+- The deployment repository owns ingress, probes, secrets, and rollout
+  resources.
 
-- `../cbioportal-frontend` obtains a study-scoped capability from
-  `/api/wsi/access-token?studyId=<study>` and sends it on WSI requests.
-- `../cbioportal` authenticates the user, checks study-read permission, and
-  issues the capability.
-- [`knowledgesystems/knowledgesystems-k8s-deployment`](https://github.com/knowledgesystems/knowledgesystems-k8s-deployment)
-  owns the production Kubernetes deployment, ingress, secrets wiring, and
-  smoke test.
-- `../cbioportal-docker-compose` provides the local nginx rehearsal.
+The backend access response is the only online input needed beyond the shared
+secret. It contains `sourceUrl`, `thumbnail.sourceUrl`, dimensions, intrinsic
+tile metadata, and a v2 token. The token binds both URLs by SHA-256.
 
-The production manifests are under:
+## Production topology
 
-```text
-argocd/aws/666628074417/clusters/cbioportal-prod/apps/slide-viewer/
-```
+The existing `/wsi` ingress may route to this service. Keep `/health` and
+`/ready` public for orchestration; all other routes require a Bearer token.
+Ingress and deployment configuration are authoritative for timeouts, network
+policy, worker count, and block-cache volumes.
 
-The isolated MSK triage rehearsal uses the parallel
-`slide-viewer-triage/` manifests and the `triage-beta.cbioportal.aws.mskcc.org`
-hostname; it does not share the production Service or PVC.
-
-Do not edit those manifests from this repository, and preserve any unrelated
-working-tree changes in that deployment repository.
-
-## Production endpoint and topology
-
-The current ingress is path-based:
+## Required environment
 
 ```text
-https://cbioportal.mskcc.org/wsi/...
+AWS_ENDPOINT_URL=<S3-compatible endpoint>
+AWS_ACCESS_KEY_ID=<object-store key>
+AWS_SECRET_ACCESS_KEY=<object-store secret>
+WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
+WSI_AUTH_AUDIENCE=cbioportal-wsi
+WSI_AUTH_MAX_TTL=300
+WSI_ALLOWED_SOURCE_SCHEMES=s3
+REDIS_URL=<password-protected Redis URL>
 ```
 
-It routes the `/wsi` prefix to the Kubernetes `slide-viewer` Service on port
-80, which forwards to container port 8080. The ingress has 300-second proxy
-timeouts, buffering disabled, a 1 MiB request limit, 100 requests/second per
-source limit with burst multiplier 5, and 50 concurrent connections per
-source.
+The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
+server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
+legacy configuration key but authentication is mandatory for pixel routes.
 
-There is no checked-in `slides.cbioportal.org` DNS record or ingress rule.
-Do not create or document that CNAME unless the infrastructure/DNS owner
-explicitly introduces it. The existing production route does not require a
-new CNAME.
+## Endpoints and smoke checks
 
-The coordinated 16 GiB rollout profile is one replica on
-`workload: cbioportal`, with 4 GiB memory requested, 16 GiB limited,
-and a 20 GiB `emptyDir` block cache. Liveness uses `/health`; readiness uses
-`/ready` so auth-enabled deployments stay out of rotation until the trusted
-resource index is available. The NetworkPolicy in the deployment repository
-permits ingress only from the `ingress-nginx` namespace.
+```bash
+curl -fsS https://cbioportal.example.org/wsi/health
+curl -fsS https://cbioportal.example.org/wsi/ready
+curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs
+```
 
-Apply this profile only after publishing an image that contains the readiness
-endpoint and mounting the loader-published trusted resource index. The
-deployment repository is authoritative for the currently applied image,
-resource limits, probes, and volumes.
+The final command must return `401` without `Authorization`. With a fresh
+bundle from cBioPortal, use the returned source URL and token:
 
-The deployed image is currently named `cbioportal/cbioportal-slide-viewer`
-with a CI/CD-managed tag. Keep that legacy image/release name aligned with the
-deployment repository; do not silently rename it when publishing this service.
+```bash
+curl -fsS \
+  -H "Authorization: Bearer ${WSI_TOKEN}" \
+  "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$WSI_SOURCE")"
+```
 
-## Production configuration
+Also verify that changing one character of the source URL returns `403`, that
+an expired token returns `401`, and that the thumbnail endpoint accepts only
+the artifact URL bound in the same token.
 
-The rollout ConfigMap should set:
+## Data preparation
+
+The offline association pipeline loads each WSI slide row with:
 
 ```text
-AWS_ENDPOINT_URL=http://pmindecs.mskcc.org:9020
-DATABRICKS_WAREHOUSE_ID=0b49b7d78734ad5c
-TILE_CACHE_TTL=86400
-THUMBNAIL_CACHE_TTL=86400
-METADATA_CACHE_TTL=86400
-MAX_DECODE_PIXELS=16777216
-THUMBNAIL_MAX_DECODE_PIXELS=16000000
-THUMBNAIL_TIMEOUT_SEC=8
-BLOCKCACHE_PATH=/cache/slide-blocks
-BLOCKCACHE_BLOCK_SIZE=8388608
-BLOCKCACHE_MAX_BYTES=19327352832
-BLOCKCACHE_PRUNE_INTERVAL_SECONDS=60
-REDIS_CONNECT_TIMEOUT_SECONDS=0.25
-REDIS_COMMAND_TIMEOUT_SECONDS=0.25
-REDIS_FAILURE_BACKOFF_SECONDS=5
-MAX_OPEN_SLIDES=8
-MAX_IMAGE_OPERATIONS=1
-N_WORKERS=4
-TILE_SIZE=256
-JPEG_QUALITY=85
-CORS_ORIGINS=https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org
+source_url, tile_metadata_json, thumbnail_url,
+thumbnail_width, thumbnail_height, thumbnail_content_type
 ```
 
-Credentials are supplied by the `slide-viewer-secrets` Secret:
-`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `DATABRICKS_HOST`,
-`DATABRICKS_TOKEN`, `REDIS_URL`, and `ANNOTATION_DATABASE_URL`. The tile
-server receives `WSI_AUTH_SECRET` from the `cbioportal-wsi-auth` Secret.
-The blue and green cBioPortal backend deployments are configured with the
-same secret and with audience `cbioportal-wsi` and a 300-second token TTL.
-`WSI_AUTH_REQUIRED` is `true`, `WSI_AUTH_MAX_TTL` is `300`, and
-`WSI_RESOURCE_INDEX_FILE` points to the loader-published trusted resource
-index in production. The secret and audience must match exactly, and the
-backend TTL must not exceed the tile-server maximum.
+The thumbnail generator writes the artifact and intrinsic metadata to the
+thumbnail registry. The loader publishes `can_serve_tiles=true` only when all
+fields are complete; otherwise the hierarchy reports the slide as unavailable.
+No registry or manifest is mounted into the online tile-server pod.
 
-The production values above are the memory-bound starting point for a
-16 GiB-limited pod. Decrease the memory limit only after collecting
-production telemetry with the bounded decode and concurrency settings above.
+## Response and cache policy
 
-Use a password-protected Redis URL in shared environments. Redis is a cache,
-not an authorization boundary. Keep it private and do not place WSI metadata
-or image responses behind a public/shared cache.
+- Tiles: `private, max-age=3600`, vary on `Authorization`.
+- Thumbnails: `private, max-age=300`, vary on `Authorization`.
+- Redis is an optimization, never an authorization boundary.
+- Overview decodes that exceed `MAX_DECODE_PIXELS` return HTTP 422 with
+  `overview_requires_preprocessing`.
 
-## Authentication contract
-
-The browser obtains a capability from the cBioPortal backend:
-
-```text
-GET /api/wsi/access-token?studyId=coad_msk_2025
-```
-
-The backend requires an authenticated user with read access to the requested
-study. Anonymous requests return `401`; a user without study access receives
-`403`. The token contains `sub`, `aud=cbioportal-wsi`, `scope=wsi:read`,
-`study_id`, `iat`, and `exp`.
-
-The frontend caches tokens per study and sends:
-
-```text
-Authorization: Bearer <token>
-```
-
-The tile server rejects WSI tokens whose lifetime exceeds 300 seconds and
-applies an in-process limit of 120 expensive requests per client per minute.
-Production ingress should apply distributed rate limits as well.
-
-The tile server validates the signature, algorithm, audience, scope, subject,
-authorization-contract version, issued-at time, expiry, and maximum lifetime.
-It then validates the token's `study_id` against the loader-published mapping
-for patient, sample, and slide resources used by protected endpoints. The
-cBioPortal backend owns patient hierarchy responses; the mapping covers slide metadata, thumbnails, tiles,
-warmup, restricted diagnostic slide metadata, and search. A client-supplied `studyId` query parameter is only a consistency
-check and cannot widen access. Patient hierarchy is not exposed through a
-tile-server fallback route. A missing mapping fails closed; it is not
-interpreted as “no slides”.
-The loader and tile server reject ambiguous patient, sample, or slide
-identifiers that are listed under more than one study, because the underlying
-metadata APIs are ID-addressed and cannot safely disambiguate such a resource.
-
-`/health` and `/ready` are public for Kubernetes probes. All other routes
-require a valid Bearer token when `WSI_AUTH_REQUIRED=true`.
+Application logs must not include tokens, source URLs, patient IDs, or slide
+IDs. Keep operation type, dimensions, status, timing, and exception class.
 
 ## Local integration
 
-The supported local rehearsal uses:
+The local cBioPortal compose rehearsal should pass the same
+`WSI_AUTH_SECRET`/audience to the backend and tile server. For mounted local
+slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`; production should
+remain `s3` only. Generate a v2 access bundle through the backend before
+testing a pixel request.
 
-| Component | Address | Responsibility |
-|---|---|---|
-| Frontend dev server | `http://localhost:3000` | Browser UI |
-| cBioPortal backend | `http://localhost:8090` | Login, authorization, token issuance |
-| Tile server | `http://localhost:8081` | Direct WSI API |
-| WSI nginx | `http://localhost:3001` | Same-origin browser entrypoint |
+## Thumbnail batch operations
 
-From `../cbioportal-docker-compose`:
-
-```bash
-docker compose \
-  -f docker-compose.yml \
-  -f addon/slide-viewer/docker-compose.slide-viewer.yml \
-  -f addon/wsi-nginx/docker-compose.wsi-nginx.yml \
-  up -d wsi-nginx
-```
-
-The compose slide-viewer overlay is a local rehearsal and contains legacy
-defaults. Verify authentication, secret names, Redis protection, and runtime
-environment before treating it as production-equivalent.
-
-## Health and smoke checks
-
-Local health checks:
-
-```bash
-curl -fsS http://localhost:8081/health
-curl -fsS http://localhost:8081/ready
-curl -fsS http://localhost:3001/wsi/health
-curl -fsS http://localhost:3001/wsi/ready
-```
-
-For production, run the deployment repository's smoke test from that
-repository's root. The scheduled check verifies readiness and unauthenticated
-rejection of a protected route:
-
-```bash
-export CBIOPORTAL_URL=https://cbioportal.mskcc.org
-tests/smoke/slide-viewer-routing.sh
-```
-
-The test requires `/wsi/ready` to return `200`, then requires an
-unauthenticated protected request to return `401` or `403`. Run a separate,
-fresh-token manual check before rollout if you need to verify an authenticated
-tile or thumbnail route end to end.
-Also verify anonymous token requests return `401`, unauthorized studies
-return `403`, tokens are cached per study, study-A tokens cannot access
-study-B resources, and metadata responses are not publicly cacheable.
-
-## Cache and response policy
-
-- Tiles: `private, max-age=3600`.
-- Thumbnails: `private, max-age=300`.
-- Slide metadata, diagnostic metadata, and search: `private, no-store`.
-- Thumbnails and metadata now use 24-hour Redis TTLs by default.
-- Avoid `TILE_CACHE_TTL=0` in production unless Redis capacity has been sized
-  explicitly for the resulting working set.
-
-Application logs must not contain patient IDs, slide IDs, search terms, S3 paths,
-or exception text that may contain those values. Keep only operation type,
-dimensions, status/reason, timing, and exception class. Review ingress and proxy
-access-log policies separately because they are owned by the deployment repository.
-
-## Thumbnail artifacts
-
-`GET /thumbnails/{slide_id}` normally serves a JPEG master from
-`THUMBNAIL_MANIFEST_URI` and downsizes it for smaller requests. If the manifest
-entry or artifact is missing, a bounded, process-isolated worker generates and
-stores the master on demand. The worker is capped by `MAX_IMAGE_OPERATIONS` and
-`THUMBNAIL_TIMEOUT_SEC`; timeout or failure returns a placeholder with
-`X-Thumbnail-Status: placeholder`.
-
-Run the batch generator on on-prem infrastructure as a separate Slurm array:
-
-```bash
-tools/run_thumbnail_pipeline_slurm.sh submit \
-  --manifest-uri s3://my-bucket/wsi-thumbnails/manifest.json \
-  --root-uri s3://my-bucket/wsi-thumbnails/masters \
-  --slides-per-task 2000 --concurrency 2
-
-# Retry only rows recorded as failed by a prior run.
-tools/run_thumbnail_pipeline_slurm.sh retry \
-  --manifest-uri s3://my-bucket/wsi-thumbnails/manifest.json \
-  --root-uri s3://my-bucket/wsi-thumbnails/masters \
-  --slides-per-task 2000 --concurrency 2
-```
-
-The batch path reads servable S3 paths from Databricks, stores publication state
-in `cdsi_prod.pathology_data_mining.slide_thumbnail_registry`, and keeps its
-temporary files, logs, and subprocess handoff data under the shared run
-directory rather than `/tmp`. Array workers write result files only; the
-dependent publisher performs serialized registry updates and publishes the
-manifest even when individual slides fail. Block cache is disabled for offline
-generation so one-time slide reads do not accumulate on GPFS. Successful
-publication removes candidate, result, temporary, and block-cache directories
-while retaining summaries and failure logs.
-
-## Overview decode guard
-
-Overview-tile requests remain memory-bounded. If a slide lacks a safe overview
-pyramid level, the server returns HTTP `422` with
-`{"error":"overview_requires_preprocessing"}` and logs the selected pyramid
-level, requested decode dimensions, requested pixel count, and decode limit.
-
-## ETL and study operations
-
-The nightly Databricks Asset Bundle is defined in `databricks.yml` and runs:
-
-1. `tools/wsi_canonical_associations_pipeline.sql`
-2. `tools/wsi_summary_pipeline.sql`
-
-The canonical association output is the loader's strict, normalized JSONL
-contract. Each row contains explicit part and block keys, slide and placement
-facts, an optional portal sample reference, and `slide_path` only for trusted
-index publication. It contains neither portal-owned clinical data nor a
-sequencing date. The loader resolves every study/patient/sample reference by
-its full tuple, validates the entire input before writing, rejects malformed
-keys and duplicate placements, assigns a unique release ID, and publishes the
-release row and version-2 study-to-patient/sample/slide index only after all
-rows are accepted:
-
-```bash
-python3 tools/load_clickhouse_hierarchy.py hierarchy.jsonl \
-  --version 20260723030000 \
-  --resource-index /var/lib/wsi/wsi-resource-index.json
-```
-
-Retrying a version creates a new release ID; the latest completed release
-points to that ID, so corrected rows win deterministically. A failed row or
-index publication leaves the previous release and trusted index active. The
-backend query uses the active release ID plus deterministic `argMax` keys,
-not `LIMIT 1`. This is a coordinated pre-release rebuild: recreate the
-canonical table, snapshot, ClickHouse WSI data, and trusted index before a
-private-study rollout.
-
-Preview migrations before writing:
-
-```bash
-bash tools/migrate_all_studies.sh --dry-run
-```
-
-For a real study update, review generated files in the private dataset
-repository before opening the study-data PR. Do not remove legacy resource
-files until replacement files and the reload plan are approved.
-
-## Validation and ownership
-
-Run tile-server tests with:
-
-```bash
-python3 -m pytest -q
-```
-
-Frontend WSI tests and local end-to-end study-access tests are defined in
-`../cbioportal-frontend`. Production rollout, image tags, Kubernetes changes,
-DNS/TLS, secret rotation, ingress policy, observability, rollback, and
-secret/index distribution remain owned outside this repository. Update this
-runbook when those sources of truth change.
+Run `tools/generate_slide_thumbnails.py` (usually through the Slurm wrapper)
+outside the API process. It writes immutable artifacts and registry rows; a
+successful batch must be followed by the ClickHouse hierarchy loader before a
+slide becomes servable.

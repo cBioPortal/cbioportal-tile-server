@@ -3,83 +3,48 @@ import json
 import pytest
 
 from tools.load_clickhouse_hierarchy import load
+from tools.wsi_study_format import write_wsi_study_files
 
 
-def hierarchy(*, sample_id="S-1", image_id="SLIDE-1", unmatched=False):
-    actual_sample = None if unmatched else sample_id
+def slide(*, sample_id="S-1", image_id="SLIDE-1", unmatched=False):
     return {
-        "samples": [
-            {
-                "sample_id": "UNMATCHED" if unmatched else sample_id,
-                "parts": [
-                    {
-                        "part_number": "1",
-                        "part_description": "specimen",
-                        "blocks": [
-                            {
-                                "block_number": "1",
-                                "slides": [{"image_id": image_id, "can_serve_tiles": True}],
-                            }
-                        ],
-                    }
-                ],
-            }
-        ],
-        "slide_associations": [
-            {
-                "image_id": image_id,
-                "sample_id": actual_sample,
-                "match_level": "UNMATCHED" if unmatched else "BLOCK",
-                "specimen_key": "block::1::1",
-            }
-        ],
+        "image_id": image_id,
+        "sample_id": None if unmatched else sample_id,
+        "part_key": "part:1",
+        "part_number": "1",
+        "part_description": "specimen",
+        "block_key": "block:1",
+        "block_number": "1",
+        "match_level": "UNMATCHED" if unmatched else "BLOCK",
+        "specimen_key": "block::1::1",
+        "can_serve_tiles": True,
     }
 
 
-def snapshot_file(tmp_path, rows):
-    path = tmp_path / "hierarchy.jsonl"
+def wsi_study_files(tmp_path, rows):
+    study_ids = {row["study_id"] for row in rows}
+    if len(study_ids) != 1:
+        raise ValueError("test fixture must contain exactly one study")
     canonical_rows = []
     for row in rows:
-        if "hierarchy" not in row:
-            canonical_rows.append(row)
-            continue
-        associations = row["hierarchy"].get("slide_associations", [])
-        slides = []
-        for sample in row["hierarchy"].get("samples", []):
-            sample_id = sample.get("sample_id")
-            sample_id = None if sample_id == "UNMATCHED" else sample_id
-            for part in sample.get("parts", []):
-                part_number = part.get("part_number")
-                for block in part.get("blocks", []):
-                    block_number = block.get("block_number")
-                    for slide in block.get("slides", []):
-                        matching = [
-                            association
-                            for association in associations
-                            if association.get("image_id") == slide.get("image_id")
-                        ]
-                        for association in matching:
-                            slides.append({
-                                **slide,
-                                "sample_id": sample_id,
-                                "part_key": f"part:{part_number}",
-                                "part_number": part_number,
-                                "block_key": f"block:{block_number}",
-                                "block_number": block_number,
-                                "match_level": association["match_level"],
-                                "specimen_key": association["specimen_key"],
-                                "slide_path": (
-                                    f"s3://test-bucket/{slide['image_id']}.svs"
-                                    if slide.get("can_serve_tiles") else None
-                                ),
-                            })
-        canonical_rows.append({
-            "study_id": row["study_id"],
-            "patient_id": row["patient_id"],
-            "slides": slides,
-        })
-    path.write_text("\n".join(json.dumps(row) for row in canonical_rows) + "\n")
-    return path
+        for slide_row in row["slides"]:
+            canonical = {
+                **slide_row,
+                "patient_id": row["patient_id"],
+                "is_hne": slide_row.get("is_hne", False),
+                "is_ihc": slide_row.get("is_ihc", False),
+            }
+            if slide_row.get("can_serve_tiles") in (True, "true", "TRUE"):
+                image_id = slide_row["image_id"]
+                canonical.setdefault("slide_path", f"s3://test-bucket/{image_id}.svs")
+                canonical.setdefault("tile_metadata_json", '{"width":1024,"height":768}')
+                canonical.setdefault("thumbnail_url", f"s3://test-bucket/{image_id}.jpg")
+                canonical.setdefault("thumbnail_width", 128)
+                canonical.setdefault("thumbnail_height", 96)
+                canonical.setdefault("thumbnail_content_type", "image/jpeg")
+            canonical_rows.append(canonical)
+    meta_path, _ = write_wsi_study_files(tmp_path, study_ids.pop(), canonical_rows)
+    return meta_path
 
 
 class RecordingClickHouse:
@@ -99,7 +64,10 @@ class RecordingClickHouse:
 
 
 def test_unknown_portal_reference_is_rejected_before_any_database_write(tmp_path):
-    snapshot = snapshot_file(tmp_path, [{"study_id": "unknown", "patient_id": "P-1", "hierarchy": hierarchy()}])
+    snapshot = wsi_study_files(
+        tmp_path,
+        [{"study_id": "unknown", "patient_id": "P-1", "slides": [slide()]}],
+    )
     clickhouse = RecordingClickHouse(identities=[])
 
     with pytest.raises(ValueError, match="unknown cBioPortal study/patient"):
@@ -109,7 +77,7 @@ def test_unknown_portal_reference_is_rejected_before_any_database_write(tmp_path
 
 
 def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -145,7 +113,7 @@ def test_flat_canonical_rows_are_normalized_without_a_hierarchy_blob(tmp_path):
 
 
 def test_flat_canonical_rows_coerce_databricks_boolean_strings(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -182,7 +150,7 @@ def test_flat_canonical_rows_coerce_databricks_boolean_strings(tmp_path):
 
 
 def test_flat_canonical_rows_keep_slides_when_part_metadata_differs(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -238,7 +206,7 @@ def test_flat_canonical_rows_keep_slides_when_part_metadata_differs(tmp_path):
 
 
 def test_canonical_rows_preserve_multiple_parts_blocks_and_slide_bindings(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -282,9 +250,7 @@ def test_canonical_rows_preserve_multiple_parts_blocks_and_slide_bindings(tmp_pa
         }],
     )
     clickhouse = RecordingClickHouse()
-    resource_index = tmp_path / "resource-index.json"
-
-    load(snapshot, 7, clickhouse, resource_index)
+    load(snapshot, 7, clickhouse)
 
     parts = [
         json.loads(line)
@@ -310,15 +276,9 @@ def test_canonical_rows_preserve_multiple_parts_blocks_and_slide_bindings(tmp_pa
         ("part:2", "block:B"),
     }
     assert {row["procedure_date_days"] for row in placements} == {4, 9}
-    index = json.loads(resource_index.read_text())
-    assert index["studies"]["study"]["slides"]["SLIDE-2"] == {
-        "patient_id": "P-1",
-        "source_path": "s3://test-bucket/SLIDE-2.svs",
-    }
-
 
 def test_malformed_canonical_row_is_rejected_before_database_writes(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -335,29 +295,14 @@ def test_malformed_canonical_row_is_rejected_before_database_writes(tmp_path):
     )
     clickhouse = RecordingClickHouse()
 
-    with pytest.raises(ValueError, match="part_key"):
+    with pytest.raises(ValueError, match="PART_KEY"):
         load(snapshot, 7, clickhouse)
 
     assert clickhouse.calls == []
 
 
-def test_legacy_hierarchy_wrapper_is_rejected_before_database_writes(tmp_path):
-    path = tmp_path / "hierarchy.jsonl"
-    path.write_text(json.dumps({
-        "study_id": "study",
-        "patient_id": "P-1",
-        "hierarchy": hierarchy(),
-    }) + "\n")
-    clickhouse = RecordingClickHouse()
-
-    with pytest.raises(ValueError, match="slides"):
-        load(path, 7, clickhouse)
-
-    assert clickhouse.calls == []
-
-
 def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
         [{
             "study_id": "study",
@@ -387,9 +332,9 @@ def test_reference_sample_without_a_pathology_slide_is_resolved(tmp_path):
 
 
 def test_sample_resolution_ignores_same_stable_id_in_another_study(tmp_path):
-    snapshot = snapshot_file(
+    snapshot = wsi_study_files(
         tmp_path,
-        [{"study_id": "study-a", "patient_id": "P-1", "hierarchy": hierarchy()}],
+        [{"study_id": "study-a", "patient_id": "P-1", "slides": [slide()]}],
     )
     clickhouse = RecordingClickHouse(
         identities=[
@@ -417,61 +362,26 @@ def test_sample_resolution_ignores_same_stable_id_in_another_study(tmp_path):
     assert json.loads(placement.decode().splitlines()[0])["sample_id"] == 700
 
 
-def test_resource_index_allows_duplicate_ids_across_studies(tmp_path):
-    snapshot = snapshot_file(
+def test_duplicate_image_is_rejected_before_any_database_write(tmp_path):
+    snapshot = wsi_study_files(
         tmp_path,
         [
-            {"study_id": "study-a", "patient_id": "same-patient", "hierarchy": hierarchy(sample_id="same-sample", image_id="same-slide")},
-            {"study_id": "study-b", "patient_id": "same-patient", "hierarchy": hierarchy(sample_id="same-sample", image_id="same-slide")},
-        ],
-    )
-    clickhouse = RecordingClickHouse(
-        identities=[
-            {"study_id": "study-a", "study_internal_id": 7, "patient_id": "same-patient", "patient_internal_id": 70},
-            {"study_id": "study-b", "study_internal_id": 8, "patient_id": "same-patient", "patient_internal_id": 80},
-        ],
-        samples=[
-            {"study_id": "study-a", "patient_id": "same-patient", "sample_id": "same-sample", "sample_internal_id": 700},
-            {"study_id": "study-b", "patient_id": "same-patient", "sample_id": "same-sample", "sample_internal_id": 800},
-        ],
-    )
-    resource_index = tmp_path / "resource-index.json"
-
-    load(snapshot, 7, clickhouse, resource_index)
-
-    payload = json.loads(resource_index.read_text())
-    assert payload["version"] == 2
-    assert payload["studies"]["study-a"]["slides"] == {
-        "same-slide": {
-            "patient_id": "same-patient",
-            "source_path": "s3://test-bucket/same-slide.svs",
-        }
-    }
-    assert payload["studies"]["study-b"]["slides"] == {
-        "same-slide": {
-            "patient_id": "same-patient",
-            "source_path": "s3://test-bucket/same-slide.svs",
-        }
-    }
-
-
-def test_duplicate_patient_is_rejected_before_any_database_write(tmp_path):
-    snapshot = snapshot_file(
-        tmp_path,
-        [
-            {"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy()},
-            {"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy(image_id="SLIDE-2")},
+            {"study_id": "study", "patient_id": "P-1", "slides": [slide()]},
+            {"study_id": "study", "patient_id": "P-2", "slides": [slide()]},
         ],
     )
     clickhouse = RecordingClickHouse()
 
-    with pytest.raises(ValueError, match="duplicate study_id/patient_id"):
+    with pytest.raises(ValueError, match="duplicate IMAGE_ID"):
         load(snapshot, 7, clickhouse)
     assert clickhouse.calls == []
 
 
 def test_unmatched_slide_is_persisted_with_null_sample_and_no_sentinel(tmp_path):
-    snapshot = snapshot_file(tmp_path, [{"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy(unmatched=True)}])
+    snapshot = wsi_study_files(
+        tmp_path,
+        [{"study_id": "study", "patient_id": "P-1", "slides": [slide(unmatched=True)]}],
+    )
     clickhouse = RecordingClickHouse()
 
     load(snapshot, 7, clickhouse)
@@ -482,23 +392,13 @@ def test_unmatched_slide_is_persisted_with_null_sample_and_no_sentinel(tmp_path)
     assert not any('"sample_id": "UNMATCHED"' in (body or b"").decode() for _, body in clickhouse.calls if body)
 
 
-def test_duplicate_slide_association_is_rejected_before_writes(tmp_path):
-    value = hierarchy()
-    value["slide_associations"].append(value["slide_associations"][0].copy())
-    snapshot = snapshot_file(tmp_path, [{"study_id": "study", "patient_id": "P-1", "hierarchy": value}])
-    clickhouse = RecordingClickHouse()
-
-    with pytest.raises(ValueError, match="duplicate slide association"):
-        load(snapshot, 7, clickhouse)
-    assert clickhouse.calls == []
-
-
 def test_retry_uses_a_new_release_and_normalized_tables(tmp_path):
-    snapshot = snapshot_file(tmp_path, [{"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy()}])
+    snapshot = wsi_study_files(
+        tmp_path,
+        [{"study_id": "study", "patient_id": "P-1", "slides": [slide()]}],
+    )
     clickhouse = RecordingClickHouse()
-    resource_index = tmp_path / "resource-index.json"
-
-    count, studies = load(snapshot, 7, clickhouse, resource_index)
+    count, studies = load(snapshot, 7, clickhouse)
     assert count == 1
     assert studies == {"study"}
     first_manifest = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release")][-1]
@@ -506,20 +406,7 @@ def test_retry_uses_a_new_release_and_normalized_tables(tmp_path):
     assert any(query.startswith("INSERT INTO wsi_slide FORMAT") for query, _ in clickhouse.calls)
     assert not any("hierarchy_json" in (body or b"").decode() for _, body in clickhouse.calls)
 
-    load(snapshot, 7, clickhouse, resource_index)
+    load(snapshot, 7, clickhouse)
     manifests = [body for query, body in clickhouse.calls if query.startswith("INSERT INTO wsi_release")]
     second_release = json.loads(manifests[-1].decode().splitlines()[0])["release_id"]
     assert second_release != first_release
-    assert json.loads(resource_index.read_text())["studies"]["study"]["samples"] == ["S-1"]
-
-
-def test_failed_release_restores_previous_resource_index(tmp_path):
-    snapshot = snapshot_file(tmp_path, [{"study_id": "study", "patient_id": "P-1", "hierarchy": hierarchy()}])
-    resource_index = tmp_path / "resource-index.json"
-    load(snapshot, 7, RecordingClickHouse(), resource_index)
-    previous_index = resource_index.read_text()
-
-    failing = RecordingClickHouse(fail_on="INSERT INTO wsi_release")
-    with pytest.raises(RuntimeError, match="simulated"):
-        load(snapshot, 8, failing, resource_index)
-    assert resource_index.read_text() == previous_index

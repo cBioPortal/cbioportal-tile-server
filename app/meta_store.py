@@ -7,6 +7,7 @@ from typing import Any
 from urllib.request import Request, urlopen
 
 from .constants import (
+    CANONICAL_ASSOCIATION_TABLE as _CANONICAL_ASSOCIATIONS,
     CLEANED_SLIDE_TABLE as _CLEANED_TABLE,
     DEID_TABLE as _TABLE,
     INVENTORY_TABLE as _INVENTORY,
@@ -153,6 +154,13 @@ ORDER BY sample_id
 LIMIT 8
 """
 
+PATIENT_ASSOCIATION_SQL = f"""
+SELECT *
+FROM {_CANONICAL_ASSOCIATIONS}
+WHERE patient_id = :patient_id
+ORDER BY image_id
+"""
+
 def param(name: str, value: str, ptype: str = "STRING"):
     from databricks.sdk.service.sql import StatementParameterListItem  # noqa: PLC0415
 
@@ -286,6 +294,16 @@ def run_statement(sql: str, warehouse_id: str, params: list | None = None) -> No
 
 def get_patient_rows(patient_id: str, warehouse_id: str) -> list[dict[str, Any]]:
     return run_query(PATIENT_SQL, warehouse_id, [param("patient_id", patient_id)])
+
+
+def get_patient_association_rows(
+    patient_id: str, warehouse_id: str
+) -> list[dict[str, Any]]:
+    return run_query_external(
+        PATIENT_ASSOCIATION_SQL,
+        warehouse_id,
+        [param("patient_id", patient_id)],
+    )
 
 
 def get_slide_row(image_id: str, warehouse_id: str) -> dict[str, Any] | None:

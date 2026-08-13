@@ -59,6 +59,25 @@ inventory_paths AS (
     ) ranked
     WHERE row_num = 1
 ),
+thumbnail_registry AS (
+    SELECT image_id, artifact_uri, width, height, content_type, tile_metadata_json
+    FROM (
+        SELECT
+            CAST(image_id AS STRING) AS image_id,
+            artifact_uri,
+            width,
+            height,
+            content_type,
+            tile_metadata_json,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(image_id AS STRING)
+                ORDER BY rendered_at DESC, manifest_version DESC
+            ) AS row_num
+        FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry
+        WHERE status = 'success'
+    ) ranked_thumbnails
+    WHERE row_num = 1
+),
 sample_patient_pairs AS (
     SELECT DISTINCT PATIENT_ID AS patient_id, sample_id, mrn
     FROM cdsi_eng_phi.pdm_base_tables_dev.impact_block_matched_slides_v1
@@ -312,7 +331,18 @@ SELECT
     CASE WHEN LOWER(association.stain_group) = 'ihc' THEN TRUE ELSE FALSE END AS is_ihc,
     association.magnification,
     association.file_size_bytes,
-    CASE WHEN association.slide_path LIKE 's3://%' THEN TRUE ELSE FALSE END AS can_serve_tiles,
+    CASE
+        WHEN association.slide_path LIKE 's3://%'
+         AND thumbnail_registry.artifact_uri IS NOT NULL
+         AND thumbnail_registry.tile_metadata_json IS NOT NULL
+         AND TRIM(thumbnail_registry.tile_metadata_json) <> ''
+         AND thumbnail_registry.width > 0
+         AND thumbnail_registry.height > 0
+         AND thumbnail_registry.content_type IS NOT NULL
+         AND TRIM(thumbnail_registry.content_type) <> ''
+        THEN TRUE
+        ELSE FALSE
+    END AS can_serve_tiles,
     association.barcode,
     association.slide_type,
     CONCAT(LOWER(association.match_level), '::', association.part_key, '::', association.block_key) AS specimen_key,
@@ -322,6 +352,27 @@ SELECT
             THEN 'Procedure date relative to tumor sequencing'
         ELSE NULL
     END AS timepoint_source,
-    association.slide_path
+    association.slide_path,
+    CASE
+        WHEN association.slide_path LIKE 's3://%'
+         AND thumbnail_registry.artifact_uri IS NOT NULL
+         AND thumbnail_registry.tile_metadata_json IS NOT NULL
+         AND TRIM(thumbnail_registry.tile_metadata_json) <> ''
+        THEN thumbnail_registry.tile_metadata_json
+        ELSE NULL
+    END AS tile_metadata_json,
+    CASE
+        WHEN association.slide_path LIKE 's3://%'
+         AND thumbnail_registry.artifact_uri IS NOT NULL
+         AND thumbnail_registry.tile_metadata_json IS NOT NULL
+         AND TRIM(thumbnail_registry.tile_metadata_json) <> ''
+        THEN thumbnail_registry.artifact_uri
+        ELSE NULL
+    END AS thumbnail_url,
+    thumbnail_registry.width AS thumbnail_width,
+    thumbnail_registry.height AS thumbnail_height,
+    thumbnail_registry.content_type AS thumbnail_content_type
 FROM canonical_associations association
-LEFT JOIN patient_reference reference ON reference.patient_id = association.patient_id;
+LEFT JOIN patient_reference reference ON reference.patient_id = association.patient_id
+LEFT JOIN thumbnail_registry
+    ON thumbnail_registry.image_id = CAST(association.image_id AS STRING);

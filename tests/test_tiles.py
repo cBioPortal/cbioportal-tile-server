@@ -1,4 +1,4 @@
-"""Tests for tile coordinate math and slide metadata extraction (app/tiles.py)."""
+"""Tests for tile coordinate math and safe pixel/thumbnail rendering."""
 
 import math
 from unittest.mock import MagicMock
@@ -11,13 +11,11 @@ from app.tiles import (
     OverviewTooLarge,
     TILE_SIZE,
     _resize_and_pad,
-    _slide_properties_metadata,
     _tile_geometry,
     get_tile_bytes,
     get_thumbnail_bytes,
     get_thumbnail_bytes_with_plan,
     max_zoom,
-    slide_metadata,
 )
 from tests.conftest import make_mock_slide
 
@@ -37,57 +35,6 @@ class TestMaxZoom:
     def test_tall_slide_uses_larger_dimension(self):
         slide = make_mock_slide(512, 4096)
         assert max_zoom(slide) == math.ceil(math.log2(4096 / TILE_SIZE))
-
-
-class TestSlideMetadata:
-    def test_slide_properties_helper_parses_values(self):
-        slide = make_mock_slide()
-        assert _slide_properties_metadata(slide) == (
-            pytest.approx(0.5034),
-            pytest.approx(0.5034),
-            "aperio",
-            20,
-        )
-
-    def test_tiffslide_namespace_parsed(self):
-        meta = slide_metadata(make_mock_slide())
-        assert meta["mpp"]["x"]       == pytest.approx(0.5034)
-        assert meta["mpp"]["y"]       == pytest.approx(0.5034)
-        assert meta["vendor"]         == "aperio"
-        assert meta["objective_power"] == 20
-
-    def test_openslide_fallback(self):
-        slide = make_mock_slide()
-        slide.properties = {
-            "openslide.mpp-x":          "0.25",
-            "openslide.mpp-y":          "0.25",
-            "openslide.vendor":         "leica",
-            "openslide.objective-power": "40",
-        }
-        meta = slide_metadata(slide)
-        assert meta["mpp"]["x"]        == pytest.approx(0.25)
-        assert meta["vendor"]          == "leica"
-        assert meta["objective_power"] == 40
-
-    def test_missing_properties_returns_defaults(self):
-        slide = make_mock_slide()
-        slide.properties = {}
-        meta = slide_metadata(slide)
-        assert meta["mpp"]["x"]       == 0.0
-        assert meta["vendor"]         == ""
-        assert meta["objective_power"] is None
-
-    def test_structure_keys_present(self):
-        meta = slide_metadata(make_mock_slide(2048, 1024))
-        for key in ("dimensions", "levels", "max_zoom", "tile_size",
-                    "mpp", "vendor", "objective_power",
-                    "level_dimensions", "level_downsamples"):
-            assert key in meta
-
-    def test_dimensions_correct(self):
-        meta = slide_metadata(make_mock_slide(2048, 1536))
-        assert meta["dimensions"]["width"]  == 2048
-        assert meta["dimensions"]["height"] == 1536
 
 
 class TestTileHelpers:

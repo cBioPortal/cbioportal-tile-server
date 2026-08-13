@@ -37,7 +37,7 @@ STUDIES=(
   bladder_msk_2025
   bone_msk_2025
   breast_msk_2025
-  coad_msk_2025
+  msk_spectrum_tme_2022
   esca_msk_2025
   gist_msk_2025
   hnsc_msk_2025

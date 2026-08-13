@@ -25,8 +25,8 @@ resources:
       name: "[${bundle.target}] WSI Summary Pipeline"
       description: >
         Nightly job that first materializes the canonical patient/sample/slide
-        association universe and then derives the legacy sample summary table
-        from that shared snapshot for compatibility consumers.
+        association universe and then derives the sample summary table used by
+        cBioPortal ingestion and access APIs.
 
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"

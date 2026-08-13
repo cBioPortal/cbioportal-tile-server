@@ -1,14 +1,14 @@
 """
 Redis tile cache.
 
-Keys:  tile:{slide_id}:{z}:{x}:{y}
+Keys:  tile:{source_digest}:{z}:{x}:{y}
 Value: raw JPEG bytes
 
 Tiles are immutable so tile TTL is configured separately. A thumbnail cache
-uses the key thumbnail:{slide_id}:{width}:{height}.
+uses the key thumbnail:{source_digest}:{width}:{height}.
 
-Patient hierarchy is owned by the cBioPortal backend. This cache is limited to
-slide tiles, thumbnails, slide metadata, and short-lived search results.
+Patient hierarchy and all clinical metadata are owned by the cBioPortal
+backend. This cache is limited to source-bound slide tiles and thumbnails.
 """
 
 import json

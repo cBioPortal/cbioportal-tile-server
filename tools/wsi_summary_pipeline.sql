@@ -14,6 +14,7 @@ WITH canonical_rows AS (
         patient_id,
         image_id,
         slide_path,
+        can_serve_tiles,
         stain_group,
         stain_name
     FROM cdsi_prod.pathology_data_mining.canonical_slide_associations
@@ -27,7 +28,7 @@ sample_summary AS (
         MAX(updated_at) AS updated_at,
         COUNT(
             DISTINCT CASE
-                WHEN slide_path LIKE 's3://%'
+                WHEN can_serve_tiles
                  AND (
                     LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
                     OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
@@ -54,7 +55,7 @@ sample_summary AS (
         ) AS non_servable_ihc_slide_count,
         MAX(
             CASE
-                WHEN slide_path LIKE 's3://%'
+                WHEN can_serve_tiles
                  AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
                 THEN 1
                 ELSE 0
@@ -62,7 +63,7 @@ sample_summary AS (
         ) AS has_hne,
         MAX(
             CASE
-                WHEN slide_path LIKE 's3://%'
+                WHEN can_serve_tiles
                  AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
                 THEN 1
                 ELSE 0
@@ -72,7 +73,7 @@ sample_summary AS (
             ARRAY_SORT(
                 COLLECT_SET(
                     CASE
-                        WHEN slide_path LIKE 's3://%'
+                        WHEN can_serve_tiles
                          AND (
                             LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
                             OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'

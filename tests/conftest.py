@@ -7,12 +7,6 @@ import pytest
 from PIL import Image
 
 from app.tiles import TILE_SIZE
-from app.config import settings
-
-
-@pytest.fixture(autouse=True)
-def wsi_auth_for_tests(monkeypatch):
-    monkeypatch.setattr(settings, "wsi_auth_required", False)
 
 
 def make_mock_slide(width: int = 1024, height: int = 1024, levels: int = 3) -> MagicMock:

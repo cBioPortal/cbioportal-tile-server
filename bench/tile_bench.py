@@ -4,7 +4,7 @@
 Example:
   python bench/tile_bench.py \
     --base-url http://localhost:3001/wsi \
-    --study-id coad_msk_2025 \
+    --study-id msk_spectrum_tme_2022 \
     --slide-id 2908638 --slide-id 4186363 \
     --bearer-token "$WSI_BENCH_TOKEN" \
     --requests 1000 --concurrency 20 --warmup 100 \

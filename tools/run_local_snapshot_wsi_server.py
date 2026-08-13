@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local WSI tile server against the trusted resource index."""
+"""Run the source-bound local WSI pixel service."""
 
 from __future__ import annotations
 

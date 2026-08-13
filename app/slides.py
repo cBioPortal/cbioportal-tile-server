@@ -32,10 +32,10 @@ T = TypeVar("T")
 
 def _resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     """
-    Return (bucket, key, s3_opts) for a slide_id.
+    Return (bucket, key, s3_opts) for a source URL.
 
-    slide_id must be a full s3:// URI as stored in the Databricks inventory table,
-    e.g. "s3://mskmind-bkt/reef-slides/3735444.svs".
+    The URL is supplied by cBioPortal, e.g.
+    "s3://mskmind-bkt/reef-slides/3735444.svs".
     """
     if not slide_id.startswith("s3://"):
         raise FileNotFoundError(f"Slide not found: {slide_id!r} (expected s3:// URI)")
