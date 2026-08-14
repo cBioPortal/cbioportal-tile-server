@@ -4,6 +4,12 @@ The source-bound v2 contract supersedes the image-ID routes described below.
 New deployments use `/thumbnails?source=...` with a cBioPortal slide access
 capability; this file is retained only as historical context.
 
+> **Production policy:** this is a historical design document. The current
+> production path is a separately scheduled batch that writes thumbnail
+> artifacts and `slide_thumbnail_registry` before the Databricks canonical
+> refresh. The frontend is read-only, and the on-demand worker described below
+> is not the production publication mechanism.
+
 ## Objective
 
 Replace live thumbnail generation with a predictable artifact-serving path that
@@ -30,8 +36,8 @@ latency. That is the wrong runtime profile for a high-fanout navigator image.
 
 Serving pre-rendered artifacts is simpler operationally:
 
-- normal thumbnail requests no longer open WSI files; missing artifacts use a
-  short-lived, capped worker instead
+- normal production thumbnail requests do not generate or publish artifacts;
+  missing artifacts are a data-preparation failure to be remediated offline
 - thumbnail latency is bounded by object-store fetch plus optional resize
 - slides that need preprocessing are handled offline once, not per request
 - the API contract is explicit instead of relying on hidden fallback behavior
@@ -87,7 +93,12 @@ The default operational shape is 2,000 slides per task, at most 480 array
 tasks, two concurrent tasks, and a 600-second timeout per slide. Use an
 explicit retry run for rows whose registry status is `failed`.
 
-### 4. Runtime serving rules
+### 4. Runtime serving rules (historical proposal only)
+
+The following rules describe the superseded design and are not the current
+production contract. Current production treats a missing artifact as an
+offline data-preparation failure and does not generate or publish it from the
+request path.
 
 For `GET /thumbnails/{slide_id}`:
 
@@ -125,7 +136,7 @@ offline.
 2. missing manifest entry returns placeholder JPEG
 3. legacy `/tiles/{slide_id}/thumbnail` path is absent
 
-## Success criteria
+## Success criteria (historical)
 
 The rollout is successful when:
 
