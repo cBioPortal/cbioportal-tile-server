@@ -128,6 +128,12 @@ app = FastAPI(
 async def require_wsi_capability(request: Request, call_next):
     if request.scope["path"] in ("/health", "/ready"):
         return await call_next(request)
+    # Browser clients send an unauthenticated OPTIONS request before any
+    # cross-origin request that includes the Authorization header.  CORS
+    # normally handles this outside the application stack, but keep the
+    # capability guard safe if middleware ordering changes.
+    if request.method == "OPTIONS":
+        return await call_next(request)
     authorization = request.headers.get("authorization", "")
     if not authorization.startswith("Bearer "):
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
