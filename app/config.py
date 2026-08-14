@@ -56,10 +56,12 @@ class Settings:
     # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
+    # Deprecated compatibility setting. Pixel routes always require a v2
+    # capability; this value is intentionally ignored by app.main.
     wsi_auth_required: bool = field(default_factory=lambda: _env_bool("WSI_AUTH_REQUIRED", True))
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
-    wsi_resource_index_file: str = field(
-        default_factory=lambda: _env_str("WSI_RESOURCE_INDEX_FILE")
+    wsi_allowed_source_schemes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )
 
     # S3 / Dell ECS connection
@@ -109,16 +111,19 @@ class Settings:
     )
     tile_cache_ttl: int = field(default_factory=lambda: _env_int("TILE_CACHE_TTL", 86_400))
     thumbnail_cache_ttl: int = field(default_factory=lambda: _env_int("THUMBNAIL_CACHE_TTL", 86_400))
+    # Deprecated cache setting retained for offline/legacy imports; runtime
+    # endpoints never cache clinical or slide metadata.
     metadata_cache_ttl: int = field(default_factory=lambda: _env_int("METADATA_CACHE_TTL", 86_400))
 
     # Slide cache / workers
     max_open_slides: int = field(default_factory=lambda: _env_int("MAX_OPEN_SLIDES", 64))
     n_workers: int = field(default_factory=lambda: _env_int("N_WORKERS", 4))
     max_image_operations: int = field(default_factory=lambda: _env_int("MAX_IMAGE_OPERATIONS", 2))
+    # Deprecated compatibility setting retained for offline callers.
     path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
     rate_limit_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 120))
 
-    # Databricks SQL
+    # Offline preparation tooling only (never read by the FastAPI runtime).
     databricks_warehouse_id: str = field(
         default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
     )

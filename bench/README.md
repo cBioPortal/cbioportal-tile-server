@@ -17,7 +17,7 @@ Example:
 ```bash
 python bench/tile_bench.py \
   --base-url http://localhost:3001/wsi \
-  --study-id coad_msk_2025 \
+  --study-id msk_spectrum_tme_2022 \
   --slide-id 2908638 --slide-id 4186363 \
   --bearer-token "$WSI_BENCH_TOKEN" \
   --requests 1000 --concurrency 20 --warmup 100 \
@@ -34,7 +34,7 @@ For distributed load generation or HTML reports, use the equivalent headless JMe
 ```bash
 jmeter -n -t bench/tile-benchmark.jmx \
   -JBASE_URL=http://pllimsksparky3:3001/wsi \
-  -JSTUDY_ID=coad_msk_2025 -JSLIDE_IDS=2908638,4186363 \
+  -JSTUDY_ID=msk_spectrum_tme_2022 -JSLIDE_IDS=3020691,3020726 \
   -JBEARER_TOKEN="$WSI_BENCH_TOKEN" -JMAX_ZOOM=9 -JTILE_GRID=8 \
   -Jusers=20 -Jramp_seconds=20 -Jduration_seconds=60 \
   -l results/jmeter-warm.jtl -e -o results/jmeter-warm-report

@@ -15,7 +15,7 @@ Outputs written to --study-dir:
 
 Usage:
   python tools/generate_resource_patient.py \\
-      --study-dir /path/to/private/automation_tool_datasets/coad_msk_2025 \\
+      --study-dir /path/to/public/automation_tool_datasets/msk_spectrum_tme_2022 \\
       --base-url https://slides.cbioportal.org
 
 Credentials:

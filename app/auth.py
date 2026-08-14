@@ -11,6 +11,11 @@ class InvalidWsiToken(ValueError):
     """Raised when a WSI capability cannot be trusted."""
 
 
+def source_digest(source: str) -> str:
+    """Hash the exact source URL representation signed by cBioPortal."""
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
 def _b64decode(value: str) -> bytes:
     try:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
@@ -18,13 +23,17 @@ def _b64decode(value: str) -> bytes:
         raise InvalidWsiToken("invalid token encoding") from exc
 
 
+def validate_wsi_auth_configuration(secret: str, audience: str, max_ttl: int) -> None:
+    if not secret or len(secret.encode()) < 32:
+        raise InvalidWsiToken("WSI authentication is not configured")
+    if not audience or not audience.strip() or not 1 <= max_ttl <= 300:
+        raise InvalidWsiToken("WSI authentication is not configured")
+
+
 def validate_wsi_token(
     token: str, secret: str, audience: str, max_ttl: int = 300
 ) -> dict:
-    if not secret or len(secret.encode()) < 32:
-        raise InvalidWsiToken("WSI authentication is not configured")
-    if not audience or not audience.strip() or max_ttl < 1:
-        raise InvalidWsiToken("WSI authentication is not configured")
+    validate_wsi_auth_configuration(secret, audience, max_ttl)
 
     parts = token.split(".")
     if len(parts) != 3:
@@ -57,8 +66,18 @@ def validate_wsi_token(
         raise InvalidWsiToken("invalid token subject")
     if not isinstance(payload.get("study_id"), str) or not payload["study_id"].strip():
         raise InvalidWsiToken("invalid token study")
-    if type(payload.get("wsi_auth_version")) is not int or payload["wsi_auth_version"] != 1:
+    if payload.get("wsi_auth_version") != 2:
         raise InvalidWsiToken("unsupported WSI authorization contract")
+    if not isinstance(payload.get("image_id"), str) or not payload["image_id"].strip():
+        raise InvalidWsiToken("invalid token image")
+    for claim in ("tile_source_sha256", "thumbnail_source_sha256"):
+        value = payload.get(claim)
+        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise InvalidWsiToken("invalid token source binding")
+    for claim in ("thumbnail_width", "thumbnail_height"):
+        value = payload.get(claim)
+        if type(value) is not int or value <= 0 or value > 8192:
+            raise InvalidWsiToken("invalid token thumbnail dimensions")
     if type(payload.get("exp")) is not int or payload["exp"] <= now:
         raise InvalidWsiToken("expired token")
     if type(payload.get("iat")) is not int or payload["iat"] > now + 60:

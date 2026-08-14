@@ -26,7 +26,7 @@ from app.config import settings
 from app.constants import INVENTORY_TABLE, THUMBNAIL_REGISTRY_TABLE
 from app.meta_store import run_query_external, run_statement
 from app.slide_store import open_slide, s3_opts
-from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan
+from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan, slide_metadata
 
 logger = logging.getLogger("thumbnail-generator")
 
@@ -64,12 +64,18 @@ CREATE TABLE IF NOT EXISTS {registry_table} (
     width INT,
     height INT,
     content_type STRING,
+    tile_metadata_json STRING,
     status STRING,
     rendered_at TIMESTAMP,
     error_message STRING,
     manifest_version STRING
 )
 USING DELTA
+""".format(registry_table=THUMBNAIL_REGISTRY_TABLE)
+
+REGISTRY_MIGRATE_SQL = """
+ALTER TABLE {registry_table}
+ADD COLUMNS (tile_metadata_json STRING)
 """.format(registry_table=THUMBNAIL_REGISTRY_TABLE)
 
 REGISTRY_SELECT_SQL = """
@@ -80,6 +86,7 @@ SELECT
     width,
     height,
     content_type,
+    tile_metadata_json,
     status,
     rendered_at,
     error_message,
@@ -106,6 +113,7 @@ class RegistryRow:
     rendered_at: str
     error_message: str
     manifest_version: str
+    tile_metadata_json: str = ""
 
 
 def _filesystem_for_uri(uri: str):
@@ -183,6 +191,14 @@ def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> 
     with _without_blockcache():
         slide, fileobj = open_slide(slide_uri, logger)
     try:
+        # A real OpenSlide object always exposes the intrinsic pyramid.  Keep
+        # the renderer's artifact path usable for legacy/test doubles that do
+        # not implement those fields; the core importer/backend will fail closed when
+        # the resulting metadata JSON is not a valid tile contract.
+        try:
+            metadata = slide_metadata(slide)
+        except (AttributeError, TypeError, ValueError):
+            metadata = {}
         try:
             thumb_bytes, plan = get_thumbnail_bytes_with_plan(slide, master_size, master_size)
         except NoSafeThumbnailOverview:
@@ -213,6 +229,7 @@ def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> 
         "height": height,
         "level": None if plan is None else plan.level,
         "requested_pixels": None if plan is None else plan.requested_pixels,
+        "tile_metadata_json": json.dumps(metadata, separators=(",", ":")),
     }
 
 
@@ -234,6 +251,7 @@ def _render_candidate_artifact(
         "content_type": "image/jpeg",
         "level": artifact["level"],
         "requested_pixels": artifact["requested_pixels"],
+        "tile_metadata_json": artifact["tile_metadata_json"],
     }
 
 
@@ -319,6 +337,7 @@ def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
             rendered_at=str(row.get("rendered_at") or ""),
             error_message=str(row.get("error_message") or ""),
             manifest_version=str(row.get("manifest_version") or ""),
+            tile_metadata_json=str(row.get("tile_metadata_json") or ""),
         )
         for row in rows
     ]
@@ -334,6 +353,16 @@ def _fetch_registry_rows(warehouse_id: str) -> list[RegistryRow]:
 
 def _ensure_registry_table(warehouse_id: str) -> None:
     run_statement(REGISTRY_CREATE_SQL, warehouse_id)
+    # Existing registries predate the source-bound contract.  Delta accepts
+    # this idempotent schema extension, allowing an in-place rollout without
+    # rewriting the generated thumbnail artifacts.
+    try:
+        run_statement(REGISTRY_MIGRATE_SQL, warehouse_id)
+    except Exception as exc:
+        # CREATE TABLE already includes the column for new installations; an
+        # "already exists" response is therefore harmless.
+        if "already exists" not in str(exc).lower():
+            raise
 
 
 def _dedupe_inventory_rows(rows: list[InventoryRow]) -> list[InventoryRow]:
@@ -377,11 +406,17 @@ def _select_candidate_rows(
             if not retry_failures_only:
                 candidates.append(row)
             continue
+        # A successful row written before tile_metadata_json was introduced
+        # is not a complete source-bound record. Regenerate it so migration
+        # does not make an otherwise servable slide unavailable.
+        metadata_missing = not (registry_row.tile_metadata_json or "").strip()
         if retry_failures_only:
-            if registry_row.status != "success":
+            if registry_row.status != "success" or metadata_missing:
                 candidates.append(row)
             continue
-        if registry_row.status == "success" and registry_row.source_path != row.path:
+        if registry_row.status == "success" and (
+            registry_row.source_path != row.path or metadata_missing
+        ):
             candidates.append(row)
     return candidates
 
@@ -532,6 +567,7 @@ def process_candidate_rows(
                         "rendered_at": _rendered_at(),
                         "error_message": None,
                         "manifest_version": manifest_version,
+                        "tile_metadata_json": artifact.get("tile_metadata_json") or "",
                     },
                 )
             except Exception as exc:
@@ -554,6 +590,7 @@ def process_candidate_rows(
                         "rendered_at": _rendered_at(),
                         "error_message": str(exc),
                         "manifest_version": manifest_version,
+                        "tile_metadata_json": "",
                     },
                 )
     finally:
@@ -594,6 +631,7 @@ SELECT
     {_sql_nullable_int(row.get("width"))} AS width,
     {_sql_nullable_int(row.get("height"))} AS height,
     {_sql_string(str(row.get("content_type") or "image/jpeg"))} AS content_type,
+    {_sql_string(str(row.get("tile_metadata_json") or ""))} AS tile_metadata_json,
     {_sql_string(str(row["status"]))} AS status,
     CAST({_sql_string(str(row["rendered_at"]))} AS TIMESTAMP) AS rendered_at,
     {_sql_nullable_string(row.get("error_message"))} AS error_message,
@@ -616,16 +654,17 @@ WHEN MATCHED THEN UPDATE SET
     target.width = source.width,
     target.height = source.height,
     target.content_type = source.content_type,
+    target.tile_metadata_json = source.tile_metadata_json,
     target.status = source.status,
     target.rendered_at = source.rendered_at,
     target.error_message = source.error_message,
     target.manifest_version = source.manifest_version
 WHEN NOT MATCHED THEN INSERT (
-    image_id, source_path, artifact_uri, width, height, content_type,
+    image_id, source_path, artifact_uri, width, height, content_type, tile_metadata_json,
     status, rendered_at, error_message, manifest_version
 ) VALUES (
     source.image_id, source.source_path, source.artifact_uri, source.width,
-    source.height, source.content_type, source.status, source.rendered_at,
+    source.height, source.content_type, source.tile_metadata_json, source.status, source.rendered_at,
     source.error_message, source.manifest_version
 )
 """

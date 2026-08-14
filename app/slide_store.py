@@ -23,9 +23,9 @@ def s3_opts() -> dict:
 
 def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     """
-    Return (bucket, key, s3_opts) for a slide_id.
+    Return (bucket, key, s3_opts) for a source URL.
 
-    slide_id must be a full s3:// URI as stored in the Databricks inventory table.
+    The source URL must be a full s3:// URI supplied by cBioPortal.
     """
     if not slide_id.startswith("s3://"):
         raise FileNotFoundError(f"Slide not found: {slide_id!r} (expected s3:// URI)")

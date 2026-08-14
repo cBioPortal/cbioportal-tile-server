@@ -31,5 +31,5 @@ class RequestRateLimiter:
             return True
 
 
-EXPENSIVE_PATH_PREFIXES = ("/thumbnails/", "/slides/", "/search", "/tiles/")
+EXPENSIVE_PATH_PREFIXES = ("/thumbnails", "/tiles/")
 rate_limiter = RequestRateLimiter()

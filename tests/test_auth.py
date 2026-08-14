@@ -6,7 +6,12 @@ import time
 
 import pytest
 
-from app.auth import InvalidWsiToken, validate_wsi_token
+from app.auth import (
+    InvalidWsiToken,
+    source_digest,
+    validate_wsi_auth_configuration,
+    validate_wsi_token,
+)
 
 
 def make_token(secret: str, **claims) -> str:
@@ -42,7 +47,12 @@ def valid_claims(**overrides):
         "aud": "cbioportal-wsi",
         "scope": "wsi:read",
         "study_id": "study-a",
-        "wsi_auth_version": 1,
+        "image_id": "slide-a",
+        "wsi_auth_version": 2,
+        "tile_source_sha256": source_digest("s3://slides/slide-a.svs"),
+        "thumbnail_source_sha256": source_digest("s3://thumbs/slide-a.jpg"),
+        "thumbnail_width": 1024,
+        "thumbnail_height": 768,
         "iat": now,
         "exp": now + 300,
     }
@@ -55,6 +65,21 @@ def test_valid_wsi_token():
     assert validate_wsi_token(
         make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
     )["sub"] == "user@example.org"
+
+
+@pytest.mark.parametrize(
+    ("secret", "audience", "max_ttl"),
+    [
+        ("s" * 31, "cbioportal-wsi", 300),
+        ("s" * 32, "   ", 300),
+        ("s" * 32, "cbioportal-wsi", 0),
+        ("s" * 32, "cbioportal-wsi", 301),
+        ("s" * 32, "cbioportal-wsi", 900),
+    ],
+)
+def test_invalid_wsi_auth_configuration_is_rejected(secret, audience, max_ttl):
+    with pytest.raises(InvalidWsiToken, match="not configured"):
+        validate_wsi_auth_configuration(secret, audience, max_ttl)
 
 
 @pytest.mark.parametrize("change", [
@@ -91,10 +116,12 @@ def test_non_object_header_and_payload_are_rejected():
 
 @pytest.mark.parametrize("change", [
     {"study_id": ""},
-    {"wsi_auth_version": 2},
+    {"image_id": ""},
+    {"tile_source_sha256": ""},
+    {"thumbnail_width": 0},
     {"exp": int(time.time()) + 1000},
 ])
-def test_resource_binding_and_max_ttl_claims_are_required(change):
+def test_source_bound_claims_and_max_ttl_are_required(change):
     secret = "s" * 32
     with pytest.raises(InvalidWsiToken):
         validate_wsi_token(

@@ -3,7 +3,7 @@
   <hashTree>
     <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="WSI tile loading benchmark" enabled="true"><stringProp name="TestPlan.comments">90% tiles, 5% metadata, 5% thumbnails.</stringProp><boolProp name="TestPlan.functional_mode">false</boolProp><boolProp name="TestPlan.serialize_threadgroups">false</boolProp><elementProp name="TestPlan.user_defined_variables" elementType="Arguments"><collectionProp name="Arguments.arguments">
       <elementProp name="BASE_URL" elementType="Argument"><stringProp name="Argument.value">${__P(BASE_URL,http://localhost:8080)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>
-      <elementProp name="STUDY_ID" elementType="Argument"><stringProp name="Argument.value">${__P(STUDY_ID,coad_msk_2025)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>
+<elementProp name="STUDY_ID" elementType="Argument"><stringProp name="Argument.value">${__P(STUDY_ID,msk_spectrum_tme_2022)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>
       <elementProp name="SLIDE_IDS" elementType="Argument"><stringProp name="Argument.value">${__P(SLIDE_IDS,2908638)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>
       <elementProp name="BEARER_TOKEN" elementType="Argument"><stringProp name="Argument.value">${__P(BEARER_TOKEN,)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>
       <elementProp name="MAX_ZOOM" elementType="Argument"><stringProp name="Argument.value">${__P(MAX_ZOOM,9)}</stringProp><stringProp name="Argument.metadata">=</stringProp></elementProp>

@@ -1,10 +1,10 @@
 import asyncio
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 import app.main as main_module
-from app.config import settings
 
 
 class TestSingleFlight:
@@ -52,49 +52,31 @@ class TestImageOperationGate:
         assert peak == 2
 
 
-class TestThumbnailWorker:
+class TestCorsPreflight:
     @pytest.mark.asyncio
-    async def test_timeout_terminates_child_process(self, monkeypatch):
-        class FakeProcess:
-            def __init__(self):
-                self.returncode = None
-                self.killed = False
-
-            async def communicate(self):
-                if self.killed:
-                    self.returncode = -9
-                    return b"", b""
-                await asyncio.sleep(60)
-
-            def kill(self):
-                self.killed = True
-
-        process = FakeProcess()
-
-        async def fake_create_process(*args, **kwargs):
-            return process
-
-        monkeypatch.setattr(main_module.asyncio, "create_subprocess_exec", fake_create_process)
-        monkeypatch.setattr(main_module.settings, "thumbnail_timeout_sec", 0.01)
-
-        with pytest.raises(asyncio.TimeoutError):
-            await main_module._run_thumbnail_worker(
-                "1492807",
-                "s3://bucket/1492807.svs",
+    async def test_preflight_does_not_require_slide_capability(self):
+        transport = httpx.ASGITransport(app=main_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.options(
+                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                headers={
+                    "Origin": "https://cbioportal.mskcc.org",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "Authorization",
+                },
             )
 
-        assert process.killed is True
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == "https://cbioportal.mskcc.org"
+        assert "authorization" in response.headers["access-control-allow-headers"].lower()
 
+    @pytest.mark.asyncio
+    async def test_unauthenticated_tile_get_remains_protected(self):
+        transport = httpx.ASGITransport(app=main_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                headers={"Origin": "https://cbioportal.mskcc.org"},
+            )
 
-class TestPathCache:
-    def test_path_cache_evicts_least_recently_used_entry(self, monkeypatch):
-        main_module._path_cache.clear()
-        monkeypatch.setattr(settings, "path_cache_capacity", 2)
-
-        with patch("app.main.meta.get_slide_path", side_effect=lambda image_id, _: f"s3://bucket/{image_id}.svs"):
-            assert main_module._resolve_slide_id("a") == "s3://bucket/a.svs"
-            assert main_module._resolve_slide_id("b") == "s3://bucket/b.svs"
-            assert main_module._resolve_slide_id("a") == "s3://bucket/a.svs"
-            assert main_module._resolve_slide_id("c") == "s3://bucket/c.svs"
-
-        assert list(main_module._path_cache.keys()) == ["a", "c"]
+        assert response.status_code == 401

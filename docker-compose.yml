@@ -18,32 +18,17 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
 
-      # ── Databricks — patient/slide metadata ──────────────────────────────
-      DATABRICKS_HOST: ${DATABRICKS_HOST}
-      DATABRICKS_TOKEN: ${DATABRICKS_TOKEN}
-      DATABRICKS_WAREHOUSE_ID: ${DATABRICKS_WAREHOUSE_ID:-0b49b7d78734ad5c}
-
       # ── WSI capability authentication ────────────────────────────────────
       WSI_AUTH_SECRET: ${WSI_AUTH_SECRET:?WSI_AUTH_SECRET must be set}
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
-      WSI_AUTH_REQUIRED: ${WSI_AUTH_REQUIRED:-true}
-      WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-900}
-      WSI_RESOURCE_INDEX_FILE: ${WSI_RESOURCE_INDEX_FILE:-/var/lib/wsi/wsi-resource-index.json}
-      WSI_TEST_SLIDE_MAP_FILE: ${WSI_TEST_SLIDE_MAP_FILE:-}
+      WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
+      WSI_ALLOWED_SOURCE_SCHEMES: ${WSI_ALLOWED_SOURCE_SCHEMES:-s3}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
 
       # ── Tile settings ─────────────────────────────────────────────────────
       TILE_SIZE: ${TILE_SIZE:-256}
       JPEG_QUALITY: ${JPEG_QUALITY:-85}
       MAX_DECODE_PIXELS: ${MAX_DECODE_PIXELS:-4194304}
-      THUMBNAIL_MAX_DECODE_PIXELS: ${THUMBNAIL_MAX_DECODE_PIXELS:-16000000}
-      THUMBNAIL_TIMEOUT_SEC: ${THUMBNAIL_TIMEOUT_SEC:-8}
-      THUMBNAIL_PLACEHOLDER_CACHE_TTL: ${THUMBNAIL_PLACEHOLDER_CACHE_TTL:-60}
-      THUMBNAIL_MANIFEST_URI: ${THUMBNAIL_MANIFEST_URI:-}
-      THUMBNAIL_MASTER_SIZE: ${THUMBNAIL_MASTER_SIZE:-1024}
-      THUMBNAIL_MANIFEST_REFRESH_SEC: ${THUMBNAIL_MANIFEST_REFRESH_SEC:-300}
-      THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY: ${THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY:-4096}
-      THUMBNAIL_BATCH_TIMEOUT_SEC: ${THUMBNAIL_BATCH_TIMEOUT_SEC:-600}
 
       # ── Redis cache ───────────────────────────────────────────────────────
       REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
@@ -52,7 +37,6 @@ services:
       REDIS_FAILURE_BACKOFF_SECONDS: ${REDIS_FAILURE_BACKOFF_SECONDS:-5}
       TILE_CACHE_TTL: ${TILE_CACHE_TTL:-86400}
       THUMBNAIL_CACHE_TTL: ${THUMBNAIL_CACHE_TTL:-86400}
-      METADATA_CACHE_TTL: ${METADATA_CACHE_TTL:-86400}
 
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
@@ -61,7 +45,6 @@ services:
       MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
       N_WORKERS: ${N_WORKERS:-2}
       MAX_IMAGE_OPERATIONS: ${MAX_IMAGE_OPERATIONS:-2}
-      PATH_CACHE_CAPACITY: ${PATH_CACHE_CAPACITY:-4096}
 
       # ── fsspec BlockCache — point at a fast local disk (NVMe preferred) ──
       # The named volume above keeps cold SVS range reads local between
@@ -73,7 +56,6 @@ services:
       PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-/cache/prometheus}
     volumes:
       - slide_blocks:/cache/slide-blocks
-      - ${WSI_RESOURCE_INDEX_DIR:-./data/wsi}:/var/lib/wsi:ro
       - ./tests/testdata:/app/testdata:ro
     depends_on:
       redis:

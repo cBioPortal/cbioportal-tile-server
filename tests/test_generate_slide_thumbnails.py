@@ -173,6 +173,7 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
+                tile_metadata_json='{"width":1024,"height":768}',
             )
         ]
 
@@ -198,6 +199,7 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
+                tile_metadata_json='{"width":1024,"height":768}',
             )
         ]
 
@@ -226,6 +228,7 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
+                tile_metadata_json='{"width":1024,"height":768}',
             ),
             module.RegistryRow(
                 image_id="1492808",
@@ -248,6 +251,34 @@ class TestDeltaSelection:
         )
 
         assert rows == [inventory[1]]
+
+    def test_legacy_success_without_metadata_is_regenerated(self):
+        inventory = [module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs")]
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path="s3://bucket/a.svs",
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+            )
+        ]
+
+        assert module._select_candidate_rows(
+            inventory,
+            registry,
+            retry_failures_only=False,
+        ) == inventory
+        assert module._select_candidate_rows(
+            inventory,
+            registry,
+            retry_failures_only=True,
+        ) == inventory
 
     def test_default_mode_skips_existing_failed_rows(self):
         inventory = [module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs")]
@@ -335,6 +366,7 @@ class TestRunIncrementalPipeline:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
+                tile_metadata_json='{"width":1024,"height":768}',
             )
         ]
         second_registry = first_registry + [

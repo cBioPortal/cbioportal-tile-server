@@ -1,32 +1,54 @@
 #!/usr/bin/env python3
-"""Export canonical pathology rows as a study-scoped JSONL snapshot."""
+"""Export canonical pathology rows as cBioPortal WSI study files."""
 
 from __future__ import annotations
 
 import argparse
-import json
+import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from app.config import settings
 from app import meta_store
+from app.config import settings
+
+try:
+    from tools.wsi_study_format import write_wsi_study_files
+except ModuleNotFoundError:  # Direct execution from the tools directory.
+    from wsi_study_format import write_wsi_study_files
 
 
 def _read_patient_ids(study_dir: Path) -> list[str]:
     data_file = study_dir / "data_clinical_patient.txt"
-    lines = [
-        line.rstrip("\n")
-        for line in data_file.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return [line.split("\t", 1)[0] for line in lines[4:]]
+    with data_file.open(encoding="utf-8", newline="") as handle:
+        rows = [
+            row
+            for row in csv.reader(handle, delimiter="\t")
+            if row and not row[0].startswith("#")
+        ]
+    if not rows:
+        raise ValueError(f"No column header found in {data_file}")
+    header = rows[0]
+    try:
+        patient_index = header.index("PATIENT_ID")
+    except ValueError as error:
+        raise ValueError(f"PATIENT_ID column not found in {data_file}") from error
+    return sorted(
+        {
+            row[patient_index].strip()
+            for row in rows[1:]
+            if len(row) > patient_index and row[patient_index].strip()
+        }
+    )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--study-dir", required=True, help="Path to the cBioPortal study directory.")
-    parser.add_argument("--study-id", required=True, help="Study identifier to embed in each JSONL row.")
-    parser.add_argument("--output", required=True, help="Output JSONL path.")
+    parser.add_argument("--study-id", required=True, help="cBioPortal study identifier.")
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for meta_wsi.txt and data_wsi.txt; defaults to --study-dir.",
+    )
     parser.add_argument(
         "--warehouse-id",
         default=settings.databricks_warehouse_id,
@@ -44,10 +66,14 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     study_dir = Path(args.study_dir).expanduser().resolve()
-    output = Path(args.output).expanduser().resolve()
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else study_dir
+    )
     patient_ids = _read_patient_ids(study_dir)
 
-    rows: dict[str, dict] = {}
+    rows: list[dict] = []
     missing: list[str] = []
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
@@ -65,20 +91,16 @@ def main() -> int:
             if not slides:
                 missing.append(patient_id)
                 continue
-            rows[patient_id] = {
-                "study_id": args.study_id,
-                "patient_id": patient_id,
-                "slides": slides,
-            }
+            for slide in slides:
+                rows.append({**slide, "patient_id": patient_id})
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        for patient_id in sorted(rows):
-            handle.write(json.dumps(rows[patient_id], separators=(",", ":")))
-            handle.write("\n")
+    if not rows:
+        raise ValueError(f"No WSI association rows found for {args.study_id}")
+    meta_path, data_path = write_wsi_study_files(output_dir, args.study_id, rows)
 
     print(
-        f"Wrote {len(rows)} canonical association rows for {args.study_id} to {output}"
+        f"Wrote {len(rows)} canonical WSI rows for {args.study_id} to "
+        f"{meta_path} and {data_path}"
         f" (missing {len(missing)} patients)"
     )
     if missing:
