@@ -94,6 +94,9 @@ optional Redis cache:
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 | `RATE_LIMIT_PER_MINUTE` | `120` | Per-capability request limit; `0` disables it |
+| `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
+| `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
+| `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
 
 Thumbnail artifacts are generated offline by
 `tools/generate_slide_thumbnails.py` and their URL, dimensions, content type,
@@ -157,6 +160,34 @@ metaImport.py -d /path/to/wsi-update
 The tile server is deliberately not a ClickHouse writer. It receives source
 URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
 authorized pixel and thumbnail requests.
+
+For development or rehearsal, use the Databricks `dev` profile and its
+warehouse, and point all three `WSI_*_TABLE` variables at the isolated
+`cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
+object-store prefix such as
+`s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does
+not expose the production PHI catalogs, so load a validated study snapshot and
+the offline registry with:
+
+```bash
+DATABRICKS_CONFIG_PROFILE=dev PYTHONPATH=. .venv/bin/python \
+  tools/materialize_dev_wsi_snapshot.py \
+  --meta-wsi /path/to/meta_wsi.txt \
+  --registry-jsonl /path/to/thumbnail-results.jsonl \
+  --namespace cdsi_dev.wsi_test \
+  --warehouse-id a52519fa662ce69d \
+  --artifact-root-uri s3://mskmind-bkt/wsi-thumbnails-dev/masters \
+  --manifest-uri s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json
+```
+
+This writes only the dev source, registry, canonical, and summary tables and
+publishes thumbnails below the separate `wsi-thumbnails-dev/` prefix. The
+materializer rejects registry rows whose artifact URI is not exactly below the
+dev artifact root, retains failed registry rows for diagnostics, and publishes
+only complete successful rows in the manifest. The
+production Databricks SQL templates remain available through
+`tools/run_wsi_pipelines.py` for a workspace with the production source
+catalogs; leaving the variables unset preserves production defaults.
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
 issue a v2 capability whose source URL is the mounted file URI. The normal
