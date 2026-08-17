@@ -77,6 +77,30 @@ thumbnail registry. The cBioPortal core importer publishes `can_serve_tiles=true
 fields are complete; otherwise the hierarchy reports the slide as unavailable.
 No registry or manifest is mounted into the online tile-server pod.
 
+Inspect or resume an interrupted run from its original candidate snapshot:
+
+```bash
+tools/run_thumbnail_pipeline_slurm.sh status \
+  --run-dir /gpfs/path/.slurm-thumbnail-work/20260806180612
+
+tools/run_thumbnail_pipeline_slurm.sh resume \
+  --run-dir /gpfs/path/.slurm-thumbnail-work/20260806180612 \
+  --concurrency 4
+```
+
+The batch path reads servable S3 paths from Databricks, stores publication state
+in `cdsi_prod.pathology_data_mining.slide_thumbnail_registry`, and keeps its
+temporary files, logs, and subprocess handoff data under the shared run
+directory rather than `/tmp`. Array workers write results atomically and create
+completion markers only after every candidate in a shard has a result. The
+dependent publisher audits every task before performing serialized registry
+updates and publishing the manifest, even when individual slides fail. An
+interrupted run can resume only missing or incomplete task indexes without
+changing its candidate snapshot. Block cache is disabled for offline
+generation so one-time slide reads do not accumulate on GPFS. Successful
+publication removes candidate, result, temporary, and block-cache directories
+while retaining summaries, failure logs, and quarantined partial results.
+
 ## Production thumbnail publication
 
 Thumbnail preparation is a separate scheduled workload, not part of the

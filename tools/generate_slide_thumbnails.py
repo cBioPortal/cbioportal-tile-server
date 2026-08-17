@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ logger = logging.getLogger("thumbnail-generator")
 REGISTRY_UPSERT_BATCH_SIZE = 1_000
 DEFAULT_SLIDES_PER_TASK = 2_000
 MAX_ARRAY_TASKS = 480
+TASK_MARKER_VERSION = 1
 
 SERVABLE_SLIDES_SQL = """
 SELECT image_id, path
@@ -114,6 +116,301 @@ class RegistryRow:
     error_message: str
     manifest_version: str
     tile_metadata_json: str = ""
+
+
+def _task_result_path(run_dir: str | Path, task_index: int) -> Path:
+    return Path(run_dir) / "results" / f"task-{task_index:04d}.jsonl"
+
+
+def _task_marker_path(run_dir: str | Path, task_index: int) -> Path:
+    return Path(run_dir) / "results" / f"task-{task_index:04d}.done.json"
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_result_records_strict(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid result JSON at {path}:{line_number}") from exc
+            if not isinstance(payload, dict) or not payload.get("image_id"):
+                raise ValueError(f"invalid result record at {path}:{line_number}")
+            records.append(payload)
+    return records
+
+
+def _legacy_summary_path(run_dir: Path, task_index: int) -> Path | None:
+    summaries = sorted(
+        (run_dir / "logs").glob(f"slide-thumbnail-summary-*-{task_index}.json"),
+        key=lambda path: path.stat().st_mtime,
+    )
+    return summaries[-1] if summaries else None
+
+
+def _result_counts(records: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"record_count": len(records), "success_count": 0, "failure_count": 0}
+    for record in records:
+        if record.get("status") == "success":
+            counts["success_count"] += 1
+        elif record.get("status") == "failed":
+            counts["failure_count"] += 1
+        else:
+            raise ValueError(f"unsupported thumbnail result status: {record.get('status')!r}")
+    return counts
+
+
+def write_task_completion_marker(
+    *,
+    run_dir: str | Path,
+    task_index: int,
+    candidate_count: int,
+    manifest_version: str,
+    result_path: str | Path | None = None,
+) -> dict[str, Any]:
+    result_file = Path(result_path) if result_path else _task_result_path(run_dir, task_index)
+    records = _read_result_records_strict(result_file)
+    counts = _result_counts(records)
+    if counts["record_count"] != candidate_count:
+        raise ValueError(
+            f"task {task_index} has {counts['record_count']} results for "
+            f"{candidate_count} candidates"
+        )
+    marker = {
+        "marker_version": TASK_MARKER_VERSION,
+        "task_index": task_index,
+        "candidate_count": candidate_count,
+        "manifest_version": manifest_version,
+        "result_sha256": _sha256_file(result_file),
+        **counts,
+    }
+    marker_path = _task_marker_path(run_dir, task_index)
+    _atomic_write_json(marker_path, marker)
+    return marker
+
+
+def _validate_task(
+    *,
+    run_dir: Path,
+    candidate_dir: Path,
+    task_index: int,
+    manifest_version: str,
+    require_marker: bool,
+) -> dict[str, Any]:
+    candidate_path = candidate_dir / f"task-{task_index:04d}.jsonl"
+    result_path = _task_result_path(run_dir, task_index)
+    marker_path = _task_marker_path(run_dir, task_index)
+    try:
+        candidate_rows = read_candidate_rows(str(candidate_path))
+        candidate_ids = [row.image_id for row in candidate_rows]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("duplicate candidate image_id")
+        records = _read_result_records_strict(result_path)
+        result_ids = [str(record["image_id"]) for record in records]
+        if len(result_ids) != len(set(result_ids)):
+            raise ValueError("duplicate result image_id")
+        if set(candidate_ids) != set(result_ids):
+            raise ValueError("candidate and result image_id sets differ")
+        candidate_by_id = {row.image_id: row for row in candidate_rows}
+        for record in records:
+            image_id = str(record["image_id"])
+            if str(record.get("source_path") or "") != candidate_by_id[image_id].path:
+                raise ValueError(f"source path mismatch for {image_id}")
+            if str(record.get("manifest_version") or "") != manifest_version:
+                raise ValueError(f"manifest version mismatch for {image_id}")
+        counts = _result_counts(records)
+        marker = None
+        if marker_path.exists():
+            with marker_path.open("r", encoding="utf-8") as handle:
+                marker = json.load(handle)
+            expected_marker = {
+                "marker_version": TASK_MARKER_VERSION,
+                "task_index": task_index,
+                "candidate_count": len(candidate_rows),
+                "record_count": counts["record_count"],
+                "success_count": counts["success_count"],
+                "failure_count": counts["failure_count"],
+                "manifest_version": manifest_version,
+                "result_sha256": _sha256_file(result_path),
+            }
+            if marker != expected_marker:
+                raise ValueError("completion marker does not match result file")
+        elif require_marker:
+            raise ValueError("missing completion marker")
+        return {
+            "task_index": task_index,
+            "state": "complete" if marker else "legacy_complete",
+            "candidate_count": len(candidate_rows),
+            **counts,
+            "result_path": str(result_path),
+            "marker_path": str(marker_path),
+        }
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "task_index": task_index,
+            "state": "incomplete",
+            "candidate_count": 0,
+            "record_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "result_path": str(result_path),
+            "marker_path": str(marker_path),
+            "reason": str(exc),
+        }
+
+
+def _quarantine_task_files(run_dir: Path, task_index: int) -> str | None:
+    paths = [
+        _task_result_path(run_dir, task_index),
+        _task_marker_path(run_dir, task_index),
+        *_task_result_path(run_dir, task_index).parent.glob(
+            f"task-{task_index:04d}.jsonl.partial.*"
+        ),
+    ]
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    quarantine_dir = run_dir / "quarantine" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    quarantine_dir.mkdir(parents=True, exist_ok=True)
+    for path in existing:
+        shutil.move(str(path), str(quarantine_dir / path.name))
+    return str(quarantine_dir)
+
+
+def audit_thumbnail_run(
+    run_dir: str,
+    *,
+    adopt_legacy: bool = False,
+    quarantine_incomplete: bool = False,
+) -> dict[str, Any]:
+    run_path = Path(run_dir).resolve()
+    with (run_path / "run-meta.json").open("r", encoding="utf-8") as handle:
+        meta = json.load(handle)
+    task_count = int(meta["task_count"])
+    candidate_dir = Path(meta["candidate_dir"])
+    if not candidate_dir.is_absolute():
+        candidate_dir = run_path / candidate_dir
+    manifest_version = str(meta["manifest_version"])
+    tasks: list[dict[str, Any]] = []
+    legacy_adopted: list[int] = []
+    quarantined: dict[str, str] = {}
+    for task_index in range(task_count):
+        task = _validate_task(
+            run_dir=run_path,
+            candidate_dir=candidate_dir,
+            task_index=task_index,
+            manifest_version=manifest_version,
+            require_marker=False,
+        )
+        if task["state"] == "legacy_complete":
+            summary_path = _legacy_summary_path(run_path, task_index)
+            summary_matches = False
+            if summary_path is not None:
+                try:
+                    with summary_path.open("r", encoding="utf-8") as handle:
+                        summary = json.load(handle)
+                    summary_matches = (
+                        int(summary.get("task_index", -1)) == task_index
+                        and int(summary.get("candidate_count", -1)) == task["candidate_count"]
+                        and int(summary.get("success_count", -1)) == task["success_count"]
+                        and int(summary.get("failure_count", -1)) == task["failure_count"]
+                        and str(summary.get("manifest_version")) == manifest_version
+                    )
+                except (OSError, TypeError, ValueError):
+                    summary_matches = False
+            if adopt_legacy and summary_matches:
+                write_task_completion_marker(
+                    run_dir=run_path,
+                    task_index=task_index,
+                    candidate_count=task["candidate_count"],
+                    manifest_version=manifest_version,
+                )
+                task["state"] = "complete"
+                legacy_adopted.append(task_index)
+            elif not summary_matches:
+                task["state"] = "incomplete"
+                task["reason"] = "valid result has no matching legacy summary"
+        if task["state"] == "incomplete" and quarantine_incomplete:
+            quarantine_dir = _quarantine_task_files(run_path, task_index)
+            if quarantine_dir:
+                quarantined[str(task_index)] = quarantine_dir
+        tasks.append(task)
+
+    complete_tasks = [task for task in tasks if task["state"] in {"complete", "legacy_complete"}]
+    incomplete_tasks = [task for task in tasks if task["state"] == "incomplete"]
+    marker_complete_tasks = [task for task in tasks if task["state"] == "complete"]
+    return {
+        "run_dir": str(run_path),
+        "manifest_version": manifest_version,
+        "worker_job": meta.get("worker_job"),
+        "publisher_job": meta.get("publisher_job"),
+        "task_count": task_count,
+        "completed_task_count": len(complete_tasks),
+        "incomplete_task_count": len(incomplete_tasks),
+        "completed_task_indexes": [task["task_index"] for task in complete_tasks],
+        "incomplete_task_indexes": [task["task_index"] for task in incomplete_tasks],
+        "legacy_complete_task_indexes": [
+            task["task_index"] for task in complete_tasks if task["state"] == "legacy_complete"
+        ],
+        "legacy_adopted_task_indexes": legacy_adopted,
+        "candidate_count": sum(task["candidate_count"] for task in complete_tasks),
+        "record_count": sum(task["record_count"] for task in complete_tasks),
+        "success_count": sum(task["success_count"] for task in complete_tasks),
+        "failure_count": sum(task["failure_count"] for task in complete_tasks),
+        "publishable": not incomplete_tasks and len(marker_complete_tasks) == task_count,
+        "quarantined": quarantined,
+        "tasks": tasks,
+    }
+
+
+def slurm_array_expression(task_indexes: Iterable[int]) -> str:
+    indexes = sorted(set(int(index) for index in task_indexes))
+    if not indexes:
+        return ""
+    ranges: list[str] = []
+    start = previous = indexes[0]
+    for index in indexes[1:]:
+        if index == previous + 1:
+            previous = index
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = index
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
 
 
 def _filesystem_for_uri(uri: str):
@@ -540,7 +837,7 @@ def process_candidate_rows(
     if result_path:
         result_file = Path(result_path)
         result_file.parent.mkdir(parents=True, exist_ok=True)
-        result_handle = result_file.open("a", encoding="utf-8")
+        result_handle = result_file.open("w", encoding="utf-8")
 
     try:
         for index, row in enumerate(rows, start=1):
