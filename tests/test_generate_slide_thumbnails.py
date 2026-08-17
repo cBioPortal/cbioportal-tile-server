@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,6 +16,50 @@ from tools import generate_slide_thumbnails as module
 def _jpeg_size(payload: bytes) -> tuple[int, int]:
     image = Image.open(BytesIO(payload))
     return image.size
+
+
+def _result_record(image_id: str, path: str, *, status: str = "success") -> dict:
+    return {
+        "image_id": image_id,
+        "source_path": path,
+        "artifact_uri": f"s3://thumbs/{image_id}.jpg",
+        "width": 1024 if status == "success" else None,
+        "height": 768 if status == "success" else None,
+        "content_type": "image/jpeg",
+        "status": status,
+        "rendered_at": "2026-08-06 12:00:00",
+        "error_message": None if status == "success" else "render failed",
+        "manifest_version": "v1",
+    }
+
+
+def _run_fixture(tmp_path: Path, records: list[dict]) -> tuple[Path, Path]:
+    run_dir = tmp_path / "run"
+    candidate_dir = run_dir / "candidates"
+    result_dir = run_dir / "results"
+    (run_dir / "logs").mkdir(parents=True)
+    candidate_dir.mkdir()
+    result_dir.mkdir()
+    rows = [{"image_id": record["image_id"], "path": record["source_path"]} for record in records]
+    (candidate_dir / "task-0000.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    (result_dir / "task-0000.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    (run_dir / "run-meta.json").write_text(
+        json.dumps(
+            {
+                "candidate_dir": str(candidate_dir),
+                "manifest_version": "v1",
+                "task_count": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir, result_dir / "task-0000.jsonl"
 
 
 class TestBuildThumbnailRecord:
@@ -114,6 +159,94 @@ class TestBatchSafety:
         assert task_count == 4
         assert sum(1 for _ in tmp_path.glob("task-*.jsonl")) == 4
         assert sum(1 for path in tmp_path.glob("task-*.jsonl") for _ in module.iter_candidate_rows(str(path))) == 11
+
+    def test_result_processing_overwrites_retried_task(self, tmp_path):
+        rows = [module.InventoryRow("1492807", "s3://bucket/1492807.svs")]
+        result_path = tmp_path / "task-0000.jsonl"
+        artifact = {
+            "image_id": "1492807",
+            "source_path": "s3://bucket/1492807.svs",
+            "artifact_uri": "s3://thumbs/1492807.jpg",
+            "width": 1024,
+            "height": 768,
+            "content_type": "image/jpeg",
+        }
+        with patch.object(module, "_render_candidate_artifact_subprocess", return_value=artifact):
+            module.process_candidate_rows(
+                warehouse_id="warehouse",
+                root_uri="s3://thumbs",
+                master_size=1024,
+                rows=rows,
+                manifest_version="v1",
+                result_path=str(result_path),
+            )
+            module.process_candidate_rows(
+                warehouse_id="warehouse",
+                root_uri="s3://thumbs",
+                master_size=1024,
+                rows=rows,
+                manifest_version="v1",
+                result_path=str(result_path),
+            )
+
+        assert len(result_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    def test_task_audit_rejects_partial_results(self, tmp_path):
+        records = [_result_record("1492807", "s3://bucket/1492807.svs")]
+        run_dir, _ = _run_fixture(tmp_path, records)
+        candidate_path = run_dir / "candidates" / "task-0000.jsonl"
+        candidate_path.write_text(
+            candidate_path.read_text(encoding="utf-8")
+            + json.dumps({"image_id": "1492808", "path": "s3://bucket/1492808.svs"})
+            + "\n",
+            encoding="utf-8",
+        )
+
+        audit = module.audit_thumbnail_run(str(run_dir))
+
+        assert audit["publishable"] is False
+        assert audit["incomplete_task_indexes"] == [0]
+
+    def test_task_audit_adopts_matching_legacy_summary(self, tmp_path):
+        records = [
+            _result_record("1492807", "s3://bucket/1492807.svs"),
+            _result_record("1492808", "s3://bucket/1492808.svs", status="failed"),
+        ]
+        run_dir, _ = _run_fixture(tmp_path, records)
+        (run_dir / "logs" / "slide-thumbnail-summary-123-0.json").write_text(
+            json.dumps(
+                {
+                    "candidate_count": 2,
+                    "failure_count": 1,
+                    "manifest_version": "v1",
+                    "success_count": 1,
+                    "task_index": 0,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        audit = module.audit_thumbnail_run(str(run_dir), adopt_legacy=True)
+
+        assert audit["publishable"] is True
+        assert audit["legacy_adopted_task_indexes"] == [0]
+        assert (run_dir / "results" / "task-0000.done.json").exists()
+
+    def test_task_audit_rejects_duplicate_results(self, tmp_path):
+        record = _result_record("1492807", "s3://bucket/1492807.svs")
+        run_dir, result_path = _run_fixture(tmp_path, [record])
+        result_path.write_text(
+            json.dumps(record) + "\n" + json.dumps(record) + "\n",
+            encoding="utf-8",
+        )
+
+        audit = module.audit_thumbnail_run(str(run_dir))
+
+        assert audit["incomplete_task_indexes"] == [0]
+        assert "duplicate result" in audit["tasks"][0]["reason"]
+
+    def test_slurm_array_expression_compresses_ranges(self):
+        assert module.slurm_array_expression([5, 2, 3, 9, 7, 8]) == "2-3,5,7-9"
 
     def test_result_publisher_skips_truncated_line(self, tmp_path):
         result_path = tmp_path / "task-0000.jsonl"
