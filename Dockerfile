@@ -25,7 +25,8 @@ RUN uv sync --frozen --no-dev
 # Add venv to PATH so binaries are available without `uv run`
 ENV PATH="/app/.venv/bin:$PATH"
 
-RUN useradd --no-create-home --shell /bin/false appuser
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid 1000 --no-create-home --shell /bin/false appuser
 # A fresh named volume mounted at this path inherits this ownership.
 RUN mkdir -p /cache/slide-blocks /cache/prometheus && chown -R appuser:appuser /cache
 ENV PROMETHEUS_MULTIPROC_DIR=/cache/prometheus
