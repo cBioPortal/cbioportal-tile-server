@@ -111,6 +111,12 @@ class Settings:
     )
     tile_cache_ttl: int = field(default_factory=lambda: _env_int("TILE_CACHE_TTL", 86_400))
     thumbnail_cache_ttl: int = field(default_factory=lambda: _env_int("THUMBNAIL_CACHE_TTL", 86_400))
+    cache_miss_lock_ttl_seconds: int = field(
+        default_factory=lambda: _env_int("CACHE_MISS_LOCK_TTL_SECONDS", 120)
+    )
+    cache_miss_wait_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("CACHE_MISS_WAIT_TIMEOUT_SECONDS", 30.0)
+    )
     # Deprecated cache setting retained for offline/legacy imports; runtime
     # endpoints never cache clinical or slide metadata.
     metadata_cache_ttl: int = field(default_factory=lambda: _env_int("METADATA_CACHE_TTL", 86_400))
@@ -121,7 +127,13 @@ class Settings:
     max_image_operations: int = field(default_factory=lambda: _env_int("MAX_IMAGE_OPERATIONS", 2))
     # Deprecated compatibility setting retained for offline callers.
     path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
-    rate_limit_per_minute: int = field(default_factory=lambda: _env_int("RATE_LIMIT_PER_MINUTE", 120))
+    # RATE_LIMIT_PER_MINUTE is retained as a one-release compatibility alias.
+    cache_miss_rate_limit_per_minute: int = field(
+        default_factory=lambda: _env_int(
+            "CACHE_MISS_RATE_LIMIT_PER_MINUTE",
+            _env_int("RATE_LIMIT_PER_MINUTE", 120),
+        )
+    )
 
     # Offline preparation tooling only (never read by the FastAPI runtime).
     databricks_warehouse_id: str = field(

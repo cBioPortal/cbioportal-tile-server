@@ -26,6 +26,37 @@ class TestSingleFlight:
         assert results == [b"jpeg"] * 5
         assert calls == 1
 
+    @pytest.mark.asyncio
+    async def test_distributed_owner_rechecks_cache_before_extracting(self):
+        calls = 0
+
+        async def producer():
+            nonlocal calls
+            calls += 1
+            return b"generated"
+
+        async def cached():
+            return b"already-published"
+
+        with (
+            patch.object(main_module.tile_cache, "try_acquire_miss_lock", return_value="token"),
+            patch.object(main_module.tile_cache, "release_miss_lock") as release,
+            patch.object(main_module.tile_cache, "allow_cache_miss") as allow,
+        ):
+            result = await main_module._distributed_singleflight(
+                "tile:race-check",
+                "tile",
+                "subject",
+                producer,
+                cached,
+                lambda value: value,
+            )
+
+        assert result == b"already-published"
+        assert calls == 0
+        allow.assert_not_awaited()
+        release.assert_awaited_once_with("tile:race-check", "token")
+
 
 class TestImageOperationGate:
     @pytest.mark.asyncio
@@ -50,6 +81,34 @@ class TestImageOperationGate:
 
         assert results == [0, 1, 2, 3, 4]
         assert peak == 2
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_work_uses_image_operation_gate(self):
+        active = 0
+        peak = 0
+
+        async def fake_in_thread(fn, *args):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return fn(*args)
+
+        main_module._image_operation_semaphore = asyncio.Semaphore(1)
+        with patch.object(main_module, "_in_thread", fake_in_thread):
+            results = await asyncio.gather(
+                *[
+                    main_module._run_image_operation(
+                        lambda value=value: value,
+                        operation_kind="thumbnail",
+                    )
+                    for value in range(4)
+                ]
+            )
+
+        assert results == [0, 1, 2, 3]
+        assert peak == 1
 
 
 class TestCorsPreflight:
@@ -80,3 +139,19 @@ class TestCorsPreflight:
             )
 
         assert response.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_metrics_bypasses_capability_guard(self):
+        scope = {
+            "type": "http",
+            "path": "/metrics",
+            "headers": [],
+            "method": "GET",
+        }
+        starlette_request = main_module.Request(scope, receive=lambda: None)
+
+        async def call_next(request):
+            return main_module.Response(status_code=204)
+
+        response = await main_module.require_wsi_capability(starlette_request, call_next)
+        assert response.status_code == 204

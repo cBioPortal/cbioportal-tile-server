@@ -12,18 +12,49 @@ backend. This cache is limited to source-bound slide tiles and thumbnails.
 """
 
 import json
+import hashlib
 import logging
 import time
+import uuid
 
 import redis.asyncio as aioredis
 
 from .config import settings
-from .metrics import CACHE_REQUESTS, REDIS_ERRORS, REDIS_OPERATION_SECONDS
+from .metrics import (
+    CACHE_MISS_RATE_LIMITS,
+    CACHE_REQUESTS,
+    DISTRIBUTED_MISS_LOCKS,
+    REDIS_ERRORS,
+    REDIS_OPERATION_SECONDS,
+)
 
 _redis: aioredis.Redis | None = None
 _redis_disabled_until = 0.0
 _redis_failure_logged = False
 logger = logging.getLogger(__name__)
+
+_RELEASE_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+_CACHE_MISS_LIMIT_SCRIPT = """
+local now = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local member = ARGV[4]
+redis.call('zremrangebyscore', KEYS[1], 0, now - window)
+local count = redis.call('zcard', KEYS[1])
+if count >= limit then
+  local first = redis.call('zrange', KEYS[1], 0, 0, 'WITHSCORES')
+  return {0, first[2]}
+end
+redis.call('zadd', KEYS[1], now, member)
+redis.call('expire', KEYS[1], math.ceil(window / 1000) + 1)
+return {1, now}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +81,15 @@ def tile_cache_key(slide_id: str, z: int, x: int, y: int) -> str:
 
 def thumbnail_cache_key(slide_id: str, width: int, height: int) -> str:
     return _thumb_key(slide_id, width, height)
+
+
+def _lock_key(cache_key: str) -> str:
+    return f"lock:{cache_key}"
+
+
+def _miss_limit_key(subject: str) -> str:
+    digest = hashlib.sha256(subject.encode("utf-8")).hexdigest()
+    return f"rate:cache-miss:{digest}"
 
 
 def _redis_configured() -> bool:
@@ -141,6 +181,96 @@ async def _redis_set(key: str, data: bytes | str, ttl: int = 0) -> None:
         REDIS_OPERATION_SECONDS.labels(operation="set").observe(time.perf_counter() - started)
         REDIS_ERRORS.labels(operation="set").inc()
         _trip_redis_breaker("set")
+
+
+async def try_acquire_miss_lock(cache_key: str, kind: str) -> str | bool | None:
+    """Return token for owner, False for another owner, or None if Redis is down."""
+    if not _redis_available():
+        return None
+    token = uuid.uuid4().hex
+    started = time.perf_counter()
+    try:
+        acquired = await _redis.set(
+            _lock_key(cache_key),
+            token,
+            nx=True,
+            px=max(1, settings.cache_miss_lock_ttl_seconds) * 1000,
+        )
+        REDIS_OPERATION_SECONDS.labels(operation="acquire_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        _record_redis_recovery()
+        result = token if acquired else False
+        DISTRIBUTED_MISS_LOCKS.labels(kind=kind, result="owner" if acquired else "follower").inc()
+        return result
+    except Exception:
+        REDIS_OPERATION_SECONDS.labels(operation="acquire_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        REDIS_ERRORS.labels(operation="acquire_miss_lock").inc()
+        DISTRIBUTED_MISS_LOCKS.labels(kind=kind, result="unavailable").inc()
+        _trip_redis_breaker("acquire_miss_lock")
+        return None
+
+
+async def release_miss_lock(cache_key: str, token: str) -> None:
+    if not _redis_available():
+        return
+    started = time.perf_counter()
+    try:
+        await _redis.eval(_RELEASE_LOCK_SCRIPT, 1, _lock_key(cache_key), token)
+        REDIS_OPERATION_SECONDS.labels(operation="release_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        _record_redis_recovery()
+    except Exception:
+        REDIS_OPERATION_SECONDS.labels(operation="release_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        REDIS_ERRORS.labels(operation="release_miss_lock").inc()
+        _trip_redis_breaker("release_miss_lock")
+
+
+async def allow_cache_miss(subject: str) -> tuple[bool, int]:
+    """Atomically apply the shared cache-miss limit and return (allowed, retry seconds)."""
+    limit = settings.cache_miss_rate_limit_per_minute
+    if limit <= 0 or not _redis_available():
+        CACHE_MISS_RATE_LIMITS.labels(result="bypassed").inc()
+        return True, 0
+    now_ms = int(time.time() * 1000)
+    window_ms = 60_000
+    member = f"{now_ms}:{uuid.uuid4().hex}"
+    started = time.perf_counter()
+    try:
+        result = await _redis.eval(
+            _CACHE_MISS_LIMIT_SCRIPT,
+            1,
+            _miss_limit_key(subject),
+            now_ms,
+            window_ms,
+            limit,
+            member,
+        )
+        REDIS_OPERATION_SECONDS.labels(operation="cache_miss_limit").observe(
+            time.perf_counter() - started
+        )
+        _record_redis_recovery()
+        allowed = bool(int(result[0]))
+        if allowed:
+            CACHE_MISS_RATE_LIMITS.labels(result="allowed").inc()
+            return True, 0
+        first_ms = int(result[1])
+        retry_after = max(1, int((first_ms + window_ms - now_ms + 999) / 1000))
+        CACHE_MISS_RATE_LIMITS.labels(result="rejected").inc()
+        return False, retry_after
+    except Exception:
+        REDIS_OPERATION_SECONDS.labels(operation="cache_miss_limit").observe(
+            time.perf_counter() - started
+        )
+        REDIS_ERRORS.labels(operation="cache_miss_limit").inc()
+        CACHE_MISS_RATE_LIMITS.labels(result="unavailable").inc()
+        _trip_redis_breaker("cache_miss_limit")
+        return True, 0
 
 
 def _from_json(raw: bytes | None) -> object | None:

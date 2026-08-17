@@ -72,6 +72,35 @@ def test_same_slide_operations_are_serialized():
     assert peak == 1
 
 
+def test_concurrent_cold_open_calls_opener_once():
+    entered = threading.Event()
+    release = threading.Event()
+    opened = []
+
+    def open_slide(slide_id, logger):
+        opened.append(slide_id)
+        entered.set()
+        release.wait(1)
+        return MagicMock(), None
+
+    cache = SlideCache(1)
+    with patch("app.slides._open_slide", side_effect=open_slide):
+        first = threading.Thread(target=lambda: cache.run("same", lambda slide: None))
+        second = threading.Thread(target=lambda: cache.run("same", lambda slide: None))
+        first.start()
+        assert entered.wait(1)
+        second.start()
+        time.sleep(0.03)
+        assert opened == ["same"]
+        release.set()
+        first.join(1)
+        second.join(1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert opened == ["same"]
+
+
 def test_capacity_one_never_closes_an_active_slide():
     opened = {}
     started = threading.Event()

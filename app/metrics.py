@@ -50,8 +50,23 @@ SLIDE_CACHE_EVENTS = Counter(
 )
 IMAGE_OPERATION_SECONDS = Histogram(
     "tile_server_image_operation_seconds",
-    "Blocking image operation latency.",
+    "Image operation latency including time waiting for the worker gate.",
     ("kind",),
+)
+IMAGE_OPERATION_QUEUE_SECONDS = Histogram(
+    "tile_server_image_operation_queue_seconds",
+    "Time spent waiting for an image-operation slot.",
+    ("kind",),
+)
+DISTRIBUTED_MISS_LOCKS = Counter(
+    "tile_server_distributed_miss_locks_total",
+    "Distributed cache-miss lock outcomes.",
+    ("kind", "result"),
+)
+CACHE_MISS_RATE_LIMITS = Counter(
+    "tile_server_cache_miss_rate_limits_total",
+    "Distributed cache-miss rate-limit outcomes.",
+    ("result",),
 )
 
 

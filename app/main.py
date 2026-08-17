@@ -32,11 +32,11 @@ from .metrics import (
     COALESCED_CACHE_MISS_REQUESTS,
     DECODE_SOURCE_PIXELS,
     IMAGE_OPERATION_SECONDS,
+    IMAGE_OPERATION_QUEUE_SECONDS,
     OVERSIZED_DECODE_REJECTIONS,
     metrics_payload,
     track_image_operation,
 )
-from .rate_limit import rate_limiter
 from .slides import SlideCache
 from .thumbnail_store import ThumbnailRecord, render_thumbnail_response
 from .tiles import OverviewTooLarge, get_tile_bytes
@@ -80,6 +80,16 @@ class _SingleFlight:
 
 
 _singleflight = _SingleFlight()
+
+
+class CacheMissRateLimitExceeded(Exception):
+    def __init__(self, retry_after: int) -> None:
+        super().__init__("cache-miss rate limit exceeded")
+        self.retry_after = retry_after
+
+
+class DistributedMissTimeout(Exception):
+    pass
 
 
 @asynccontextmanager
@@ -126,7 +136,7 @@ app = FastAPI(
 
 @app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
-    if request.scope["path"] in ("/health", "/ready"):
+    if request.scope["path"] in ("/health", "/ready", "/metrics"):
         return await call_next(request)
     # Browser clients send an unauthenticated OPTIONS request before any
     # cross-origin request that includes the Authorization header.  CORS
@@ -149,8 +159,6 @@ async def require_wsi_capability(request: Request, call_next):
     if claims.get("wsi_auth_version") != 2:
         return Response(status_code=403, content="slide-scoped capability is required")
     request.state.wsi_claims = claims
-    if not rate_limiter.allow(claims["sub"], settings.rate_limit_per_minute):
-        return Response(status_code=429, headers={"Retry-After": "60"}, content="Rate limit exceeded")
     return await call_next(request)
 
 
@@ -187,12 +195,63 @@ async def _run_image_operation(fn, *args, operation_kind: str = "image"):
             return await _in_thread(fn, *args)
         finally:
             IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
+    queue_started = time.perf_counter()
     async with _image_operation_semaphore:
+        IMAGE_OPERATION_QUEUE_SECONDS.labels(kind=operation_kind).observe(
+            time.perf_counter() - queue_started
+        )
         async with track_image_operation():
             try:
                 return await _in_thread(fn, *args)
             finally:
                 IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
+
+
+async def _distributed_singleflight(
+    cache_key: str,
+    kind: str,
+    subject: str,
+    producer,
+    read_cached,
+    decode_cached,
+):
+    """Coalesce a cache miss across workers, with local fallback if Redis is down."""
+    async def coordinated_producer():
+        async def run_owner(lock: str):
+            cached = await read_cached()
+            if cached is not None:
+                return decode_cached(cached)
+            allowed, retry_after = await tile_cache.allow_cache_miss(subject)
+            if not allowed:
+                raise CacheMissRateLimitExceeded(retry_after)
+            return await producer()
+
+        lock = await tile_cache.try_acquire_miss_lock(cache_key, kind)
+        if lock is None:
+            return await producer()
+        if lock:
+            try:
+                return await run_owner(lock)
+            finally:
+                await tile_cache.release_miss_lock(cache_key, lock)
+
+        deadline = time.monotonic() + max(0.1, settings.cache_miss_wait_timeout_seconds)
+        while time.monotonic() < deadline:
+            cached = await read_cached()
+            if cached is not None:
+                return decode_cached(cached)
+            await asyncio.sleep(0.02 if time.monotonic() + 1 < deadline else 0.1)
+            lock = await tile_cache.try_acquire_miss_lock(cache_key, kind)
+            if lock is None:
+                return await producer()
+            if lock:
+                try:
+                    return await run_owner(lock)
+                finally:
+                    await tile_cache.release_miss_lock(cache_key, lock)
+        raise DistributedMissTimeout()
+
+    return await _singleflight.do(cache_key, kind, coordinated_producer)
 
 
 def _allowed_source(source: str) -> str:
@@ -308,7 +367,7 @@ async def tile(
     y: int,
     source: str = Query(...),
 ):
-    source, _ = _authorize_source(request, source, "tile")
+    source, claims = _authorize_source(request, source, "tile")
     cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
     if cached:
@@ -322,7 +381,19 @@ async def tile(
         return image_bytes
 
     try:
-        data = await _singleflight.do(tile_cache.tile_cache_key(cache_key, z, x, y), "tile", _build_tile)
+        tile_key = tile_cache.tile_cache_key(cache_key, z, x, y)
+        data = await _distributed_singleflight(
+            tile_key,
+            "tile",
+            claims["sub"],
+            _build_tile,
+            lambda: tile_cache.get_tile(cache_key, z, x, y),
+            lambda cached: cached,
+        )
+    except CacheMissRateLimitExceeded as exc:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(exc.retry_after)}, detail="Rate limit exceeded")
+    except DistributedMissTimeout:
+        raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Tile extraction is still in progress")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except OverviewTooLarge as exc:
@@ -353,7 +424,7 @@ async def thumbnail(
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
-        data, status = await _in_thread(
+        data, status = await _run_image_operation(
             _read_thumbnail,
             source,
             width,
@@ -365,11 +436,19 @@ async def thumbnail(
         return data, status
 
     try:
-        data, status = await _singleflight.do(
-            tile_cache.thumbnail_cache_key(cache_key, width, height),
+        thumbnail_key = tile_cache.thumbnail_cache_key(cache_key, width, height)
+        data, status = await _distributed_singleflight(
+            thumbnail_key,
             "thumbnail",
+            claims["sub"],
             _build_thumbnail,
+            lambda: tile_cache.get_thumbnail(cache_key, width, height),
+            lambda cached: (cached, {"status": "ok", "reason": "distributed-cache"}),
         )
+    except CacheMissRateLimitExceeded as exc:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(exc.retry_after)}, detail="Rate limit exceeded")
+    except DistributedMissTimeout:
+        raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Thumbnail extraction is still in progress")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="thumbnail not found")
     except Exception as exc:
