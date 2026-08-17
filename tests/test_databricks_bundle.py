@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from app.constants import CANONICAL_ASSOCIATION_TABLE
+import tools.run_wsi_pipelines as wsi_pipelines
 
 
 def test_canonical_association_sql_asset_exists():
@@ -57,6 +58,28 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
     ):
         assert column in sql
     assert "reference_sequencing_date" not in sql
+
+
+def test_pipeline_renderer_rewrites_all_output_names(monkeypatch):
+    monkeypatch.setattr(
+        wsi_pipelines,
+        "CANONICAL_ASSOCIATION_TABLE",
+        "cdsi_dev.wsi_test.canonical_slide_associations",
+    )
+    monkeypatch.setattr(
+        wsi_pipelines, "SUMMARY_TABLE", "cdsi_dev.wsi_test.sample_wsi_summary"
+    )
+    monkeypatch.setattr(
+        wsi_pipelines,
+        "THUMBNAIL_REGISTRY_TABLE",
+        "cdsi_dev.wsi_test.slide_thumbnail_registry",
+    )
+    rendered = wsi_pipelines._render(
+        "FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry "
+        "JOIN cdsi_prod.pathology_data_mining.canonical_slide_associations c "
+        "JOIN cdsi_prod.pathology_data_mining.sample_wsi_summary s"
+    )
+    assert "cdsi_prod.pathology_data_mining" not in rendered
 
 
 def test_canonical_pipeline_scopes_unmatched_parts_to_source_accessions():

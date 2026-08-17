@@ -77,6 +77,30 @@ thumbnail registry. The cBioPortal core importer publishes `can_serve_tiles=true
 fields are complete; otherwise the hierarchy reports the slide as unavailable.
 No registry or manifest is mounted into the online tile-server pod.
 
+## Production thumbnail publication
+
+Thumbnail preparation is a separate scheduled workload, not part of the
+frontend, Compose stack, or online tile-server request path. Schedule
+`tools/run_thumbnail_pipeline_slurm.sh` (or an equivalent cron/workflow) to
+run `tools/generate_slide_thumbnails.py` against the eligible inventory. The
+job must:
+
+1. read source slides from the configured S3/Dell ECS-compatible store;
+2. write immutable master JPEGs to that store; and
+3. upsert `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
+   artifact URI, intrinsic `tile_metadata_json`, dimensions, and content type.
+
+Do not start the Databricks canonical-association refresh until this batch has
+completed for the input inventory. Coordinate the two jobs with an explicit
+dependency or completion watermark. Rows marked successful without
+`tile_metadata_json` must be regenerated before publication.
+
+The frontend only requests `/thumbnails` and never uploads artifacts. The
+tile-server `app/thumbnail_worker.py` CLI can be used for development,
+rehearsal, or controlled remediation, but it writes only an object-store
+artifact and does not populate the registry. It must not be used as the
+production source of truth.
+
 ## Response and cache policy
 
 - Tiles: `private, max-age=3600`, vary on `Authorization`.
@@ -99,6 +123,7 @@ testing a pixel request.
 ## Thumbnail batch operations
 
 Run `tools/generate_slide_thumbnails.py` (usually through the Slurm wrapper)
-outside the API process. It writes immutable artifacts and registry rows; a
-successful batch must be followed by a cBioPortal core study import before a
-slide becomes servable.
+outside the API process and on a schedule. It writes immutable artifacts and
+registry rows; a successful batch must be followed by the Databricks canonical
+refresh, study-file export, and cBioPortal core study import before a slide
+becomes servable.

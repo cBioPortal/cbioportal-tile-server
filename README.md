@@ -18,6 +18,38 @@ The tile server never resolves an image ID, queries cBioPortal metadata, or
 loads portal data files. A URL without a matching capability is
 rejected, even when the URL is otherwise reachable.
 
+## Production WSI artifact dataflow
+
+Thumbnail generation and registry publication are an offline prerequisite to
+the API. They are not performed by the frontend or by the FastAPI request
+handlers. The production sequence is:
+
+1. A separate cron, Slurm, or equivalent scheduled job runs
+   `tools/run_thumbnail_pipeline_slurm.sh` (or an equivalent wrapper around
+   `tools/generate_slide_thumbnails.py`).
+2. The batch reads eligible `slide_inventory` rows and source slides from the
+   S3/Dell ECS-compatible store, writes immutable master JPEGs back to that
+   store, and upserts
+   `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
+   `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
+   `content_type`.
+3. The Databricks canonical-association job joins the source path to the
+   latest successful registry row and computes `can_serve_tiles`. The
+   canonical job must run only after the thumbnail batch has completed for the
+   input inventory (use a job dependency or completion watermark).
+4. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
+   dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`.
+5. cBioPortal core imports that complete snapshot and is the sole ClickHouse
+   writer.
+
+The frontend is read-only: it requests the backend access bundle and then
+requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes
+Databricks tables. `app/thumbnail_worker.py` is a controlled on-demand CLI
+that can write a generated JPEG to the configured S3/ECS-compatible location,
+but it does not update `slide_thumbnail_registry` and is not a production
+publication mechanism. Keep it limited to development, rehearsal, or explicit
+remediation.
+
 ## Endpoints
 
 | Method | Path | Description |
@@ -62,12 +94,17 @@ optional Redis cache:
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 | `RATE_LIMIT_PER_MINUTE` | `120` | Per-capability request limit; `0` disables it |
+| `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
+| `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
+| `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
 
 Thumbnail artifacts are generated offline by
 `tools/generate_slide_thumbnails.py` and their URL, dimensions, content type,
 and tile metadata are loaded into the cBioPortal WSI slide table. A slide is
 published with `can_serve_tiles=false` until all of those fields are present.
-The online service does not generate thumbnails or consult a manifest.
+The online service does not generate thumbnails, consult a manifest, or write
+the registry. Production deployments must schedule the offline batch described
+above; an on-demand worker is not a substitute for registry publication.
 
 Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
 Redis is an optimization only; a cache outage does not change authorization.
@@ -95,6 +132,12 @@ the same intrinsic tile metadata when creating the registry artifact. The
 exporter and SQL pipeline are intentionally offline tooling; none of their
 metadata clients are imported by the FastAPI runtime.
 
+Run the thumbnail batch as a separate scheduled process before the canonical
+Databricks refresh. A successful thumbnail run must publish both the object
+store artifacts and the matching registry rows; writing only a JPEG or only a
+manifest is insufficient. Legacy successful rows with missing
+`tile_metadata_json` must be backfilled or regenerated before export.
+
 The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
 `data_wsi.txt` pair. Export it from the canonical association table with:
 
@@ -117,6 +160,34 @@ metaImport.py -d /path/to/wsi-update
 The tile server is deliberately not a ClickHouse writer. It receives source
 URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
 authorized pixel and thumbnail requests.
+
+For development or rehearsal, use the Databricks `dev` profile and its
+warehouse, and point all three `WSI_*_TABLE` variables at the isolated
+`cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
+object-store prefix such as
+`s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does
+not expose the production PHI catalogs, so load a validated study snapshot and
+the offline registry with:
+
+```bash
+DATABRICKS_CONFIG_PROFILE=dev PYTHONPATH=. .venv/bin/python \
+  tools/materialize_dev_wsi_snapshot.py \
+  --meta-wsi /path/to/meta_wsi.txt \
+  --registry-jsonl /path/to/thumbnail-results.jsonl \
+  --namespace cdsi_dev.wsi_test \
+  --warehouse-id a52519fa662ce69d \
+  --artifact-root-uri s3://mskmind-bkt/wsi-thumbnails-dev/masters \
+  --manifest-uri s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json
+```
+
+This writes only the dev source, registry, canonical, and summary tables and
+publishes thumbnails below the separate `wsi-thumbnails-dev/` prefix. The
+materializer rejects registry rows whose artifact URI is not exactly below the
+dev artifact root, retains failed registry rows for diagnostics, and publishes
+only complete successful rows in the manifest. The
+production Databricks SQL templates remain available through
+`tools/run_wsi_pipelines.py` for a workspace with the production source
+catalogs; leaving the variables unset preserves production defaults.
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
 issue a v2 capability whose source URL is the mounted file URI. The normal

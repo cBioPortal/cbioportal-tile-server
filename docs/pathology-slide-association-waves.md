@@ -32,6 +32,21 @@ does not assemble or cache patient hierarchies; it serves source-bound tiles and
 thumbnail artifacts. cBioPortal returns intrinsic tile metadata and exact
 source URLs in the per-slide access bundle.
 
+## Thumbnail artifact prerequisite
+
+The thumbnail artifact is prepared before the canonical association refresh by
+a separate scheduled batch process. The batch reads the slide inventory and
+source slides, writes master JPEGs to the S3/Dell ECS-compatible store, and
+populates `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
+artifact URI, `tile_metadata_json`, dimensions, and content type. The
+canonical SQL joins that registry row and emits the corresponding study-file
+fields. The Databricks refresh must depend on the thumbnail batch completion
+watermark.
+
+The frontend is read-only and does not upload thumbnails. The tile-server
+on-demand worker is limited to development/rehearsal or controlled remediation;
+it does not publish registry rows and is not the production path.
+
 Import the validated cBioPortal WSI study files through cBioPortal core:
 
 ```bash

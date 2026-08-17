@@ -24,6 +24,11 @@ services:
       WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
       WSI_ALLOWED_SOURCE_SCHEMES: ${WSI_ALLOWED_SOURCE_SCHEMES:-s3}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      # ── Databricks / thumbnail namespace (dev overrides only) ───────────
+      WSI_THUMBNAIL_REGISTRY_TABLE: ${WSI_THUMBNAIL_REGISTRY_TABLE:-cdsi_prod.pathology_data_mining.slide_thumbnail_registry}
+      WSI_CANONICAL_ASSOCIATION_TABLE: ${WSI_CANONICAL_ASSOCIATION_TABLE:-cdsi_prod.pathology_data_mining.canonical_slide_associations}
+      WSI_SUMMARY_TABLE: ${WSI_SUMMARY_TABLE:-cdsi_prod.pathology_data_mining.sample_wsi_summary}
+      THUMBNAIL_MANIFEST_URI: ${THUMBNAIL_MANIFEST_URI:-}
 
       # ── Tile settings ─────────────────────────────────────────────────────
       TILE_SIZE: ${TILE_SIZE:-256}

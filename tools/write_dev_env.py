@@ -73,6 +73,15 @@ def main(argv: list[str] | None = None) -> None:
         "WSI_AUTH_MAX_TTL=300",
         f"WSI_AUTH_SECRET={os.environ.get('WSI_AUTH_SECRET', 'local-dev-wsi-secret-change-me-32chars')}",
         f"REDIS_PASSWORD={os.environ.get('REDIS_PASSWORD', 'local-dev-redis-password')}",
+        "",
+        "# ── Isolated Databricks/S3 WSI namespace for development ───────────",
+        "DATABRICKS_CONFIG_PROFILE=dev",
+        "DATABRICKS_WAREHOUSE_ID=a52519fa662ce69d",
+        "WSI_THUMBNAIL_REGISTRY_TABLE=cdsi_dev.wsi_test.slide_thumbnail_registry",
+        "WSI_CANONICAL_ASSOCIATION_TABLE=cdsi_dev.wsi_test.canonical_slide_associations",
+        "WSI_SUMMARY_TABLE=cdsi_dev.wsi_test.sample_wsi_summary",
+        "THUMBNAIL_ARTIFACT_ROOT_URI=s3://mskmind-bkt/wsi-thumbnails-dev/masters",
+        "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json",
     ]
     output = args.output.expanduser().resolve()
     _write_secure(output, "\n".join(lines) + "\n")
