@@ -56,6 +56,7 @@ remediation.
 |--------|------|-------------|
 | GET | `/health` | Public liveness probe |
 | GET | `/ready` | Public readiness probe (auth configuration only) |
+| GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
 | GET | `/tiles/zxy/{z}/{x}/{y}?source=...` | Source-bound JPEG tile |
 | GET | `/thumbnails?source=...&width=...&height=...` | Source-bound thumbnail resize |
 
@@ -91,12 +92,15 @@ optional Redis cache:
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |
+| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per capability subject; `0` disables it |
+| `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Cross-worker extraction lock lifetime |
+| `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `30` | Maximum follower wait for another worker's extraction |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
-| `RATE_LIMIT_PER_MINUTE` | `120` | Per-capability request limit; `0` disables it |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
 | `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
 | `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
+| `WSI_STAIN_CLASSIFICATION_TABLE` | `cdsi_prod.pathology_data_mining.slide_stain_classification` | Approved offline H-Optimus release consumed by canonical stain routing |
 
 Thumbnail artifacts are generated offline by
 `tools/generate_slide_thumbnails.py` and their URL, dimensions, content type,
@@ -111,6 +115,20 @@ Redis is an optimization only; a cache outage does not change authorization.
 If a requested overview cannot be decoded within the configured pixel bound,
 the tile endpoint returns HTTP 422 with
 `{"error":"overview_requires_preprocessing"}`.
+
+Cache misses are coordinated in two layers. The in-process single-flight
+coalesces requests within a Gunicorn worker, while Redis locks coalesce the
+same key across workers and replicas. Only the extraction owner consumes the
+cache-miss rate limit; cache hits are not application-rate-limited. If Redis
+is unavailable, the service falls back to local single-flight and the image
+operation semaphore, and records the outage in metrics.
+
+The `/metrics` endpoint is intended for internal monitoring and is not a WSI
+capability endpoint. Production ingress should expose only the tile,
+thumbnail, health, and readiness paths; scrape `/metrics` through the internal
+Kubernetes service. Important metrics include image-operation queue time,
+slide-open latency, Redis errors/latency, cache hit/miss counts, distributed
+miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ## Quick start
 
@@ -161,8 +179,19 @@ The tile server is deliberately not a ClickHouse writer. It receives source
 URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
 authorized pixel and thumbnail requests.
 
+### Image-assisted stain routing
+
+The offline stain-classifier publisher writes an approved release to
+`WSI_STAIN_CLASSIFICATION_TABLE`. The canonical association job joins the
+latest approved row by `image_id`, applies exact binary adjudications first,
+and then permits only high-confidence H&E-to-IHC promotions. Metadata IHC is
+never downgraded by the model; missing scores and ambiguous reviews retain
+metadata behavior. The resulting `is_hne`, `is_ihc`, and `slide_type` values
+are consumed by the normal WSI importer, ClickHouse hierarchy, and frontend
+filters. Tile authorization and pixel delivery remain unchanged.
+
 For development or rehearsal, use the Databricks `dev` profile and its
-warehouse, and point all three `WSI_*_TABLE` variables at the isolated
+warehouse, and point all four `WSI_*_TABLE` variables at the isolated
 `cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
 object-store prefix such as
 `s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does

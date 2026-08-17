@@ -84,6 +84,7 @@ class SlideCache:
         while True:
             opener: _OpenState | None = None
             evicted: _CacheEntry | None = None
+            is_owner = False
             with self._condition:
                 cached = self._cache.get(slide_id)
                 if cached is not None:
@@ -115,17 +116,13 @@ class SlideCache:
 
                     opener = _OpenState(event=threading.Event())
                     self._opening[slide_id] = opener
+                    is_owner = True
 
-            if opener is not None and slide_id in self._opening and evicted is None:
-                # If this state was already present, wait for its owner. The
-                # owner path below has evicted any idle entry before opening.
-                with self._condition:
-                    is_owner = self._opening.get(slide_id) is opener
-                if not is_owner:
-                    opener.event.wait()
-                    if opener.error is not None:
-                        raise opener.error
-                    continue
+            if opener is not None and not is_owner:
+                opener.event.wait()
+                if opener.error is not None:
+                    raise opener.error
+                continue
 
             if evicted is not None:
                 _close_entry(evicted.entry)

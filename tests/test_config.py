@@ -19,7 +19,7 @@ def make_settings(**env):
              if not k.startswith(("AWS_", "DATABRICKS_", "REDIS", "TILE_",
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
-                                   "CORS_", "PATIENT_", "WSI_"))}
+                                   "CORS_", "CACHE_", "PATIENT_", "WSI_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -82,6 +82,17 @@ class TestOtherSettings:
     def test_max_image_operations_default(self):
         s = make_settings()
         assert s.max_image_operations == 2
+
+    def test_cache_miss_rate_limit_prefers_new_environment_name(self):
+        s = make_settings(
+            RATE_LIMIT_PER_MINUTE="7",
+            CACHE_MISS_RATE_LIMIT_PER_MINUTE="120",
+        )
+        assert s.cache_miss_rate_limit_per_minute == 120
+
+    def test_cache_miss_rate_limit_accepts_legacy_alias(self):
+        s = make_settings(RATE_LIMIT_PER_MINUTE="7")
+        assert s.cache_miss_rate_limit_per_minute == 7
 
     def test_test_slide_map_defaults_empty(self):
         s = make_settings()
