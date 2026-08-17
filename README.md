@@ -207,3 +207,20 @@ uv run pytest
 uv export --all-groups --no-emit-project --format requirements-txt \
   | uv run pip-audit -r /dev/stdin --strict
 ```
+
+## Container publication
+
+The `Build and publish container` workflow builds every pull request and runs
+the same health, readiness, authentication, CORS, and Gunicorn-startup smoke
+checks used for the triage canary.  A push to `main` publishes only an
+immutable full-commit tag to Docker Hub:
+
+```text
+cbioportal/cbioportal-tile-server:<commit-sha>
+```
+
+The repository must provide the `DOCKER_HUB_USERNAME` and
+`DOCKER_HUB_TOKEN` Actions secrets.  Kubernetes deployments should use the
+digest printed by the workflow (`@sha256:...`), not a mutable tag.  The
+workflow does not publish from pull requests or expose registry credentials to
+fork builds.

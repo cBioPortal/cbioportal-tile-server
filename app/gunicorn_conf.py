@@ -6,6 +6,10 @@ workers = int(os.environ.get("N_WORKERS", "4"))
 preload_app = True
 timeout = int(os.environ.get("GUNICORN_TIMEOUT", "120"))
 loglevel = os.environ.get("GUNICORN_LOG_LEVEL", "info")
+# The container runs without a writable home directory.  Gunicorn's optional
+# control socket otherwise defaults below /home/appuser and emits a startup
+# error even though the HTTP workers are healthy.
+control_socket_disable = True
 
 
 def child_exit(server, worker):

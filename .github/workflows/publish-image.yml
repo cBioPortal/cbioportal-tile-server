@@ -1,0 +1,85 @@
+name: Build and publish container
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: cbioportal/cbioportal-tile-server
+
+jobs:
+  container-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Build image
+        run: docker build --pull --tag tile-server:ci .
+
+      - name: Exercise health, readiness, auth, and CORS
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id="$(docker run --detach --rm \
+            --env WSI_AUTH_SECRET=0123456789abcdef0123456789abcdef \
+            --env REDIS_URL= \
+            --env N_WORKERS=1 \
+            --env CORS_ORIGINS=https://triage-beta.cbioportal.aws.mskcc.org \
+            --publish 18080:8080 tile-server:ci)"
+          cleanup() {
+            docker logs "$container_id" || true
+            docker stop "$container_id" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:18080/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/health
+          curl --fail --silent http://127.0.0.1:18080/ready
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)" = 401
+          curl --fail --silent --include --request OPTIONS \
+            --header 'Origin: https://triage-beta.cbioportal.aws.mskcc.org' \
+            --header 'Access-Control-Request-Method: GET' \
+            --header 'Access-Control-Request-Headers: authorization' \
+            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs \
+            | grep -i '^access-control-allow-origin: https://triage-beta.cbioportal.aws.mskcc.org'
+          ! docker logs "$container_id" 2>&1 | grep -q 'Control server error'
+
+  publish:
+    needs: container-smoke
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
+          DOCKER_HUB_TOKEN: ${{ secrets.DOCKER_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$DOCKER_HUB_USERNAME"
+          test -n "$DOCKER_HUB_TOKEN"
+          printf '%s' "$DOCKER_HUB_TOKEN" | docker login docker.io \
+            --username "$DOCKER_HUB_USERNAME" --password-stdin
+
+      - name: Build and push immutable image
+        run: |
+          set -euo pipefail
+          image="docker.io/${IMAGE_NAME}:${GITHUB_SHA}"
+          docker build --pull --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            --tag "$image" .
+          docker push "$image"
+          docker image inspect "$image" --format 'published digest: {{index .RepoDigests 0}}'
