@@ -57,12 +57,36 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
         "slide_path",
         "metadata_is_hne",
         "metadata_is_ihc",
+        "stain_name_canonical",
+        "stain_group_canonical",
+        "stain_name_raw",
+        "stain_group_raw",
         "resolved_is_hne",
         "resolved_is_ihc",
         "stain_classification_source",
     ):
         assert column in sql
     assert "reference_sequencing_date" not in sql
+    assert "REGEXP_REPLACE" in sql
+    assert "association.stain_name_canonical AS stain_name" in sql
+    assert "association.stain_group_canonical AS stain_group" in sql
+
+
+def test_canonical_pipeline_normalizes_common_stain_aliases():
+    sql = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_canonical_associations_pipeline.sql"
+    ).read_text(encoding="utf-8")
+
+    for source, canonical in (
+        ("impacttumor", "IMPACT - Tumor"),
+        ("recutmolecularhe", "RECUT MOLECULAR H&E"),
+        ("androgenreceptorquant", "ANDROGEN RECEPTOR"),
+        ("immunorecut%", "IMMUNO RECUT"),
+    ):
+        assert source in sql
+        assert canonical in sql
 
 
 def test_summary_pipeline_uses_resolved_flags():

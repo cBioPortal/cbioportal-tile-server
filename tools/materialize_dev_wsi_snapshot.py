@@ -373,13 +373,22 @@ WITH ranked_registry AS (
   FROM {registry} WHERE status = 'success'
 ), source_rows AS (
   SELECT *, NULLIF(sample_id, '') AS normalized_sample_id FROM {source}
+), normalized_stains AS (
+  SELECT
+    source_rows.*,
+    NULLIF(TRIM(REGEXP_REPLACE(COALESCE(stain_name, ''), '[[:space:]]+', ' ')), '') AS stain_name_canonical,
+    NULLIF(TRIM(REGEXP_REPLACE(COALESCE(stain_group, ''), '[[:space:]]+', ' ')), '') AS stain_group_canonical
+  FROM source_rows
 )
-SELECT 'canonical_slide_associations_v3' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
+SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
   NULLIF(s.reference_sample_id, '') AS reference_sample_id,
   s.part_key, s.part_number, s.part_designator, s.part_type, s.part_description,
   s.subspecialty, s.path_dx_title, s.block_key, s.block_number, s.block_label,
-  s.image_id, s.stain_name, s.stain_group, s.is_hne, s.is_ihc, s.magnification,
+  s.image_id, s.stain_name_canonical AS stain_name, s.stain_group_canonical AS stain_group,
+  s.stain_name_canonical, s.stain_group_canonical,
+  s.stain_name AS stain_name_raw, s.stain_group AS stain_group_raw,
+  s.is_hne, s.is_ihc, s.magnification,
   s.file_size_bytes,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> ''
@@ -392,7 +401,7 @@ SELECT 'canonical_slide_associations_v3' AS association_version, CURRENT_TIMESTA
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.artifact_uri END AS thumbnail_url,
   r.width AS thumbnail_width, r.height AS thumbnail_height, r.content_type AS thumbnail_content_type
-FROM source_rows s
+FROM normalized_stains s
 LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source_path = s.source_url""",
         warehouse_id,
     )

@@ -303,6 +303,94 @@ canonical_associations AS (
     ) ranked
     WHERE association_row_num = 1
 ),
+normalized_stains AS (
+    SELECT
+        association.*,
+        NULLIF(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REPLACE(COALESCE(CAST(association.stain_group AS STRING), ''), '&amp;', '&'),
+                        '[[:cntrl:]]',
+                        ' '
+                    ),
+                    '[[:space:]]+',
+                    ' '
+                )
+            ),
+            ''
+        ) AS stain_group_clean,
+        NULLIF(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REPLACE(COALESCE(CAST(association.stain_name AS STRING), ''), '&amp;', '&'),
+                        '[[:cntrl:]]',
+                        ' '
+                    ),
+                    '[[:space:]]+',
+                    ' '
+                )
+            ),
+            ''
+        ) AS stain_name_clean
+    FROM canonical_associations association
+),
+stain_keys AS (
+    SELECT
+        normalized.*,
+        LOWER(REGEXP_REPLACE(COALESCE(normalized.stain_group_clean, ''), '[^a-z0-9]+', '')) AS stain_group_key,
+        LOWER(REGEXP_REPLACE(COALESCE(normalized.stain_name_clean, ''), '[^a-z0-9]+', '')) AS stain_name_key
+    FROM normalized_stains normalized
+),
+canonical_stains AS (
+    SELECT
+        keyed.*,
+        CASE
+            WHEN keyed.stain_group_key = 'he' THEN 'H&E'
+            WHEN keyed.stain_group_key = 'heinitial' THEN 'H&E (Initial)'
+            WHEN keyed.stain_group_key = 'heother' THEN 'H&E (Other)'
+            WHEN keyed.stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
+            WHEN keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
+            WHEN keyed.stain_group_clean IS NULL
+                 AND keyed.stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$'
+                THEN 'H&E (Other)'
+            WHEN keyed.stain_group_clean IS NULL
+                 AND keyed.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+                THEN 'IHC'
+            WHEN keyed.stain_group_clean IS NULL
+                 AND keyed.stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)'
+                THEN 'Other'
+            ELSE keyed.stain_group_clean
+        END AS stain_group_canonical,
+        CASE
+            WHEN keyed.stain_name_key = 'impacttumor' THEN 'IMPACT - Tumor'
+            WHEN keyed.stain_name_key = 'impactnormaltissue' THEN 'IMPACT - Normal Tissue'
+            WHEN keyed.stain_name_key = 'dmherecut' THEN 'DM H&E RECUT'
+            WHEN keyed.stain_name_key = 'recutmolecularhe' THEN 'RECUT MOLECULAR H&E'
+            WHEN keyed.stain_name_key = 'recutadditionalhe' THEN 'RECUT ADDITIONAL H&E'
+            WHEN keyed.stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
+            WHEN keyed.stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant')
+                THEN 'ANDROGEN RECEPTOR'
+            WHEN keyed.stain_name_key IN ('he', 'hematoxylinandeosin') THEN 'H&E'
+            ELSE keyed.stain_name_clean
+        END AS stain_name_canonical
+    FROM stain_keys keyed
+),
+typed_stains AS (
+    SELECT
+        canonical.*,
+        (
+            canonical.stain_group_key IN ('he', 'heinitial', 'heother')
+            OR canonical.stain_name_key IN ('he', 'hematoxylinandeosin')
+            OR canonical.stain_name_key LIKE 'recut%he'
+        ) AS metadata_is_hne,
+        (
+            canonical.stain_group_key IN ('ihc', 'immunohistochemistry')
+            OR canonical.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+        ) AS metadata_is_ihc
+    FROM canonical_stains canonical
+),
 approved_stain_predictions AS (
     SELECT slide_id, model_version, scored_at, image_probability, manual_label,
            image_ihc_threshold
@@ -359,21 +447,12 @@ resolved_associations AS (
                 THEN TRUE
             ELSE FALSE
         END AS resolved_is_ihc
-    FROM (
-        SELECT
-            association.*,
-            (
-                LOWER(COALESCE(association.stain_group, '')) IN ('h&e', 'h&e (initial)', 'h&e (other)')
-                OR LOWER(TRIM(COALESCE(association.stain_name, ''))) IN ('h&e', 'he')
-            ) AS metadata_is_hne,
-            LOWER(COALESCE(association.stain_group, '')) = 'ihc' AS metadata_is_ihc
-        FROM canonical_associations association
-    ) association
+    FROM typed_stains association
     LEFT JOIN approved_stain_predictions prediction
         ON prediction.slide_id = CAST(association.image_id AS STRING)
 )
 SELECT
-    'canonical_slide_associations_v3' AS association_version,
+    'canonical_slide_associations_v4' AS association_version,
     CURRENT_TIMESTAMP() AS updated_at,
     association.match_level,
     association.patient_id,
@@ -390,8 +469,12 @@ SELECT
     association.block_number,
     association.block_label,
     association.image_id,
-    association.stain_name,
-    association.stain_group,
+    association.stain_name_canonical AS stain_name,
+    association.stain_group_canonical AS stain_group,
+    association.stain_name_canonical,
+    association.stain_group_canonical,
+    association.stain_name AS stain_name_raw,
+    association.stain_group AS stain_group_raw,
     association.metadata_is_hne,
     association.metadata_is_ihc,
     association.resolved_is_hne AS is_hne,

@@ -190,6 +190,12 @@ metadata behavior. The resulting `is_hne`, `is_ihc`, and `slide_type` values
 are consumed by the normal WSI importer, ClickHouse hierarchy, and frontend
 filters. Tile authorization and pixel delivery remain unchanged.
 
+The canonical association table normalizes whitespace, control characters, and
+known stain aliases before emitting `stain_group` and `stain_name`. The source
+values remain available as `stain_group_raw` and `stain_name_raw`; ambiguous
+recuts, controls, and special stains are not silently forced into the binary
+H&E/IHC classes.
+
 For development or rehearsal, use the Databricks `dev` profile and its
 warehouse, and point all four `WSI_*_TABLE` variables at the isolated
 `cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
