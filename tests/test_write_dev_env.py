@@ -35,6 +35,7 @@ def test_main_writes_credentials_without_printing_them(tmp_path, monkeypatch, ca
     assert "AWS_SECRET_ACCESS_KEY=secret" in contents
     assert "DATABRICKS_CONFIG_PROFILE=dev" in contents
     assert "WSI_SUMMARY_TABLE=cdsi_dev.wsi_test.sample_wsi_summary" in contents
+    assert "WSI_STAIN_CLASSIFICATION_TABLE=cdsi_dev.wsi_test.slide_stain_classification" in contents
     assert (
         "THUMBNAIL_ARTIFACT_ROOT_URI=s3://mskmind-bkt/wsi-thumbnails-dev/masters"
         in contents

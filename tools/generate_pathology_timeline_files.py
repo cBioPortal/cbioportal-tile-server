@@ -185,8 +185,15 @@ def _read_study_identifier(study_dir: Path) -> str:
 
 
 def _infer_slide_type(
-    stain_group: str | None, stain_name: str | None
+    stain_group: str | None,
+    stain_name: str | None,
+    is_hne: bool | None = None,
+    is_ihc: bool | None = None,
 ) -> str | None:
+    if is_ihc is True:
+        return "IHC"
+    if is_hne is True:
+        return "H&E"
     group = (stain_group or "").lower()
     name = re.sub(r"\s+", " ", (stain_name or "").lower()).strip()
     if group == "ihc":
@@ -302,7 +309,12 @@ def build_pathology_timeline_rows(
         except (TypeError, ValueError):
             continue
 
-        subtype = _infer_slide_type(row.get("stain_group"), row.get("stain_name"))
+        subtype = _infer_slide_type(
+            row.get("stain_group"),
+            row.get("stain_name"),
+            row.get("is_hne"),
+            row.get("is_ihc"),
+        )
         if subtype is None:
             continue
 

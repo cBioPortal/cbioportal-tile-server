@@ -44,6 +44,13 @@ SUMMARY_TABLE = _table_name(
     "WSI_SUMMARY_TABLE", "cdsi_prod.pathology_data_mining.sample_wsi_summary"
 )
 
+# Approved image-assisted stain classifications. Missing rows intentionally
+# fall back to the source metadata classification.
+STAIN_CLASSIFICATION_TABLE = _table_name(
+    "WSI_STAIN_CLASSIFICATION_TABLE",
+    "cdsi_prod.pathology_data_mining.slide_stain_classification",
+)
+
 #: Canonical patient/sample/slide association table (written nightly by the Asset Bundle job)
 CANONICAL_ASSOCIATION_TABLE = _table_name(
     "WSI_CANONICAL_ASSOCIATION_TABLE",
