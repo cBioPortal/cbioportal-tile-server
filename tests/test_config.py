@@ -122,3 +122,14 @@ class TestOtherSettings:
             "https://cbioportal.mskcc.org",
             "https://triage.cbioportal.mskcc.org",
         ]
+
+    def test_wildcard_cors_origin_is_rejected(self):
+        with pytest.raises(ValueError, match="wildcard"):
+            make_settings(CORS_ORIGINS="*")
+
+    def test_file_sources_are_disabled_by_default(self):
+        assert make_settings().allow_file_sources is False
+
+    def test_external_result_hosts_are_explicit(self):
+        s = make_settings(DATABRICKS_EXTERNAL_RESULT_ALLOWED_HOSTS="results.example.org")
+        assert s.databricks_external_result_allowed_hosts == ["results.example.org"]

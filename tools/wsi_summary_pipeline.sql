@@ -15,6 +15,9 @@ WITH canonical_rows AS (
         image_id,
         slide_path,
         can_serve_tiles,
+        is_hne,
+        is_ihc,
+        slide_type,
         stain_group,
         stain_name
     FROM cdsi_prod.pathology_data_mining.canonical_slide_associations
@@ -29,10 +32,7 @@ sample_summary AS (
         COUNT(
             DISTINCT CASE
                 WHEN can_serve_tiles
-                 AND (
-                    LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
-                    OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
-                 )
+                 AND (is_hne OR is_ihc)
                 THEN image_id
                 ELSE NULL
             END
@@ -40,7 +40,7 @@ sample_summary AS (
         COUNT(
             DISTINCT CASE
                 WHEN COALESCE(slide_path, '') NOT LIKE 's3://%'
-                 AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
+                 AND is_hne
                 THEN image_id
                 ELSE NULL
             END
@@ -48,7 +48,7 @@ sample_summary AS (
         COUNT(
             DISTINCT CASE
                 WHEN COALESCE(slide_path, '') NOT LIKE 's3://%'
-                 AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
+                 AND is_ihc
                 THEN image_id
                 ELSE NULL
             END
@@ -56,7 +56,7 @@ sample_summary AS (
         MAX(
             CASE
                 WHEN can_serve_tiles
-                 AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
+                 AND is_hne
                 THEN 1
                 ELSE 0
             END
@@ -64,7 +64,7 @@ sample_summary AS (
         MAX(
             CASE
                 WHEN can_serve_tiles
-                 AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
+                 AND is_ihc
                 THEN 1
                 ELSE 0
             END
@@ -73,12 +73,8 @@ sample_summary AS (
             ARRAY_SORT(
                 COLLECT_SET(
                     CASE
-                        WHEN can_serve_tiles
-                         AND (
-                            LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%'
-                            OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%'
-                         )
-                        THEN stain_name
+                        WHEN can_serve_tiles AND (is_hne OR is_ihc)
+                        THEN COALESCE(slide_type, stain_name)
                         ELSE NULL
                     END
                 )

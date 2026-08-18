@@ -15,7 +15,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import cache as tile_cache
@@ -38,7 +38,12 @@ from .metrics import (
     track_image_operation,
 )
 from .slides import SlideCache
-from .thumbnail_store import ThumbnailRecord, render_thumbnail_response
+from .thumbnail_store import (
+    ThumbnailArtifactTooLarge,
+    ThumbnailRecord,
+    UnsafeThumbnailArtifact,
+    render_thumbnail_response,
+)
 from .tiles import OverviewTooLarge, get_tile_bytes
 
 logger = logging.getLogger(__name__)
@@ -174,13 +179,19 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_methods=["GET"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "X-WSI-Source"],
     expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason", "Retry-After"],
 )
 
 
-TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Authorization"}
-THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
+TILE_CACHE_HEADERS = {
+    "Cache-Control": "private, max-age=3600",
+    "Vary": "Authorization, X-WSI-Source",
+}
+THUMB_CACHE_HEADERS = {
+    "Cache-Control": "private, max-age=300",
+    "Vary": "Authorization, X-WSI-Source",
+}
 PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
 
 
@@ -265,6 +276,17 @@ def _allowed_source(source: str) -> str:
         raise HTTPException(status_code=400, detail="malformed source URL")
     if parsed.scheme.lower() == "file" and not parsed.path.startswith("/"):
         raise HTTPException(status_code=400, detail="malformed source URL")
+    if parsed.scheme.lower() == "file" and not settings.allow_file_sources:
+        raise HTTPException(status_code=400, detail="local file sources are disabled")
+    return source
+
+
+def _request_source(request: Request) -> str:
+    if any(key.lower() == "source" for key in request.query_params):
+        raise HTTPException(status_code=400, detail="source query parameter is not supported")
+    source = request.headers.get("x-wsi-source", "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="X-WSI-Source header is required")
     return source
 
 
@@ -365,9 +387,8 @@ async def tile(
     z: int,
     x: int,
     y: int,
-    source: str = Query(...),
 ):
-    source, claims = _authorize_source(request, source, "tile")
+    source, claims = _authorize_source(request, _request_source(request), "tile")
     cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
     if cached:
@@ -411,11 +432,10 @@ async def tile(
 @app.get("/thumbnails")
 async def thumbnail(
     request: Request,
-    source: str = Query(...),
     width: int = 256,
     height: int = 256,
 ):
-    source, claims = _authorize_source(request, source, "thumbnail")
+    source, claims = _authorize_source(request, _request_source(request), "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
     cache_key = source_digest(source)
@@ -451,6 +471,10 @@ async def thumbnail(
         raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Thumbnail extraction is still in progress")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="thumbnail not found")
+    except ThumbnailArtifactTooLarge:
+        raise HTTPException(status_code=413, detail="thumbnail artifact is too large")
+    except UnsafeThumbnailArtifact:
+        raise HTTPException(status_code=422, detail="thumbnail artifact is unsafe")
     except Exception as exc:
         logger.error("Thumbnail fetch failed; error_type=%s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="thumbnail unavailable")

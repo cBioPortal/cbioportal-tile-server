@@ -85,6 +85,12 @@ class Settings:
     thumbnail_manifest_uri: str = field(
         default_factory=lambda: _env_str("THUMBNAIL_MANIFEST_URI")
     )
+    thumbnail_manifest_max_bytes: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_MANIFEST_MAX_BYTES", 16 * 1024 * 1024)
+    )
+    thumbnail_artifact_max_bytes: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_ARTIFACT_MAX_BYTES", 16 * 1024 * 1024)
+    )
     thumbnail_master_size: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_MASTER_SIZE", 1024)
     )
@@ -139,6 +145,18 @@ class Settings:
     databricks_warehouse_id: str = field(
         default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
     )
+    databricks_external_result_allowed_hosts: list[str] = field(
+        default_factory=lambda: _env_csv("DATABRICKS_EXTERNAL_RESULT_ALLOWED_HOSTS", "")
+    )
+    databricks_external_result_max_bytes: int = field(
+        default_factory=lambda: _env_int("DATABRICKS_EXTERNAL_RESULT_MAX_BYTES", 64 * 1024 * 1024)
+    )
+
+    # Local filesystem sources are only valid for explicitly enabled
+    # development/test stacks. Production deployments must remain S3-only.
+    allow_file_sources: bool = field(
+        default_factory=lambda: _env_bool("WSI_ALLOW_FILE_SOURCES", False)
+    )
 
     # Block cache
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
@@ -159,6 +177,10 @@ class Settings:
             "https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org",
         )
     )
+
+    def __post_init__(self) -> None:
+        if any(origin == "*" for origin in self.cors_origins):
+            raise ValueError("CORS_ORIGINS must contain explicit origins; wildcard is not allowed")
 
 
 settings = Settings()

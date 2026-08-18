@@ -1,4 +1,4 @@
-FROM python:3.13.5-slim-bookworm
+FROM python:3.13.5-slim-bookworm AS builder
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
@@ -21,6 +21,19 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Copy source and install the project
 COPY app/ ./app/
 RUN uv sync --frozen --no-dev
+
+FROM python:3.13.5-slim-bookworm AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libjpeg-turbo-progs \
+    libzstd1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/.venv /app/.venv
+COPY app/ ./app/
 
 # Add venv to PATH so binaries are available without `uv run`
 ENV PATH="/app/.venv/bin:$PATH"

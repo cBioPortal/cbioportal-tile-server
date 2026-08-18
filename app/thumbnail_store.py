@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
 import fsspec
 from PIL import Image
+from PIL import UnidentifiedImageError
 
 from .config import settings
 from .slide_store import s3_opts
@@ -25,10 +27,25 @@ class ThumbnailRecord:
     content_type: str = "image/jpeg"
 
 
+class ThumbnailArtifactTooLarge(ValueError):
+    """Raised when a persisted thumbnail exceeds the configured byte budget."""
+
+
+class UnsafeThumbnailArtifact(ValueError):
+    """Raised when a persisted thumbnail is not a safe bounded JPEG."""
+
+
 def _filesystem_for_uri(uri: str):
     if uri.startswith("s3://"):
         return fsspec.filesystem("s3", **s3_opts())
     return fsspec.filesystem("file")
+
+
+def _is_manifest_artifact_uri(uri: str) -> bool:
+    parsed = urlparse(uri)
+    if parsed.scheme.lower() == "s3":
+        return bool(parsed.netloc and parsed.path.strip("/"))
+    return parsed.scheme.lower() == "file" and settings.allow_file_sources
 
 
 def _filesystem_path(uri: str) -> str:
@@ -41,21 +58,24 @@ def _filesystem_path(uri: str) -> str:
 
 def _load_manifest() -> dict[str, ThumbnailRecord]:
     manifest_uri = settings.thumbnail_manifest_uri.strip()
-    if not manifest_uri:
+    if not manifest_uri or not _is_manifest_artifact_uri(manifest_uri):
         return {}
     fs = _filesystem_for_uri(manifest_uri)
     try:
         with fs.open(_filesystem_path(manifest_uri), "r") as handle:
-            payload = json.load(handle)
+            raw = handle.read(settings.thumbnail_manifest_max_bytes + 1)
     except FileNotFoundError:
         return {}
+    if len(raw.encode("utf-8")) > settings.thumbnail_manifest_max_bytes:
+        raise ThumbnailArtifactTooLarge("thumbnail manifest exceeds byte budget")
+    payload = json.loads(raw)
     slides = payload.get("slides") or {}
     records: dict[str, ThumbnailRecord] = {}
     for image_id, raw in slides.items():
         if not isinstance(raw, dict):
             continue
         uri = str(raw.get("uri") or "").strip()
-        if not uri:
+        if not uri or not _is_manifest_artifact_uri(uri):
             continue
         records[str(image_id)] = ThumbnailRecord(
             image_id=str(image_id),
@@ -120,7 +140,7 @@ def get_thumbnail_record(image_id: str) -> ThumbnailRecord | None:
 
 def _thumbnail_root_uri() -> str:
     manifest_uri = settings.thumbnail_manifest_uri.strip()
-    if not manifest_uri:
+    if not manifest_uri or not _is_manifest_artifact_uri(manifest_uri):
         return ""
     if manifest_uri.endswith("/manifest.json"):
         return manifest_uri[: -len("/manifest.json")] + "/masters"
@@ -137,8 +157,19 @@ def _generated_thumbnail_uri(image_id: str) -> str:
 
 
 def _read_thumbnail_dimensions(payload: bytes) -> tuple[int, int]:
-    with Image.open(BytesIO(payload)) as image:
-        return image.size
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            width, height = image.size
+            if width < 1 or height < 1 or width * height > settings.thumbnail_max_decode_pixels:
+                raise UnsafeThumbnailArtifact("thumbnail dimensions exceed pixel budget")
+            if image.format != "JPEG":
+                raise UnsafeThumbnailArtifact("thumbnail is not JPEG")
+            image.verify()
+            return width, height
+    except UnsafeThumbnailArtifact:
+        raise
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise UnsafeThumbnailArtifact("thumbnail is not a valid JPEG") from exc
 
 
 def _record_from_payload(image_id: str, uri: str, payload: bytes) -> ThumbnailRecord:
@@ -161,7 +192,9 @@ def get_persisted_generated_thumbnail_record(image_id: str) -> ThumbnailRecord |
     if not fs.exists(path):
         return None
     with fs.open(path, "rb") as handle:
-        payload = handle.read()
+        payload = handle.read(settings.thumbnail_artifact_max_bytes + 1)
+    if len(payload) > settings.thumbnail_artifact_max_bytes:
+        raise ThumbnailArtifactTooLarge("thumbnail artifact exceeds byte budget")
     record = _record_from_payload(image_id, uri, payload)
     manifest_cache.register_generated(record)
     return record
@@ -171,6 +204,9 @@ def store_generated_thumbnail(image_id: str, payload: bytes) -> ThumbnailRecord 
     uri = _generated_thumbnail_uri(image_id)
     if not uri:
         return None
+    if len(payload) > settings.thumbnail_artifact_max_bytes:
+        raise ThumbnailArtifactTooLarge("thumbnail artifact exceeds byte budget")
+    _read_thumbnail_dimensions(payload)
     fs = _filesystem_for_uri(uri)
     path = _filesystem_path(uri)
     parent = path.rsplit("/", 1)[0] if "/" in path else ""
@@ -187,7 +223,10 @@ def store_generated_thumbnail(image_id: str, payload: bytes) -> ThumbnailRecord 
 def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
     fs = _filesystem_for_uri(record.uri)
     with fs.open(_filesystem_path(record.uri), "rb") as handle:
-        return handle.read()
+        payload = handle.read(settings.thumbnail_artifact_max_bytes + 1)
+    if len(payload) > settings.thumbnail_artifact_max_bytes:
+        raise ThumbnailArtifactTooLarge("thumbnail artifact exceeds byte budget")
+    return payload
 
 
 def render_thumbnail_response(
@@ -196,12 +235,19 @@ def render_thumbnail_response(
     requested_height: int,
 ) -> tuple[bytes, dict[str, Any]]:
     payload = read_thumbnail_bytes(record)
-    if requested_width >= record.width and requested_height >= record.height:
+    actual_width, actual_height = _read_thumbnail_dimensions(payload)
+    if requested_width >= actual_width and requested_height >= actual_height:
         return payload, {"status": "ok", "reason": "master"}
 
-    with Image.open(BytesIO(payload)) as image:
-        working = image.convert("RGB")
-        working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
-        out = BytesIO()
-        working.save(out, format="JPEG", quality=settings.jpeg_quality)
-    return out.getvalue(), {"status": "ok", "reason": "resized"}
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            working = image.convert("RGB")
+            working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
+            out = BytesIO()
+            working.save(out, format="JPEG", quality=settings.jpeg_quality)
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise UnsafeThumbnailArtifact("thumbnail cannot be resized") from exc
+    resized_payload = out.getvalue()
+    if len(resized_payload) > settings.thumbnail_artifact_max_bytes:
+        raise ThumbnailArtifactTooLarge("resized thumbnail exceeds byte budget")
+    return resized_payload, {"status": "ok", "reason": "resized"}

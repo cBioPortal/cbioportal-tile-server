@@ -34,8 +34,18 @@ resources:
         pause_status: UNPAUSED
 
       tasks:
+        - task_key: ensure-stain-classification-table
+          description: Ensure the approved offline stain-classification release table exists
+          sql_task:
+            warehouse_id: "0b49b7d78734ad5c"
+            file:
+              path: tools/stain_classification_schema.sql
+              source: WORKSPACE
+
         - task_key: compute-canonical-associations
           description: Run wsi_canonical_associations_pipeline.sql on serverless compute
+          depends_on:
+            - task_key: ensure-stain-classification-table
           sql_task:
             warehouse_id: "0b49b7d78734ad5c"
             file:

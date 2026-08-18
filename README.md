@@ -57,8 +57,8 @@ remediation.
 | GET | `/health` | Public liveness probe |
 | GET | `/ready` | Public readiness probe (auth configuration only) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
-| GET | `/tiles/zxy/{z}/{x}/{y}?source=...` | Source-bound JPEG tile |
-| GET | `/thumbnails?source=...&width=...&height=...` | Source-bound thumbnail resize |
+| GET | `/tiles/zxy/{z}/{x}/{y}` with `X-WSI-Source` | Source-bound JPEG tile |
+| GET | `/thumbnails?width=...&height=...` with `X-WSI-Source` | Source-bound thumbnail resize |
 
 The same routes are available under `/wsi`. Every pixel request requires:
 
@@ -70,6 +70,8 @@ Capabilities are HMAC-SHA256 JWTs with `scope=wsi:read`,
 `wsi_auth_version=2`, `study_id`, `image_id`, exact source URL digests, bounded
 thumbnail dimensions, and an expiry no longer than `WSI_AUTH_MAX_TTL`.
 `/health` and `/ready` intentionally remain public for orchestration probes.
+Pixel requests carry the exact source URL in `X-WSI-Source`; source query
+parameters are rejected so storage paths do not enter normal URL logs.
 
 ## Runtime configuration
 
@@ -85,6 +87,7 @@ optional Redis cache:
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
+| `WSI_ALLOW_FILE_SOURCES` | `false` | Explicit development-only switch for mounted local files |
 | `REDIS_URL` | `redis://redis:6379` | Optional tile/thumbnail cache |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
@@ -97,6 +100,10 @@ optional Redis cache:
 | `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `30` | Maximum follower wait for another worker's extraction |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
+| `THUMBNAIL_ARTIFACT_MAX_BYTES` | `16777216` | Maximum persisted thumbnail size before decoding |
+| `THUMBNAIL_MANIFEST_MAX_BYTES` | `16777216` | Maximum manifest size loaded by the service |
+| `DATABRICKS_EXTERNAL_RESULT_ALLOWED_HOSTS` | — | Exact HTTPS hosts permitted for offline result chunks |
+| `DATABRICKS_EXTERNAL_RESULT_MAX_BYTES` | `67108864` | Maximum Databricks external result chunk size |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
 | `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
 | `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
@@ -219,7 +226,8 @@ production Databricks SQL templates remain available through
 catalogs; leaving the variables unset preserves production defaults.
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
-issue a v2 capability whose source URL is the mounted file URI. The normal
+`WSI_ALLOW_FILE_SOURCES=true`, and issue a v2 capability whose source URL is
+the mounted file URI. The normal
 production default accepts only `s3` URLs.
 
 ## PHI-safe operation

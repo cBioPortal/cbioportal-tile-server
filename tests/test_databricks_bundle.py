@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.constants import CANONICAL_ASSOCIATION_TABLE
+from app.constants import CANONICAL_ASSOCIATION_TABLE, STAIN_CLASSIFICATION_TABLE
 import tools.run_wsi_pipelines as wsi_pipelines
 
 
@@ -55,9 +55,25 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
         "procedure_date_days",
         "timepoint_source",
         "slide_path",
+        "metadata_is_hne",
+        "metadata_is_ihc",
+        "resolved_is_hne",
+        "resolved_is_ihc",
+        "stain_classification_source",
     ):
         assert column in sql
     assert "reference_sequencing_date" not in sql
+
+
+def test_summary_pipeline_uses_resolved_flags():
+    sql = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_summary_pipeline.sql"
+    ).read_text(encoding="utf-8")
+    assert "AND (is_hne OR is_ihc)" in sql
+    assert "LIKE '%h&e%'" not in sql
+    assert "LIKE '%ihc%'" not in sql
 
 
 def test_pipeline_renderer_rewrites_all_output_names(monkeypatch):
@@ -74,12 +90,31 @@ def test_pipeline_renderer_rewrites_all_output_names(monkeypatch):
         "THUMBNAIL_REGISTRY_TABLE",
         "cdsi_dev.wsi_test.slide_thumbnail_registry",
     )
+    monkeypatch.setattr(
+        wsi_pipelines,
+        "STAIN_CLASSIFICATION_TABLE",
+        "cdsi_dev.wsi_test.slide_stain_classification",
+    )
     rendered = wsi_pipelines._render(
         "FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry "
         "JOIN cdsi_prod.pathology_data_mining.canonical_slide_associations c "
-        "JOIN cdsi_prod.pathology_data_mining.sample_wsi_summary s"
+        "JOIN cdsi_prod.pathology_data_mining.sample_wsi_summary s "
+        "JOIN cdsi_prod.pathology_data_mining.slide_stain_classification p"
     )
     assert "cdsi_prod.pathology_data_mining" not in rendered
+
+
+def test_pipeline_renderer_rewrites_stain_classification_table(monkeypatch):
+    monkeypatch.setattr(
+        wsi_pipelines,
+        "STAIN_CLASSIFICATION_TABLE",
+        "cdsi_dev.wsi_test.slide_stain_classification",
+    )
+    rendered = wsi_pipelines._render(
+        "FROM cdsi_prod.pathology_data_mining.slide_stain_classification"
+    )
+    assert STAIN_CLASSIFICATION_TABLE not in rendered
+    assert "cdsi_dev.wsi_test.slide_stain_classification" in rendered
 
 
 def test_canonical_pipeline_scopes_unmatched_parts_to_source_accessions():

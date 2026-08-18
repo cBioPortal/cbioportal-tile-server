@@ -35,6 +35,7 @@ WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
 WSI_AUTH_AUDIENCE=cbioportal-wsi
 WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
+WSI_ALLOW_FILE_SOURCES=false
 REDIS_URL=<password-protected Redis URL>
 ```
 
@@ -42,12 +43,18 @@ The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
 server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
 legacy configuration key but authentication is mandatory for pixel routes.
 
+Offline Databricks external-result jobs must also set
+`DATABRICKS_EXTERNAL_RESULT_ALLOWED_HOSTS` to the exact HTTPS result hosts
+returned by the workspace. The service rejects redirects, credential headers,
+and chunks larger than `DATABRICKS_EXTERNAL_RESULT_MAX_BYTES`.
+
 ## Endpoints and smoke checks
 
 ```bash
 curl -fsS https://cbioportal.example.org/wsi/health
 curl -fsS https://cbioportal.example.org/wsi/ready
-curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs
+curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0 \
+  -H 'X-WSI-Source: s3://bucket/slide.svs'
 ```
 
 The final command must return `401` without `Authorization`. With a fresh
@@ -56,12 +63,14 @@ bundle from cBioPortal, use the returned source URL and token:
 ```bash
 curl -fsS \
   -H "Authorization: Bearer ${WSI_TOKEN}" \
-  "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$WSI_SOURCE")"
+  -H "X-WSI-Source: ${WSI_SOURCE}" \
+  "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0"
 ```
 
-Also verify that changing one character of the source URL returns `403`, that
+Also verify that changing one character of the `X-WSI-Source` value returns `403`, that
 an expired token returns `401`, and that the thumbnail endpoint accepts only
-the artifact URL bound in the same token.
+the artifact URL bound in the same token. A `source` query parameter must be
+rejected; do not put storage URLs in request URLs or browser links.
 
 ## Data preparation
 
@@ -103,8 +112,8 @@ production source of truth.
 
 ## Response and cache policy
 
-- Tiles: `private, max-age=3600`, vary on `Authorization`.
-- Thumbnails: `private, max-age=300`, vary on `Authorization`.
+- Tiles: `private, max-age=3600`, vary on `Authorization, X-WSI-Source`.
+- Thumbnails: `private, max-age=300`, vary on `Authorization, X-WSI-Source`.
 - Redis is an optimization, never an authorization boundary.
 - Overview decodes that exceed `MAX_DECODE_PIXELS` return HTTP 422 with
   `overview_requires_preprocessing`.
@@ -116,8 +125,9 @@ IDs. Keep operation type, dimensions, status, timing, and exception class.
 
 The local cBioPortal compose rehearsal should pass the same
 `WSI_AUTH_SECRET`/audience to the backend and tile server. For mounted local
-slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`; production should
-remain `s3` only. Generate a v2 access bundle through the backend before
+slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
+`WSI_ALLOW_FILE_SOURCES=true`; production should remain `s3` only. Generate a
+v2 access bundle through the backend before
 testing a pixel request.
 
 ## Thumbnail batch operations

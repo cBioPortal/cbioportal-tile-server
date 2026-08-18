@@ -374,7 +374,7 @@ WITH ranked_registry AS (
 ), source_rows AS (
   SELECT *, NULLIF(sample_id, '') AS normalized_sample_id FROM {source}
 )
-SELECT 'canonical_slide_associations_v2' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
+SELECT 'canonical_slide_associations_v3' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
   NULLIF(s.reference_sample_id, '') AS reference_sample_id,
   s.part_key, s.part_number, s.part_designator, s.part_type, s.part_description,
@@ -400,12 +400,12 @@ LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source
         f"""CREATE TABLE {summary} USING DELTA AS
 SELECT sample_id, patient_id, MAX(association_version) AS association_version,
  MAX(updated_at) AS updated_at,
- COUNT(DISTINCT CASE WHEN can_serve_tiles AND (LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%') THEN image_id END) AS servable_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' THEN image_id END) AS non_servable_hne_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%' THEN image_id END) AS non_servable_ihc_slide_count,
- MAX(CASE WHEN can_serve_tiles AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' THEN 1 ELSE 0 END) AS has_hne,
- MAX(CASE WHEN can_serve_tiles AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%' THEN 1 ELSE 0 END) AS has_ihc,
- ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%') THEN stain_name END)), ';') AS stain_types
+ COUNT(DISTINCT CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN image_id END) AS servable_slide_count,
+ COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_hne THEN image_id END) AS non_servable_hne_slide_count,
+ COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_ihc THEN image_id END) AS non_servable_ihc_slide_count,
+ MAX(CASE WHEN can_serve_tiles AND is_hne THEN 1 ELSE 0 END) AS has_hne,
+ MAX(CASE WHEN can_serve_tiles AND is_ihc THEN 1 ELSE 0 END) AS has_ihc,
+ ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN COALESCE(slide_type, stain_name) END)), ';') AS stain_types
 FROM {canonical} WHERE sample_id IS NOT NULL GROUP BY sample_id, patient_id""",
         warehouse_id,
     )

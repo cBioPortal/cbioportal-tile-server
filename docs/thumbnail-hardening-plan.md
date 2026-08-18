@@ -1,7 +1,7 @@
 # Thumbnail Artifact Serving Plan (superseded)
 
 The source-bound v2 contract supersedes the image-ID routes described below.
-New deployments use `/thumbnails?source=...` with a cBioPortal slide access
+New deployments use `/thumbnails` with `X-WSI-Source` and a cBioPortal slide access
 capability; this file is retained only as historical context.
 
 > **Production policy:** this is a historical design document. The current

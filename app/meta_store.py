@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .constants import (
     CANONICAL_ASSOCIATION_TABLE as _CANONICAL_ASSOCIATIONS,
@@ -13,8 +14,38 @@ from .constants import (
     INVENTORY_TABLE as _INVENTORY,
     SUMMARY_TABLE as _SUMMARY,
 )
+from .config import settings
 
 EXTERNAL_LINK_TIMEOUT_SEC = 120
+_EXTERNAL_LINK_SAFE_HEADERS = {"accept", "range", "content-type"}
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Databricks external result redirects are disabled")
+
+
+_external_link_opener = build_opener(_NoRedirect)
+
+
+def _validated_external_link(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    allowed_hosts = {item.strip().lower() for item in settings.databricks_external_result_allowed_hosts}
+    if parsed.scheme.lower() != "https" or not host or parsed.username or parsed.password:
+        raise RuntimeError("Databricks external result must use an approved HTTPS URL")
+    if host not in allowed_hosts:
+        raise RuntimeError("Databricks external result host is not allowlisted")
+    return url
+
+
+def _safe_external_headers(headers: dict[str, str] | None) -> dict[str, str]:
+    safe: dict[str, str] = {}
+    for name, value in (headers or {}).items():
+        lower_name = name.lower()
+        if lower_name in _EXTERNAL_LINK_SAFE_HEADERS or lower_name.startswith(("x-amz-", "x-ms-")):
+            safe[name] = value
+    return safe
 
 PATIENT_SQL = f"""
 WITH sample_sequencing AS (
@@ -243,6 +274,7 @@ def run_query_external(sql: str, warehouse_id: str, params: list | None = None) 
 
     columns = [column.name for column in stmt.manifest.schema.columns]
     rows: list[dict[str, Any]] = []
+    total_result_bytes = 0
     for chunk_index in range(int(stmt.manifest.total_chunk_count or 0)):
         chunk = client().statement_execution.get_statement_result_chunk_n(
             stmt.statement_id,
@@ -254,9 +286,24 @@ def run_query_external(sql: str, warehouse_id: str, params: list | None = None) 
         link = links[0]
         if not link.external_link:
             raise RuntimeError(f"Databricks result chunk {chunk_index} has no external link")
-        request = Request(link.external_link, headers=link.http_headers or {})
-        with urlopen(request, timeout=EXTERNAL_LINK_TIMEOUT_SEC) as response:  # noqa: S310
-            payload = json.loads(response.read().decode("utf-8"))
+        external_link = _validated_external_link(link.external_link)
+        request = Request(external_link, headers=_safe_external_headers(link.http_headers))
+        with _external_link_opener.open(request, timeout=EXTERNAL_LINK_TIMEOUT_SEC) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("Databricks external result has an invalid content length") from exc
+                if declared_length < 0 or declared_length > settings.databricks_external_result_max_bytes:
+                    raise RuntimeError("Databricks external result exceeds byte budget")
+            raw_payload = response.read(settings.databricks_external_result_max_bytes + 1)
+        if len(raw_payload) > settings.databricks_external_result_max_bytes:
+            raise RuntimeError("Databricks external result exceeds byte budget")
+        total_result_bytes += len(raw_payload)
+        if total_result_bytes > settings.databricks_external_result_max_bytes:
+            raise RuntimeError("Databricks external result exceeds total byte budget")
+        payload = json.loads(raw_payload.decode("utf-8"))
         rows.extend(dict(zip(columns, row)) for row in payload)
     return rows
 

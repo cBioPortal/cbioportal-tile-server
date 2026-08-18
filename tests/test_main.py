@@ -117,28 +117,51 @@ class TestCorsPreflight:
         transport = httpx.ASGITransport(app=main_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.options(
-                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                "/tiles/zxy/0/0/0",
                 headers={
                     "Origin": "https://cbioportal.mskcc.org",
                     "Access-Control-Request-Method": "GET",
-                    "Access-Control-Request-Headers": "Authorization",
+                    "Access-Control-Request-Headers": "Authorization, X-WSI-Source",
                 },
             )
 
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "https://cbioportal.mskcc.org"
         assert "authorization" in response.headers["access-control-allow-headers"].lower()
+        assert "x-wsi-source" in response.headers["access-control-allow-headers"].lower()
 
     @pytest.mark.asyncio
     async def test_unauthenticated_tile_get_remains_protected(self):
         transport = httpx.ASGITransport(app=main_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                "/tiles/zxy/0/0/0",
                 headers={"Origin": "https://cbioportal.mskcc.org"},
             )
 
         assert response.status_code == 401
+
+    def test_source_must_be_supplied_in_header(self):
+        scope = {
+            "type": "http",
+            "path": "/tiles/zxy/0/0/0",
+            "query_string": b"",
+            "headers": [],
+            "method": "GET",
+        }
+        with pytest.raises(main_module.HTTPException, match="X-WSI-Source"):
+            main_module._request_source(main_module.Request(scope, receive=lambda: None))
+
+    def test_source_query_parameter_is_rejected(self):
+        scope = {
+            "type": "http",
+            "path": "/tiles/zxy/0/0/0",
+            "query_string": b"source=s3%3A%2F%2Fbucket%2Fslide.svs",
+            "headers": [(b"x-wsi-source", b"s3://bucket/slide.svs")],
+            "method": "GET",
+        }
+        with pytest.raises(main_module.HTTPException, match="query parameter"):
+            main_module._request_source(main_module.Request(scope, receive=lambda: None))
 
     @pytest.mark.asyncio
     async def test_metrics_bypasses_capability_guard(self):

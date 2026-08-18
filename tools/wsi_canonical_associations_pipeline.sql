@@ -302,9 +302,78 @@ canonical_associations AS (
         ) association
     ) ranked
     WHERE association_row_num = 1
+),
+approved_stain_predictions AS (
+    SELECT slide_id, model_version, scored_at, image_probability, manual_label,
+           image_ihc_threshold
+    FROM (
+        SELECT
+            CAST(slide_id AS STRING) AS slide_id,
+            model_version,
+            scored_at,
+            image_probability,
+            manual_label,
+            image_ihc_threshold,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(slide_id AS STRING)
+                ORDER BY scored_at DESC, model_version DESC
+            ) AS row_num
+        FROM cdsi_prod.pathology_data_mining.slide_stain_classification
+        WHERE model_approved = TRUE
+    ) ranked_predictions
+    WHERE row_num = 1
+),
+resolved_associations AS (
+    SELECT
+        association.*,
+        prediction.model_version AS stain_model_version,
+        prediction.scored_at AS stain_scored_at,
+        prediction.image_probability AS stain_image_probability,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) IN ('he', 'ihc') THEN prediction.manual_label
+            WHEN metadata_is_ihc THEN 'metadata'
+            WHEN metadata_is_hne
+                 AND prediction.image_probability IS NOT NULL
+                 AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                THEN 'image_model'
+            WHEN metadata_is_hne THEN 'metadata'
+            ELSE 'metadata_fallback'
+        END AS stain_classification_source,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'he' THEN TRUE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'ihc' THEN FALSE
+            ELSE metadata_is_hne
+                 AND NOT metadata_is_ihc
+                 AND NOT (
+                     prediction.image_probability IS NOT NULL
+                     AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                 )
+        END AS resolved_is_hne,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'ihc' THEN TRUE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'he' THEN FALSE
+            WHEN metadata_is_ihc THEN TRUE
+            WHEN metadata_is_hne
+                 AND prediction.image_probability IS NOT NULL
+                 AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                THEN TRUE
+            ELSE FALSE
+        END AS resolved_is_ihc
+    FROM (
+        SELECT
+            association.*,
+            (
+                LOWER(COALESCE(association.stain_group, '')) IN ('h&e', 'h&e (initial)', 'h&e (other)')
+                OR LOWER(TRIM(COALESCE(association.stain_name, ''))) IN ('h&e', 'he')
+            ) AS metadata_is_hne,
+            LOWER(COALESCE(association.stain_group, '')) = 'ihc' AS metadata_is_ihc
+        FROM canonical_associations association
+    ) association
+    LEFT JOIN approved_stain_predictions prediction
+        ON prediction.slide_id = CAST(association.image_id AS STRING)
 )
 SELECT
-    'canonical_slide_associations_v2' AS association_version,
+    'canonical_slide_associations_v3' AS association_version,
     CURRENT_TIMESTAMP() AS updated_at,
     association.match_level,
     association.patient_id,
@@ -323,12 +392,14 @@ SELECT
     association.image_id,
     association.stain_name,
     association.stain_group,
-    CASE
-        WHEN LOWER(association.stain_group) IN ('h&e (initial)', 'h&e (other)', 'h&e')
-          OR LOWER(TRIM(association.stain_name)) IN ('h&e', 'he') THEN TRUE
-        ELSE FALSE
-    END AS is_hne,
-    CASE WHEN LOWER(association.stain_group) = 'ihc' THEN TRUE ELSE FALSE END AS is_ihc,
+    association.metadata_is_hne,
+    association.metadata_is_ihc,
+    association.resolved_is_hne AS is_hne,
+    association.resolved_is_ihc AS is_ihc,
+    association.stain_classification_source,
+    association.stain_model_version,
+    association.stain_scored_at,
+    association.stain_image_probability,
     association.magnification,
     association.file_size_bytes,
     CASE
@@ -344,7 +415,11 @@ SELECT
         ELSE FALSE
     END AS can_serve_tiles,
     association.barcode,
-    association.slide_type,
+    CASE
+        WHEN association.resolved_is_hne THEN 'H&E'
+        WHEN association.resolved_is_ihc THEN 'IHC'
+        ELSE association.slide_type
+    END AS slide_type,
     CONCAT(LOWER(association.match_level), '::', association.part_key, '::', association.block_key) AS specimen_key,
     DATEDIFF(association.procedure_date, reference.sequencing_date) AS procedure_date_days,
     CASE
@@ -372,7 +447,7 @@ SELECT
     thumbnail_registry.width AS thumbnail_width,
     thumbnail_registry.height AS thumbnail_height,
     thumbnail_registry.content_type AS thumbnail_content_type
-FROM canonical_associations association
+FROM resolved_associations association
 LEFT JOIN patient_reference reference ON reference.patient_id = association.patient_id
 LEFT JOIN thumbnail_registry
     ON thumbnail_registry.image_id = CAST(association.image_id AS STRING);

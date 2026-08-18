@@ -2,12 +2,13 @@
 
 Example:
     python tests/smoke.py --host http://localhost:8081 \
-        --source-url s3://bucket/slide.svs --bearer-token "$WSI_TOKEN"
+        --source-url s3://bucket/slide.svs \
+        --thumbnail-source-url s3://bucket/thumb.jpg \
+        --bearer-token "$WSI_TOKEN"
 """
 
 import argparse
 import sys
-import urllib.parse
 
 import requests
 
@@ -20,10 +21,16 @@ def check(label: str, response: requests.Response, expected_status: int = 200) -
     return ok
 
 
-def run_smoke(host: str, source_url: str, bearer_token: str) -> bool:
+def run_smoke(
+    host: str,
+    source_url: str,
+    bearer_token: str,
+    thumbnail_source_url: str | None = None,
+) -> bool:
     host = host.rstrip("/")
-    source = urllib.parse.quote(source_url, safe="")
     headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
+    source_headers = {**headers, "X-WSI-Source": source_url}
+    thumbnail_headers = {**headers, "X-WSI-Source": thumbnail_source_url or source_url}
     session = requests.Session()
     session.headers.update(headers)
     passed = failed = 0
@@ -39,15 +46,23 @@ def run_smoke(host: str, source_url: str, bearer_token: str) -> bool:
     ok = check("/ready", response)
     passed += int(ok); failed += int(not ok)
 
-    response = session.get(f"{host}/tiles/zxy/0/0/0?source={source}", timeout=30)
+    response = session.get(f"{host}/tiles/zxy/0/0/0", headers=source_headers, timeout=30)
     ok = check("/tiles/zxy/0/0/0", response) and response.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
-    response = session.get(f"{host}/thumbnails?source={source}&width=256&height=256", timeout=30)
+    response = session.get(
+        f"{host}/thumbnails?width=256&height=256",
+        headers=thumbnail_headers,
+        timeout=30,
+    )
     ok = check("/thumbnails", response) and response.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
-    unauthenticated = requests.get(f"{host}/tiles/zxy/0/0/0?source={source}", timeout=30)
+    unauthenticated = requests.get(
+        f"{host}/tiles/zxy/0/0/0",
+        headers={"X-WSI-Source": source_url},
+        timeout=30,
+    )
     ok = check("unauthenticated tile", unauthenticated, 401)
     passed += int(ok); failed += int(not ok)
 
@@ -59,9 +74,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="http://localhost:8081")
     parser.add_argument("--source-url", required=True)
+    parser.add_argument("--thumbnail-source-url", default="")
     parser.add_argument("--bearer-token", default="")
     args = parser.parse_args()
-    sys.exit(0 if run_smoke(args.host, args.source_url, args.bearer_token) else 1)
+    thumbnail_source_url = args.thumbnail_source_url or args.source_url
+    sys.exit(0 if run_smoke(args.host, args.source_url, args.bearer_token, thumbnail_source_url) else 1)
 
 
 if __name__ == "__main__":
