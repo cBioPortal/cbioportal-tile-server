@@ -89,6 +89,27 @@ def test_canonical_pipeline_normalizes_common_stain_aliases():
         assert canonical in sql
 
 
+def test_canonical_pipeline_applies_conservative_stain_policy():
+    root = Path(__file__).resolve().parent.parent
+    sql = (root / "tools" / "wsi_canonical_associations_pipeline.sql").read_text(
+        encoding="utf-8"
+    )
+    audit_sql = (root / "tools" / "stain_metadata_audit.sql").read_text(
+        encoding="utf-8"
+    )
+
+    assert "REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_group_clean" in sql
+    assert "REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_name_clean" in sql
+    assert "stain_name_key = 'sslhe'" in sql
+    assert "stain_name_key LIKE '%fish%'" in sql
+    assert "stain_group_clean IS NULL" in sql
+    assert "metadata_is_fish" not in sql
+    assert "nonbinary_queue" in audit_sql
+    assert "manual_override" in audit_sql
+    assert "curated_ssl_he" in audit_sql
+    assert "fish_exclusion" in audit_sql
+
+
 def test_canonical_pipeline_ranks_manual_adjudications_before_rescoring():
     sql = (
         Path(__file__).resolve().parent.parent

@@ -382,8 +382,8 @@ WITH ranked_registry AS (
 ), stain_keys AS (
   SELECT
     normalized_stains.*,
-    LOWER(REGEXP_REPLACE(COALESCE(stain_name_clean, ''), '[^a-z0-9]+', '')) AS stain_name_key,
-    LOWER(REGEXP_REPLACE(COALESCE(stain_group_clean, ''), '[^a-z0-9]+', '')) AS stain_group_key
+    REGEXP_REPLACE(LOWER(COALESCE(stain_name_clean, '')), '[^a-z0-9]+', '') AS stain_name_key,
+    REGEXP_REPLACE(LOWER(COALESCE(stain_group_clean, '')), '[^a-z0-9]+', '') AS stain_group_key
   FROM normalized_stains
 ), canonical_stains AS (
   SELECT
@@ -394,9 +394,11 @@ WITH ranked_registry AS (
       WHEN stain_group_key = 'heother' THEN 'H&E (Other)'
       WHEN stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
       WHEN stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
-      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$' THEN 'H&E (Other)'
-      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)' THEN 'IHC'
-      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN 'Other'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key = 'sslhe' THEN 'H&E (Other)'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key LIKE '%fish%' THEN 'Other'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$' THEN 'H&E (Other)'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)' THEN 'IHC'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN 'Other'
       ELSE stain_group_clean
     END AS stain_group_canonical,
     CASE
@@ -407,10 +409,29 @@ WITH ranked_registry AS (
       WHEN stain_name_key = 'recutadditionalhe' THEN 'RECUT ADDITIONAL H&E'
       WHEN stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
       WHEN stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant') THEN 'ANDROGEN RECEPTOR'
-      WHEN stain_name_key IN ('he', 'hematoxylinandeosin') THEN 'H&E'
+      WHEN stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe') THEN 'H&E'
       ELSE stain_name_clean
     END AS stain_name_canonical
   FROM stain_keys
+), typed_stains AS (
+  SELECT canonical_stains.*,
+    (
+      stain_name_key NOT LIKE '%fish%'
+      AND (
+        stain_group_key IN ('he', 'heinitial', 'heother')
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe'))
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key LIKE 'recut%he' AND stain_name_key NOT LIKE '%fish%')
+      )
+    ) AS metadata_is_hne,
+    (
+      (stain_group_key IN ('ihc', 'immunohistochemistry') AND stain_name_key NOT LIKE '%fish%')
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key NOT LIKE '%fish%'
+          AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)')
+    ) AS metadata_is_ihc
+  FROM canonical_stains
 )
 SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
@@ -420,7 +441,7 @@ SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTA
   s.image_id, s.stain_name_canonical AS stain_name, s.stain_group_canonical AS stain_group,
   s.stain_name_canonical, s.stain_group_canonical,
   s.stain_name AS stain_name_raw, s.stain_group AS stain_group_raw,
-  s.is_hne, s.is_ihc, s.magnification,
+  s.metadata_is_hne AS is_hne, s.metadata_is_ihc AS is_ihc, s.magnification,
   s.file_size_bytes,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> ''
@@ -433,7 +454,7 @@ SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTA
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.artifact_uri END AS thumbnail_url,
   r.width AS thumbnail_width, r.height AS thumbnail_height, r.content_type AS thumbnail_content_type
-FROM canonical_stains s
+FROM typed_stains s
 LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source_path = s.source_url""",
         warehouse_id,
     )

@@ -51,6 +51,9 @@ def test_dev_materializer_keeps_canonical_and_raw_stain_fields():
     assert "'&amp;', '&'" in source
     assert "'[[:cntrl:]]'" in source
     assert "IMPACT - Tumor" in source
+    assert "REGEXP_REPLACE(LOWER(COALESCE(stain_name_clean" in source
+    assert "stain_name_key = 'sslhe'" in source
+    assert "stain_name_key LIKE '%fish%'" in source
 
 
 def test_sql_literals_escape_text_and_preserve_booleans():

@@ -339,8 +339,8 @@ normalized_stains AS (
 stain_keys AS (
     SELECT
         normalized.*,
-        LOWER(REGEXP_REPLACE(COALESCE(normalized.stain_group_clean, ''), '[^a-z0-9]+', '')) AS stain_group_key,
-        LOWER(REGEXP_REPLACE(COALESCE(normalized.stain_name_clean, ''), '[^a-z0-9]+', '')) AS stain_name_key
+        REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_group_clean, '')), '[^a-z0-9]+', '') AS stain_group_key,
+        REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_name_clean, '')), '[^a-z0-9]+', '') AS stain_name_key
     FROM normalized_stains normalized
 ),
 canonical_stains AS (
@@ -352,13 +352,24 @@ canonical_stains AS (
             WHEN keyed.stain_group_key = 'heother' THEN 'H&E (Other)'
             WHEN keyed.stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
             WHEN keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
-            WHEN keyed.stain_group_clean IS NULL
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key = 'sslhe'
+                THEN 'H&E (Other)'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key LIKE '%fish%'
+                THEN 'Other'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
                  AND keyed.stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$'
                 THEN 'H&E (Other)'
-            WHEN keyed.stain_group_clean IS NULL
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
                  AND keyed.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
                 THEN 'IHC'
-            WHEN keyed.stain_group_clean IS NULL
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
                  AND keyed.stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)'
                 THEN 'Other'
             ELSE keyed.stain_group_clean
@@ -372,7 +383,7 @@ canonical_stains AS (
             WHEN keyed.stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
             WHEN keyed.stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant')
                 THEN 'ANDROGEN RECEPTOR'
-            WHEN keyed.stain_name_key IN ('he', 'hematoxylinandeosin') THEN 'H&E'
+            WHEN keyed.stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe') THEN 'H&E'
             ELSE keyed.stain_name_clean
         END AS stain_name_canonical
     FROM stain_keys keyed
@@ -381,13 +392,32 @@ typed_stains AS (
     SELECT
         canonical.*,
         (
-            canonical.stain_group_key IN ('he', 'heinitial', 'heother')
-            OR canonical.stain_name_key IN ('he', 'hematoxylinandeosin')
-            OR canonical.stain_name_key LIKE 'recut%he'
+            canonical.stain_name_key NOT LIKE '%fish%'
+            AND (
+                canonical.stain_group_key IN ('he', 'heinitial', 'heother')
+            OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe')
+            )
+            OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key LIKE 'recut%he'
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+            )
+            )
         ) AS metadata_is_hne,
         (
-            canonical.stain_group_key IN ('ihc', 'immunohistochemistry')
-            OR canonical.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+            (
+                canonical.stain_group_key IN ('ihc', 'immunohistochemistry')
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+            ) OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+                AND canonical.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+            )
         ) AS metadata_is_ihc
     FROM canonical_stains canonical
 ),

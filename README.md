@@ -196,6 +196,14 @@ values remain available as `stain_group_raw` and `stain_name_raw`; ambiguous
 recuts, controls, and special stains are not silently forced into the binary
 H&E/IHC classes.
 
+Binary metadata precedence is explicit: valid manual labels win, FISH names
+remain non-binary unless manually adjudicated, recognized H&E/IHC groups win
+over contradictory names, and name inference is limited to blank groups. The
+reviewed exact `SSL H&E` pattern is promoted to H&E; other SSL patterns remain
+in the review queue. Run `tools/stain_metadata_audit.sql` against the source
+tables to inspect coverage, conflicts, and the ranked non-binary queue before
+publishing a release.
+
 For development or rehearsal, use the Databricks `dev` profile and its
 warehouse, and point all four `WSI_*_TABLE` variables at the isolated
 `cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
