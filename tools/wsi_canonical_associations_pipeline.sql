@@ -404,7 +404,16 @@ approved_stain_predictions AS (
             image_ihc_threshold,
             ROW_NUMBER() OVER (
                 PARTITION BY CAST(slide_id AS STRING)
-                ORDER BY scored_at DESC, model_version DESC
+                -- An approved manual adjudication is durable evidence: it
+                -- must not be displaced by a later automatic rescoring row.
+                ORDER BY
+                    CASE
+                        WHEN LOWER(TRIM(COALESCE(manual_label, ''))) IN ('he', 'ihc')
+                            THEN 0
+                        ELSE 1
+                    END,
+                    scored_at DESC,
+                    model_version DESC
             ) AS row_num
         FROM cdsi_prod.pathology_data_mining.slide_stain_classification
         WHERE model_approved = TRUE

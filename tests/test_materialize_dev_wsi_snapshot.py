@@ -48,6 +48,9 @@ def test_dev_materializer_keeps_canonical_and_raw_stain_fields():
     assert "stain_group_canonical" in source
     assert "stain_name_raw" in source
     assert "stain_group_raw" in source
+    assert "'&amp;', '&'" in source
+    assert "'[[:cntrl:]]'" in source
+    assert "IMPACT - Tumor" in source
 
 
 def test_sql_literals_escape_text_and_preserve_booleans():

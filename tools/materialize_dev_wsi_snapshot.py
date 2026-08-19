@@ -376,9 +376,41 @@ WITH ranked_registry AS (
 ), normalized_stains AS (
   SELECT
     source_rows.*,
-    NULLIF(TRIM(REGEXP_REPLACE(COALESCE(stain_name, ''), '[[:space:]]+', ' ')), '') AS stain_name_canonical,
-    NULLIF(TRIM(REGEXP_REPLACE(COALESCE(stain_group, ''), '[[:space:]]+', ' ')), '') AS stain_group_canonical
+    NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(COALESCE(stain_name, ''), '&amp;', '&'), '[[:cntrl:]]', ' '), '[[:space:]]+', ' ')), '') AS stain_name_clean,
+    NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(COALESCE(stain_group, ''), '&amp;', '&'), '[[:cntrl:]]', ' '), '[[:space:]]+', ' ')), '') AS stain_group_clean
   FROM source_rows
+), stain_keys AS (
+  SELECT
+    normalized_stains.*,
+    LOWER(REGEXP_REPLACE(COALESCE(stain_name_clean, ''), '[^a-z0-9]+', '')) AS stain_name_key,
+    LOWER(REGEXP_REPLACE(COALESCE(stain_group_clean, ''), '[^a-z0-9]+', '')) AS stain_group_key
+  FROM normalized_stains
+), canonical_stains AS (
+  SELECT
+    stain_keys.*,
+    CASE
+      WHEN stain_group_key = 'he' THEN 'H&E'
+      WHEN stain_group_key = 'heinitial' THEN 'H&E (Initial)'
+      WHEN stain_group_key = 'heother' THEN 'H&E (Other)'
+      WHEN stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
+      WHEN stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
+      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$' THEN 'H&E (Other)'
+      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)' THEN 'IHC'
+      WHEN stain_group_clean IS NULL AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN 'Other'
+      ELSE stain_group_clean
+    END AS stain_group_canonical,
+    CASE
+      WHEN stain_name_key = 'impacttumor' THEN 'IMPACT - Tumor'
+      WHEN stain_name_key = 'impactnormaltissue' THEN 'IMPACT - Normal Tissue'
+      WHEN stain_name_key = 'dmherecut' THEN 'DM H&E RECUT'
+      WHEN stain_name_key = 'recutmolecularhe' THEN 'RECUT MOLECULAR H&E'
+      WHEN stain_name_key = 'recutadditionalhe' THEN 'RECUT ADDITIONAL H&E'
+      WHEN stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
+      WHEN stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant') THEN 'ANDROGEN RECEPTOR'
+      WHEN stain_name_key IN ('he', 'hematoxylinandeosin') THEN 'H&E'
+      ELSE stain_name_clean
+    END AS stain_name_canonical
+  FROM stain_keys
 )
 SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
@@ -401,7 +433,7 @@ SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTA
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.artifact_uri END AS thumbnail_url,
   r.width AS thumbnail_width, r.height AS thumbnail_height, r.content_type AS thumbnail_content_type
-FROM normalized_stains s
+FROM canonical_stains s
 LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source_path = s.source_url""",
         warehouse_id,
     )

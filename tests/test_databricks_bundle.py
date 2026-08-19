@@ -89,6 +89,22 @@ def test_canonical_pipeline_normalizes_common_stain_aliases():
         assert canonical in sql
 
 
+def test_canonical_pipeline_ranks_manual_adjudications_before_rescoring():
+    sql = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_canonical_associations_pipeline.sql"
+    ).read_text(encoding="utf-8")
+
+    approved_predictions = sql.split("approved_stain_predictions AS (")[1].split(
+        "resolved_associations AS ("
+    )[0]
+    assert "LOWER(TRIM(COALESCE(manual_label, ''))) IN ('he', 'ihc')" in approved_predictions
+    assert approved_predictions.index("LOWER(TRIM(COALESCE(manual_label, '')))") < approved_predictions.index(
+        "scored_at DESC"
+    )
+
+
 def test_summary_pipeline_uses_resolved_flags():
     sql = (
         Path(__file__).resolve().parent.parent
