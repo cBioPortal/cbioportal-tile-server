@@ -140,6 +140,26 @@ class TestCorsPreflight:
 
         assert response.status_code == 401
 
+
+class TestSourceBinding:
+    def test_source_header_is_preferred_when_query_is_absent(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/thumbnail.jpg"},
+        )
+        assert main_module._source_from_request(request, None) == "s3://bucket/thumbnail.jpg"
+
+    def test_conflicting_source_bindings_are_rejected(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/header.jpg"},
+        )
+        with pytest.raises(main_module.HTTPException) as exc_info:
+            main_module._source_from_request(request, "s3://bucket/query.jpg")
+        assert exc_info.value.status_code == 400
+
     @pytest.mark.asyncio
     async def test_metrics_bypasses_capability_guard(self):
         scope = {

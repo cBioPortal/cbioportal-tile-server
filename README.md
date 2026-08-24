@@ -33,13 +33,17 @@ handlers. The production sequence is:
    `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
    `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
    `content_type`.
-3. The Databricks canonical-association job joins the source path to the
+3. Before the canonical refresh, run
+   `tools/generate_thumbnail_variants.py` to create the 128×96 navigation
+   derivatives and publish their serving pointers. The first run adds the
+   serving-pointer columns to the existing registry; reruns are idempotent.
+4. The Databricks canonical-association job joins the source path to the
    latest successful registry row and computes `can_serve_tiles`. The
    canonical job must run only after the thumbnail batch has completed for the
    input inventory (use a job dependency or completion watermark).
-4. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
+5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
    dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`.
-5. cBioPortal core imports that complete snapshot and is the sole ClickHouse
+6. cBioPortal core imports that complete snapshot and is the sole ClickHouse
    writer.
 
 The frontend is read-only: it requests the backend access bundle and then
@@ -86,6 +90,12 @@ optional Redis cache:
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
 | `REDIS_URL` | `redis://redis:6379` | Optional tile/thumbnail cache |
+| `THUMBNAIL_FETCH_CONCURRENCY` | `8` | Per-worker concurrent thumbnail object fetches |
+| `THUMBNAIL_S3_MAX_CONNECTIONS` | `32` | Per-worker pooled S3 connections |
+| `THUMBNAIL_S3_CONNECT_TIMEOUT_SEC` | `1` | S3 connection timeout |
+| `THUMBNAIL_S3_READ_TIMEOUT_SEC` | `5` | S3 object-read timeout |
+| `THUMBNAIL_S3_MAX_ATTEMPTS` | `2` | S3 client retry limit |
+| `THUMBNAIL_PREWARM_URI` | — | Optional stable thumbnail object used to prewarm each worker |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `4194304` | Maximum on-demand tile decode |
@@ -127,7 +137,8 @@ The `/metrics` endpoint is intended for internal monitoring and is not a WSI
 capability endpoint. Production ingress should expose only the tile,
 thumbnail, health, and readiness paths; scrape `/metrics` through the internal
 Kubernetes service. Important metrics include image-operation queue time,
-slide-open latency, Redis errors/latency, cache hit/miss counts, distributed
+thumbnail fetch/resize latency and fetch-slot queue time, slide-open latency,
+Redis errors/latency, cache hit/miss counts, distributed
 miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ## Quick start
@@ -151,10 +162,18 @@ exporter and SQL pipeline are intentionally offline tooling; none of their
 metadata clients are imported by the FastAPI runtime.
 
 Run the thumbnail batch as a separate scheduled process before the canonical
-Databricks refresh. A successful thumbnail run must publish both the object
-store artifacts and the matching registry rows; writing only a JPEG or only a
-manifest is insufficient. Legacy successful rows with missing
-`tile_metadata_json` must be backfilled or regenerated before export.
+Databricks refresh. Then run the navigation-variant job, for example:
+
+```bash
+python3 tools/generate_thumbnail_variants.py \
+  --warehouse-id "$DATABRICKS_WAREHOUSE_ID" \
+  --variant-root-uri s3://mskmind-bkt/wsi-thumbnails/variants/nav-128x96
+```
+
+A successful run must publish both the object-store artifacts and the matching
+registry rows; writing only a JPEG or only a manifest is insufficient. Legacy
+successful rows with missing `tile_metadata_json` must be backfilled or
+regenerated before export.
 
 The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
 `data_wsi.txt` pair. Export it from the canonical association table with:

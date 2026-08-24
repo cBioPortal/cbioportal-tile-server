@@ -34,17 +34,29 @@ from .metrics import (
     IMAGE_OPERATION_SECONDS,
     IMAGE_OPERATION_QUEUE_SECONDS,
     OVERSIZED_DECODE_REJECTIONS,
+    THUMBNAIL_FETCH_ERRORS,
+    THUMBNAIL_FETCH_QUEUE_SECONDS,
+    THUMBNAIL_FETCH_SECONDS,
+    THUMBNAIL_RESIZE_SECONDS,
     metrics_payload,
     track_image_operation,
+    track_thumbnail_fetch,
 )
 from .slides import SlideCache
-from .thumbnail_store import ThumbnailRecord, render_thumbnail_response
+from .thumbnail_store import (
+    ThumbnailRecord,
+    close_runtime_store,
+    initialize_runtime_store,
+    read_thumbnail_bytes,
+    render_thumbnail_payload,
+)
 from .tiles import OverviewTooLarge, get_tile_bytes
 
 logger = logging.getLogger(__name__)
 
 _slides: SlideCache | None = None
 _image_operation_semaphore: asyncio.Semaphore | None = None
+_thumbnail_fetch_semaphore: asyncio.Semaphore | None = None
 
 
 class _SingleFlight:
@@ -94,10 +106,15 @@ class DistributedMissTimeout(Exception):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _slides, _image_operation_semaphore
+    global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore
     _slides = SlideCache(capacity=settings.max_open_slides)
     _image_operation_semaphore = asyncio.Semaphore(settings.max_image_operations)
+    _thumbnail_fetch_semaphore = asyncio.Semaphore(settings.thumbnail_fetch_concurrency)
     await tile_cache.init_cache()
+    try:
+        await _in_thread(initialize_runtime_store)
+    except Exception as exc:
+        logger.warning("Thumbnail S3 client prewarm failed; using lazy initialization: %s", type(exc).__name__)
     blockcache_manager = get_blockcache_manager()
     blockcache_task = None
     if blockcache_manager.enabled:
@@ -124,6 +141,7 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await blockcache_task
         _slides.close_all()
+        await _in_thread(close_runtime_store)
         await tile_cache.close_cache()
 
 
@@ -286,6 +304,14 @@ def _authorize_source(request: Request, source: str, operation: str) -> tuple[st
     return source, claims
 
 
+def _source_from_request(request: Request, query_source: str | None) -> str:
+    header_source = request.headers.get("x-wsi-source", "").strip()
+    query_source = (query_source or "").strip()
+    if header_source and query_source and not hmac.compare_digest(header_source, query_source):
+        raise HTTPException(status_code=400, detail="conflicting source bindings")
+    return header_source or query_source
+
+
 def _run_slide_operation(source: str, operation, *args):
     try:
         if not isinstance(_slides, SlideCache):
@@ -306,15 +332,28 @@ async def _run_slide_image_operation(source: str, operation, *args, operation_ki
     )
 
 
-def _read_thumbnail(source: str, width: int, height: int, master_width: int, master_height: int):
-    record = ThumbnailRecord(
-        image_id=source_digest(source),
-        uri=source,
-        width=master_width,
-        height=master_height,
-        content_type="image/jpeg",
-    )
-    return render_thumbnail_response(record, width, height)
+async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
+    started = time.perf_counter()
+    queue_started = time.perf_counter()
+    semaphore = _thumbnail_fetch_semaphore
+    if semaphore is None:
+        try:
+            return await _in_thread(read_thumbnail_bytes, record)
+        except Exception:
+            THUMBNAIL_FETCH_ERRORS.inc()
+            raise
+        finally:
+            THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
+    async with semaphore:
+        THUMBNAIL_FETCH_QUEUE_SECONDS.observe(time.perf_counter() - queue_started)
+        try:
+            async with track_thumbnail_fetch():
+                return await _in_thread(read_thumbnail_bytes, record)
+        except Exception:
+            THUMBNAIL_FETCH_ERRORS.inc()
+            raise
+        finally:
+            THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
 
 
 def _readiness_status() -> tuple[int, dict]:
@@ -365,8 +404,9 @@ async def tile(
     z: int,
     x: int,
     y: int,
-    source: str = Query(...),
+    source: str | None = Query(None),
 ):
+    source = _source_from_request(request, source)
     source, claims = _authorize_source(request, source, "tile")
     cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
@@ -411,10 +451,11 @@ async def tile(
 @app.get("/thumbnails")
 async def thumbnail(
     request: Request,
-    source: str = Query(...),
+    source: str | None = Query(None),
     width: int = 256,
     height: int = 256,
 ):
+    source = _source_from_request(request, source)
     source, claims = _authorize_source(request, source, "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
@@ -424,14 +465,29 @@ async def thumbnail(
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
-        data, status = await _run_image_operation(
-            _read_thumbnail,
-            source,
-            width,
-            height,
-            claims["thumbnail_width"],
-            claims["thumbnail_height"],
+        record = ThumbnailRecord(
+            image_id=source_digest(source),
+            uri=source,
+            width=claims["thumbnail_width"],
+            height=claims["thumbnail_height"],
+            content_type="image/jpeg",
         )
+        payload = await _run_thumbnail_fetch(record)
+        if width >= record.width and height >= record.height:
+            data, status = payload, {"status": "ok", "reason": "master"}
+        else:
+            resize_started = time.perf_counter()
+            try:
+                data, status = await _run_image_operation(
+                    render_thumbnail_payload,
+                    payload,
+                    record,
+                    width,
+                    height,
+                    operation_kind="thumbnail_resize",
+                )
+            finally:
+                THUMBNAIL_RESIZE_SECONDS.observe(time.perf_counter() - resize_started)
         await tile_cache.set_thumbnail(cache_key, width, height, data)
         return data, status
 
