@@ -4,6 +4,7 @@ from PIL import Image
 
 from tools.generate_thumbnail_variants import _fit_thumbnail
 from tools.generate_thumbnail_variants import _join_uri
+from tools.generate_thumbnail_variants import _registry_batch_query
 from tools.generate_thumbnail_variants import _render
 from tools.generate_thumbnail_variants import variant_root_for_master
 
@@ -65,3 +66,10 @@ def test_variant_render_is_idempotent_and_reuses_existing_derivative(tmp_path):
     assert reused["skipped"] is True
     assert reused["serving_artifact_uri"] == created["serving_artifact_uri"]
     assert (reused["serving_width"], reused["serving_height"]) == (128, 64)
+
+
+def test_registry_batches_are_keyset_paginated():
+    query = _registry_batch_query("1000035", 5000)
+
+    assert "image_id > '1000035'" in query
+    assert "ORDER BY image_id LIMIT 5000" in query

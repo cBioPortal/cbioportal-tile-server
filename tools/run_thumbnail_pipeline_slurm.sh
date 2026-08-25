@@ -545,6 +545,7 @@ variant_summary = generate_thumbnail_variants(
     warehouse_id=meta["warehouse_id"],
     root_uri=variant_root_for_master(meta["root_uri"]),
     workers=32,
+    batch_size=5000,
     limit=None,
     force=False,
 )

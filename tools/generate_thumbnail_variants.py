@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -54,7 +54,6 @@ FROM (
     WHERE status = 'success'
       AND artifact_uri IS NOT NULL
 ) latest
-WHERE row_num = 1
 """
 
 
@@ -155,11 +154,11 @@ SELECT
 
 
 def _publish(warehouse_id: str, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
-    source = "\nUNION ALL\n".join(_upsert_sql(row) for row in rows)
-    run_statement(
-        f"""
+    for start in range(0, len(rows), 100):
+        batch = rows[start : start + 100]
+        source = "\nUNION ALL\n".join(_upsert_sql(row) for row in batch)
+        run_statement(
+            f"""
 MERGE INTO {THUMBNAIL_REGISTRY_TABLE} AS target
 USING ({source}) AS source
 ON target.image_id = source.image_id
@@ -169,8 +168,8 @@ WHEN MATCHED THEN UPDATE SET
     target.serving_width = source.serving_width,
     target.serving_height = source.serving_height
 """,
-        warehouse_id,
-    )
+            warehouse_id,
+        )
 
 
 def _ensure_serving_columns(warehouse_id: str) -> None:
@@ -182,28 +181,79 @@ def _ensure_serving_columns(warehouse_id: str) -> None:
             raise
 
 
-def run(*, warehouse_id: str, root_uri: str, workers: int, limit: int | None, force: bool) -> dict[str, int]:
-    _ensure_serving_columns(warehouse_id)
-    rows = list(run_query_external(REGISTRY_QUERY, warehouse_id))
-    if limit is not None:
-        rows = rows[:limit]
+def _registry_batch_query(after_image_id: str | None, batch_size: int) -> str:
+    after_clause = "" if after_image_id is None else f"AND image_id > {_sql_string(after_image_id)}"
+    return (
+        f"{REGISTRY_QUERY} WHERE row_num = 1 {after_clause} "
+        f"ORDER BY image_id LIMIT {batch_size}"
+    )
+
+
+def _render_batch(
+    rows: list[dict[str, Any]], root_uri: str, workers: int, force: bool
+) -> tuple[list[dict[str, Any]], int]:
     published: list[dict[str, Any]] = []
     failures = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = [pool.submit(_render, row, root_uri, force) for row in rows]
-        for future in as_completed(futures):
+        for row, future in zip(rows, futures):
             try:
                 published.append(future.result())
             except Exception as exc:
                 failures += 1
-                logger.error("variant generation failed; error_type=%s", type(exc).__name__)
-    for start in range(0, len(published), 1000):
-        _publish(warehouse_id, published[start : start + 1000])
+                logger.error(
+                    "variant generation failed; image_id=%s error_type=%s",
+                    row.get("image_id"),
+                    type(exc).__name__,
+                )
+    return published, failures
+
+
+def run(
+    *,
+    warehouse_id: str,
+    root_uri: str,
+    workers: int,
+    batch_size: int,
+    limit: int | None,
+    force: bool,
+) -> dict[str, int]:
+    _ensure_serving_columns(warehouse_id)
+    batch_size = max(1, batch_size)
+    candidate_count = 0
+    published_count = 0
+    failed_count = 0
+    skipped_count = 0
+    after_image_id: str | None = None
+    while limit is None or candidate_count < limit:
+        query_size = batch_size if limit is None else min(batch_size, limit - candidate_count)
+        rows = list(
+            run_query_external(
+                _registry_batch_query(after_image_id, query_size), warehouse_id
+            )
+        )
+        if not rows:
+            break
+        candidate_count += len(rows)
+        published, batch_failures = _render_batch(rows, root_uri, workers, force)
+        _publish(warehouse_id, published)
+        published_count += len(published)
+        failed_count += batch_failures
+        skipped_count += sum(1 for row in published if row.get("skipped"))
+        after_image_id = str(rows[-1]["image_id"])
+        logger.info(
+            "thumbnail variant progress candidates=%d published=%d failed=%d",
+            candidate_count,
+            published_count,
+            failed_count,
+        )
+        if len(rows) < query_size:
+            break
     return {
-        "candidate_count": len(rows),
-        "published_count": len(published),
-        "failed_count": failures,
-        "skipped_count": sum(1 for row in published if row.get("skipped")),
+        "candidate_count": candidate_count,
+        "published_count": published_count,
+        "failed_count": failed_count,
+        "skipped_count": skipped_count,
     }
 
 
@@ -212,6 +262,7 @@ def main() -> int:
     parser.add_argument("--warehouse-id", default=settings.databricks_warehouse_id)
     parser.add_argument("--variant-root-uri", default=DEFAULT_VARIANT_ROOT)
     parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=5000)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -220,6 +271,7 @@ def main() -> int:
         warehouse_id=args.warehouse_id,
         root_uri=args.variant_root_uri,
         workers=args.workers,
+        batch_size=args.batch_size,
         limit=args.limit,
         force=args.force,
     )
