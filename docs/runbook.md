@@ -88,7 +88,8 @@ tools/run_thumbnail_pipeline_slurm.sh resume \
   --concurrency 4
 ```
 
-The batch path reads servable S3 paths from Databricks, stores publication state
+The batch path reads the effective, fingerprint-bound S3 pointers from
+`cdsi_prod.pathology_data_mining.wsi_serving_manifest`, stores publication state
 in `cdsi_prod.pathology_data_mining.slide_thumbnail_registry`, and keeps its
 temporary files, logs, and subprocess handoff data under the shared run
 directory rather than `/tmp`. Array workers write results atomically and create
@@ -106,7 +107,7 @@ while retaining summaries, failure logs, and quarantined partial results.
 Thumbnail preparation is a separate scheduled workload, not part of the
 frontend, Compose stack, or online tile-server request path. Schedule
 `tools/run_thumbnail_pipeline_slurm.sh` (or an equivalent cron/workflow) to
-run `tools/generate_slide_thumbnails.py` against the eligible inventory. The
+run `tools/generate_slide_thumbnails.py` against the eligible serving manifest. The
 job must:
 
 1. read source slides from the configured S3/Dell ECS-compatible store;
@@ -114,10 +115,14 @@ job must:
 3. upsert `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
    artifact URI, intrinsic `tile_metadata_json`, dimensions, and content type.
 
-Do not start the Databricks canonical-association refresh until this batch has
-completed for the input inventory. Coordinate the two jobs with an explicit
-dependency or completion watermark. Rows marked successful without
-`tile_metadata_json` must be regenerated before publication.
+The production canonical-association and summary refresh is owned by
+`../pdm_databricks_pipelines`; the Databricks bundle in this repository is
+paused. Do not publish a thumbnail batch until it has completed for the input
+serving manifest. The PDM serving manifest matches source URI and the
+`source_fingerprint` embedded in `tile_metadata_json`; an in-place ECS rewrite
+therefore forces thumbnail regeneration even when the URL is unchanged. Rows
+marked successful without `tile_metadata_json` or its source fingerprint must
+be regenerated before publication.
 
 The frontend only requests `/thumbnails` and never uploads artifacts. The
 tile-server `app/thumbnail_worker.py` CLI can be used for development,

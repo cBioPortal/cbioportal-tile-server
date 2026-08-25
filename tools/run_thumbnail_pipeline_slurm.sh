@@ -523,8 +523,6 @@ from tools.generate_slide_thumbnails import cleanup_run_artifacts
 from tools.generate_slide_thumbnails import _iter_result_records
 from tools.generate_slide_thumbnails import publish_manifest_for_current_inventory
 from tools.generate_slide_thumbnails import publish_registry_results
-from tools.generate_thumbnail_variants import run as generate_thumbnail_variants
-from tools.generate_thumbnail_variants import variant_root_for_master
 
 meta_file, summary_path, failures_path, run_dir = sys.argv[1:]
 with open(meta_file, "r", encoding="utf-8") as handle:
@@ -541,19 +539,6 @@ result_paths = [
     if task["state"] == "complete"
 ]
 stats = publish_registry_results(meta["warehouse_id"], result_paths)
-variant_summary = generate_thumbnail_variants(
-    warehouse_id=meta["warehouse_id"],
-    root_uri=variant_root_for_master(meta["root_uri"]),
-    workers=32,
-    batch_size=5000,
-    limit=None,
-    force=False,
-)
-if variant_summary["failed_count"]:
-    raise RuntimeError(
-        "thumbnail variant generation failed for "
-        f"{variant_summary['failed_count']} rows"
-    )
 manifest = publish_manifest_for_current_inventory(
     warehouse_id=meta["warehouse_id"],
     manifest_uri=meta["manifest_uri"],
@@ -569,7 +554,6 @@ summary = {
     "manifest_version": meta["manifest_version"],
     "manifest_slide_count": len(manifest["slides"]),
     "result_file_count": len(result_paths),
-    "variant_summary": variant_summary,
 }
 with open(summary_path, "w", encoding="utf-8") as handle:
     json.dump(summary, handle, indent=2, sort_keys=True)

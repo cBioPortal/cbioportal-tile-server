@@ -8,11 +8,6 @@ ACTIVE_IMAGE_OPERATIONS = Gauge(
     "Number of image operations currently running inside a worker.",
     multiprocess_mode="livesum",
 )
-ACTIVE_THUMBNAIL_FETCHES = Gauge(
-    "tile_server_active_thumbnail_fetches",
-    "Number of thumbnail object fetches currently running inside a worker.",
-    multiprocess_mode="livesum",
-)
 DECODE_SOURCE_PIXELS = Histogram(
     "tile_server_decode_source_pixels",
     "Source pixels decoded for a tile or thumbnail request.",
@@ -63,25 +58,6 @@ IMAGE_OPERATION_QUEUE_SECONDS = Histogram(
     "Time spent waiting for an image-operation slot.",
     ("kind",),
 )
-THUMBNAIL_FETCH_SECONDS = Histogram(
-    "tile_server_thumbnail_fetch_seconds",
-    "Time spent fetching a thumbnail object from object storage.",
-    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, float("inf")),
-)
-THUMBNAIL_FETCH_QUEUE_SECONDS = Histogram(
-    "tile_server_thumbnail_fetch_queue_seconds",
-    "Time spent waiting for a thumbnail object-fetch slot.",
-    buckets=(0.001, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, float("inf")),
-)
-THUMBNAIL_RESIZE_SECONDS = Histogram(
-    "tile_server_thumbnail_resize_seconds",
-    "Time spent resizing a fetched thumbnail.",
-    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, float("inf")),
-)
-THUMBNAIL_FETCH_ERRORS = Counter(
-    "tile_server_thumbnail_fetch_errors_total",
-    "Thumbnail object-storage fetch failures.",
-)
 DISTRIBUTED_MISS_LOCKS = Counter(
     "tile_server_distributed_miss_locks_total",
     "Distributed cache-miss lock outcomes.",
@@ -101,15 +77,6 @@ async def track_image_operation():
         yield
     finally:
         ACTIVE_IMAGE_OPERATIONS.dec()
-
-
-@asynccontextmanager
-async def track_thumbnail_fetch():
-    ACTIVE_THUMBNAIL_FETCHES.inc()
-    try:
-        yield
-    finally:
-        ACTIVE_THUMBNAIL_FETCHES.dec()
 
 
 def metrics_payload() -> tuple[bytes, str]:

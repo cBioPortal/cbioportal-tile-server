@@ -1,8 +1,9 @@
 bundle:
   name: cbioportal-tile-server
 
-# Databricks Asset Bundle — manages the nightly canonical association and WSI
-# summary pipeline jobs.
+# Databricks Asset Bundle — legacy/offline SQL definitions. Production table
+# ownership and scheduling moved to ../pdm_databricks_pipelines. Keep this
+# bundle paused so two jobs cannot publish competing canonical snapshots.
 # Deploy:   databricks bundle deploy
 # Run once: databricks bundle run wsi-summary-pipeline
 # Destroy:  databricks bundle destroy
@@ -31,7 +32,7 @@ resources:
       schedule:
         quartz_cron_expression: "0 0 3 * * ?"
         timezone_id: UTC
-        pause_status: UNPAUSED
+        pause_status: PAUSED
 
       tasks:
         - task_key: ensure-stain-classification-table

@@ -62,3 +62,11 @@ THUMBNAIL_REGISTRY_TABLE = _table_name(
     "WSI_THUMBNAIL_REGISTRY_TABLE",
     "cdsi_prod.pathology_data_mining.slide_thumbnail_registry",
 )
+
+# Effective, fingerprint-bound serving pointers produced by the PDM control
+# plane. Thumbnail generation follows this table so immutable promotions are
+# rendered at their promoted URI instead of regenerating the original object.
+SERVING_MANIFEST_TABLE = _table_name(
+    "WSI_SERVING_MANIFEST_TABLE",
+    "cdsi_prod.pathology_data_mining.wsi_serving_manifest",
+)

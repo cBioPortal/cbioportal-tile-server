@@ -60,22 +60,13 @@ inventory_paths AS (
     WHERE row_num = 1
 ),
 thumbnail_registry AS (
-    SELECT
-        image_id,
-        COALESCE(serving_artifact_uri, artifact_uri) AS artifact_uri,
-        COALESCE(serving_width, width) AS width,
-        COALESCE(serving_height, height) AS height,
-        content_type,
-        tile_metadata_json
+    SELECT image_id, artifact_uri, width, height, content_type, tile_metadata_json
     FROM (
         SELECT
             CAST(image_id AS STRING) AS image_id,
             artifact_uri,
             width,
             height,
-            serving_artifact_uri,
-            serving_width,
-            serving_height,
             content_type,
             tile_metadata_json,
             ROW_NUMBER() OVER (
