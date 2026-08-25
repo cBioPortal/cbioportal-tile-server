@@ -39,7 +39,10 @@ SELECT
     CAST(image_id AS STRING) AS image_id,
     source_path,
     artifact_uri,
-    manifest_version
+    manifest_version,
+    serving_artifact_uri,
+    serving_width,
+    serving_height
 FROM {THUMBNAIL_REGISTRY_TABLE}
 WHERE status = 'success'
   AND artifact_uri IS NOT NULL
@@ -108,7 +111,11 @@ def _render(row: dict[str, Any], root_uri: str, force: bool) -> dict[str, Any]:
     if not force:
         fs = _filesystem(variant_uri)
         if fs.exists(_path(variant_uri)):
-            width, height = _dimensions(variant_uri)
+            if str(row.get("serving_artifact_uri") or "") == variant_uri:
+                width = int(row.get("serving_width") or 0)
+                height = int(row.get("serving_height") or 0)
+            else:
+                width, height = _dimensions(variant_uri)
             return {
                 "image_id": image_id,
                 "source_path": str(row.get("source_path") or ""),
@@ -132,24 +139,26 @@ def _render(row: dict[str, Any], root_uri: str, force: bool) -> dict[str, Any]:
 
 
 def _upsert_sql(row: dict[str, Any]) -> str:
-    return f"""
-SELECT
-    {_sql_string(row['image_id'])} AS image_id,
-    {_sql_string(row['source_path'])} AS source_path,
-    {_sql_string(row['serving_artifact_uri'])} AS serving_artifact_uri,
-    {int(row['serving_width'])} AS serving_width,
-    {int(row['serving_height'])} AS serving_height
-"""
+    return f"""(
+    {_sql_string(row['image_id'])},
+    {_sql_string(row['source_path'])},
+    {_sql_string(row['serving_artifact_uri'])},
+    {int(row['serving_width'])},
+    {int(row['serving_height'])}
+)"""
 
 
 def _publish(warehouse_id: str, rows: list[dict[str, Any]]) -> None:
-    for start in range(0, len(rows), 100):
-        batch = rows[start : start + 100]
-        source = "\nUNION ALL\n".join(_upsert_sql(row) for row in batch)
+    for start in range(0, len(rows), 1000):
+        batch = rows[start : start + 1000]
+        source = ",\n".join(_upsert_sql(row) for row in batch)
         run_statement(
             f"""
 MERGE INTO {THUMBNAIL_REGISTRY_TABLE} AS target
-USING ({source}) AS source
+USING (
+    SELECT * FROM VALUES {source}
+    AS rows(image_id, source_path, serving_artifact_uri, serving_width, serving_height)
+) AS source
 ON target.image_id = source.image_id
 AND COALESCE(target.source_path, '') = COALESCE(source.source_path, '')
 WHEN MATCHED THEN UPDATE SET
