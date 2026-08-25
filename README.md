@@ -33,10 +33,12 @@ handlers. The production sequence is:
    `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
    `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
    `content_type`.
-3. Before the canonical refresh, run
-   `tools/generate_thumbnail_variants.py` to create the 128×96 navigation
-   derivatives and publish their serving pointers. The first run adds the
-   serving-pointer columns to the existing registry; reruns are idempotent.
+3. The thumbnail publisher automatically runs
+   `tools/generate_thumbnail_variants.py` after the master registry is
+   published. It creates 128×96 navigation derivatives under a
+   manifest-versioned prefix and publishes their serving pointers. The first
+   run adds the serving-pointer columns to the existing registry; reruns are
+   idempotent.
 4. The Databricks canonical-association job joins the source path to the
    latest successful registry row and computes `can_serve_tiles`. The
    canonical job must run only after the thumbnail batch has completed for the
@@ -162,7 +164,8 @@ exporter and SQL pipeline are intentionally offline tooling; none of their
 metadata clients are imported by the FastAPI runtime.
 
 Run the thumbnail batch as a separate scheduled process before the canonical
-Databricks refresh. Then run the navigation-variant job, for example:
+Databricks refresh. The Slurm wrapper runs the navigation-variant job after
+master publication. For a standalone backfill or repair, run:
 
 ```bash
 python3 tools/generate_thumbnail_variants.py \

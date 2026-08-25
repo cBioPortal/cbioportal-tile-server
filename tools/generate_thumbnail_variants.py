@@ -38,12 +38,22 @@ SELECT
     CAST(image_id AS STRING) AS image_id,
     source_path,
     artifact_uri,
-    serving_artifact_uri,
-    serving_width,
-    serving_height
-FROM {THUMBNAIL_REGISTRY_TABLE}
-WHERE status = 'success'
-  AND artifact_uri IS NOT NULL
+    manifest_version
+FROM (
+    SELECT
+        CAST(image_id AS STRING) AS image_id,
+        source_path,
+        artifact_uri,
+        manifest_version,
+        ROW_NUMBER() OVER (
+            PARTITION BY CAST(image_id AS STRING)
+            ORDER BY rendered_at DESC, manifest_version DESC, source_path DESC
+        ) AS row_num
+    FROM {THUMBNAIL_REGISTRY_TABLE}
+    WHERE status = 'success'
+      AND artifact_uri IS NOT NULL
+) latest
+WHERE row_num = 1
 """
 
 
@@ -61,8 +71,15 @@ def _path(uri: str) -> str:
     return uri
 
 
-def _join_uri(root_uri: str, image_id: str) -> str:
-    return f"{root_uri.rstrip('/')}/{image_id}.jpg"
+def variant_root_for_master(master_root_uri: str) -> str:
+    root = master_root_uri.rstrip('/')
+    if root.endswith('/masters'):
+        return root[: -len('/masters')] + '/variants/nav-128x96'
+    return root + '/variants/nav-128x96'
+
+
+def _join_uri(root_uri: str, image_id: str, manifest_version: str) -> str:
+    return f"{root_uri.rstrip('/')}/{manifest_version}/{image_id}.jpg"
 
 
 def _fit_thumbnail(payload: bytes) -> tuple[bytes, int, int]:
@@ -81,6 +98,11 @@ def _read(uri: str) -> bytes:
         return handle.read()
 
 
+def _dimensions(uri: str) -> tuple[int, int]:
+    with Image.open(BytesIO(_read(uri))) as image:
+        return image.size
+
+
 def _write(uri: str, payload: bytes) -> None:
     fs = _filesystem(uri)
     with fs.open(_path(uri), "wb") as handle:
@@ -89,16 +111,19 @@ def _write(uri: str, payload: bytes) -> None:
 
 def _render(row: dict[str, Any], root_uri: str, force: bool) -> dict[str, Any]:
     image_id = str(row["image_id"])
-    variant_uri = _join_uri(root_uri, image_id)
+    manifest_version = str(row.get("manifest_version") or "legacy")
+    variant_uri = _join_uri(root_uri, image_id, manifest_version)
     if not force:
         fs = _filesystem(variant_uri)
         if fs.exists(_path(variant_uri)):
+            width, height = _dimensions(variant_uri)
             return {
                 "image_id": image_id,
                 "source_path": str(row.get("source_path") or ""),
+                "manifest_version": manifest_version,
                 "serving_artifact_uri": variant_uri,
-                "serving_width": int(row.get("serving_width") or NAV_WIDTH),
-                "serving_height": int(row.get("serving_height") or NAV_HEIGHT),
+                "serving_width": width,
+                "serving_height": height,
                 "skipped": True,
             }
     payload, width, height = _fit_thumbnail(_read(str(row["artifact_uri"])))
@@ -106,6 +131,7 @@ def _render(row: dict[str, Any], root_uri: str, force: bool) -> dict[str, Any]:
     return {
         "image_id": image_id,
         "source_path": str(row.get("source_path") or ""),
+        "manifest_version": manifest_version,
         "serving_artifact_uri": variant_uri,
         "serving_width": width,
         "serving_height": height,
@@ -133,7 +159,7 @@ def _publish(warehouse_id: str, rows: list[dict[str, Any]]) -> None:
 MERGE INTO {THUMBNAIL_REGISTRY_TABLE} AS target
 USING ({source}) AS source
 ON target.image_id = source.image_id
-AND target.source_path = source.source_path
+AND COALESCE(target.source_path, '') = COALESCE(source.source_path, '')
 WHEN MATCHED THEN UPDATE SET
     target.serving_artifact_uri = source.serving_artifact_uri,
     target.serving_width = source.serving_width,
