@@ -71,5 +71,5 @@ def test_variant_render_is_idempotent_and_reuses_existing_derivative(tmp_path):
 def test_registry_batches_are_keyset_paginated():
     query = _registry_batch_query("1000035", 5000)
 
-    assert "image_id > '1000035'" in query
-    assert "ORDER BY image_id LIMIT 5000" in query
+    assert "CAST(image_id AS STRING) > '1000035'" in query
+    assert "ORDER BY CAST(image_id AS STRING) LIMIT 5000" in query

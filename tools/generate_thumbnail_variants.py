@@ -40,20 +40,9 @@ SELECT
     source_path,
     artifact_uri,
     manifest_version
-FROM (
-    SELECT
-        CAST(image_id AS STRING) AS image_id,
-        source_path,
-        artifact_uri,
-        manifest_version,
-        ROW_NUMBER() OVER (
-            PARTITION BY CAST(image_id AS STRING)
-            ORDER BY rendered_at DESC, manifest_version DESC, source_path DESC
-        ) AS row_num
-    FROM {THUMBNAIL_REGISTRY_TABLE}
-    WHERE status = 'success'
-      AND artifact_uri IS NOT NULL
-) latest
+FROM {THUMBNAIL_REGISTRY_TABLE}
+WHERE status = 'success'
+  AND artifact_uri IS NOT NULL
 """
 
 
@@ -182,10 +171,10 @@ def _ensure_serving_columns(warehouse_id: str) -> None:
 
 
 def _registry_batch_query(after_image_id: str | None, batch_size: int) -> str:
-    after_clause = "" if after_image_id is None else f"AND image_id > {_sql_string(after_image_id)}"
+    after_clause = "" if after_image_id is None else f"AND CAST(image_id AS STRING) > {_sql_string(after_image_id)}"
     return (
-        f"{REGISTRY_QUERY} WHERE row_num = 1 {after_clause} "
-        f"ORDER BY image_id LIMIT {batch_size}"
+        f"{REGISTRY_QUERY} {after_clause} "
+        f"ORDER BY CAST(image_id AS STRING) LIMIT {batch_size}"
     )
 
 
