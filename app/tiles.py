@@ -20,6 +20,10 @@ from .config import settings
 from .metrics import DECODE_SOURCE_PIXELS
 
 TILE_SIZE = settings.tile_size
+DECODE_POLICY_VERSION = (
+    f"geometry-v1;tile-max={settings.max_decode_pixels};"
+    f"thumbnail-max={settings.thumbnail_max_decode_pixels}"
+)
 
 
 class OverviewTooLarge(RuntimeError):
@@ -146,6 +150,10 @@ def slide_metadata(slide: TiffSlide) -> dict:
         "mpp": {"x": mpp_x, "y": mpp_y},
         "objective_power": objective_power,
         "vendor": vendor,
+        "identity_version": "v2",
+        "decode_policy_version": DECODE_POLICY_VERSION,
+        "max_decode_pixels": settings.max_decode_pixels,
+        "thumbnail_max_decode_pixels": settings.thumbnail_max_decode_pixels,
     }
 
 

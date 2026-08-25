@@ -24,7 +24,8 @@ import fsspec
 from PIL import Image
 
 from app.config import settings
-from app.constants import INVENTORY_TABLE, THUMBNAIL_REGISTRY_TABLE
+from app.constants import SERVING_MANIFEST_TABLE, THUMBNAIL_REGISTRY_TABLE
+from app.identity import IDENTITY_VERSION, decode_policy_version, source_fingerprint as canonical_source_fingerprint
 from app.meta_store import run_query_external, run_statement
 from app.slide_store import open_slide, s3_opts
 from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan, slide_metadata
@@ -36,27 +37,46 @@ DEFAULT_SLIDES_PER_TASK = 2_000
 MAX_ARRAY_TASKS = 480
 TASK_MARKER_VERSION = 1
 
+
+def source_fingerprint(row: Any) -> str | None:
+    """Match the fingerprint contract produced by the audit and PDM SQL."""
+    if isinstance(row, InventoryRow):
+        path = row.path
+        size = row.size
+        last_modified = row.last_modified
+    else:
+        path = str(row.get("path") or row.get("slide_path") or "")
+        size = row.get("size", row.get("file_size_bytes", ""))
+        last_modified = row.get("last_modified", "")
+    return canonical_source_fingerprint(path, size, last_modified)
+
+
+def _metadata_source_fingerprint(metadata_json: str) -> str | None:
+    try:
+        value = json.loads(metadata_json).get("source_fingerprint")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return str(value) if value not in (None, "") else None
+
+
+def _metadata_policy_version(metadata_json: str) -> str | None:
+    try:
+        value = json.loads(metadata_json).get("decode_policy_version")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return str(value) if value not in (None, "") else None
+
 SERVABLE_SLIDES_SQL = """
-SELECT image_id, path
-FROM (
-    SELECT
-        CAST(image_id AS STRING) AS image_id,
-        path,
-        ROW_NUMBER() OVER (
-            PARTITION BY CAST(image_id AS STRING)
-            ORDER BY
-                CASE
-                    WHEN path LIKE 's3://mskmind-bkt/reef-slides/%' THEN 0
-                    ELSE 1
-                END,
-                path
-        ) AS row_num
-    FROM {inventory_table}
-    WHERE image_id IS NOT NULL
-      AND path LIKE 's3://%'
-) ranked_inventory
-WHERE row_num = 1
-""".format(inventory_table=INVENTORY_TABLE)
+SELECT
+    CAST(image_id AS STRING) AS image_id,
+    slide_path AS path,
+    serving_size AS size,
+    serving_last_modified AS last_modified
+FROM {serving_manifest_table}
+WHERE image_id IS NOT NULL
+  AND slide_path LIKE 's3://%'
+  AND certification_status = 'valid'
+""".format(serving_manifest_table=SERVING_MANIFEST_TABLE)
 
 REGISTRY_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS {registry_table} (
@@ -101,6 +121,8 @@ FROM {registry_table}
 class InventoryRow:
     image_id: str
     path: str
+    size: int | None = None
+    last_modified: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +138,7 @@ class RegistryRow:
     error_message: str
     manifest_version: str
     tile_metadata_json: str = ""
+    source_fingerprint: str | None = None
 
 
 def _task_result_path(run_dir: str | Path, task_index: int) -> Path:
@@ -618,7 +641,19 @@ def _render_candidate_artifact_subprocess(
 
 
 def _normalize_inventory_rows(rows: list[dict[str, Any]]) -> list[InventoryRow]:
-    return [InventoryRow(image_id=str(row["image_id"]), path=str(row["path"])) for row in rows]
+    return [
+        InventoryRow(
+            image_id=str(row["image_id"]),
+            path=str(row["path"]),
+            size=int(row["size"]) if row.get("size") not in (None, "") else None,
+            last_modified=(
+                str(row["last_modified"])
+                if row.get("last_modified") not in (None, "")
+                else None
+            ),
+        )
+        for row in rows
+    ]
 
 
 def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
@@ -635,6 +670,7 @@ def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
             error_message=str(row.get("error_message") or ""),
             manifest_version=str(row.get("manifest_version") or ""),
             tile_metadata_json=str(row.get("tile_metadata_json") or ""),
+            source_fingerprint=_metadata_source_fingerprint(str(row.get("tile_metadata_json") or "")),
         )
         for row in rows
     ]
@@ -707,12 +743,23 @@ def _select_candidate_rows(
         # is not a complete source-bound record. Regenerate it so migration
         # does not make an otherwise servable slide unavailable.
         metadata_missing = not (registry_row.tile_metadata_json or "").strip()
+        policy_stale = (
+            _metadata_policy_version(registry_row.tile_metadata_json or "")
+            != decode_policy_version()
+        )
         if retry_failures_only:
-            if registry_row.status != "success" or metadata_missing:
+            if registry_row.status != "success" or metadata_missing or policy_stale:
                 candidates.append(row)
             continue
+        current_fingerprint = source_fingerprint(row)
         if registry_row.status == "success" and (
-            registry_row.source_path != row.path or metadata_missing
+            registry_row.source_path != row.path
+            or (
+                current_fingerprint is not None
+                and registry_row.source_fingerprint != current_fingerprint
+            )
+            or metadata_missing
+            or policy_stale
         ):
             candidates.append(row)
     return candidates
@@ -739,7 +786,17 @@ def write_candidate_rows(path: str, rows: Iterable[InventoryRow]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("w", encoding="utf-8") as handle:
         for row in rows:
-            handle.write(json.dumps({"image_id": row.image_id, "path": row.path}, sort_keys=True))
+            handle.write(
+                json.dumps(
+                    {
+                        "image_id": row.image_id,
+                        "path": row.path,
+                        "size": row.size,
+                        "last_modified": row.last_modified,
+                    },
+                    sort_keys=True,
+                )
+            )
             handle.write("\n")
 
 
@@ -751,7 +808,18 @@ def read_candidate_rows(path: str) -> list[InventoryRow]:
             if not line:
                 continue
             payload = json.loads(line)
-            rows.append(InventoryRow(image_id=str(payload["image_id"]), path=str(payload["path"])))
+            rows.append(
+                InventoryRow(
+                    image_id=str(payload["image_id"]),
+                    path=str(payload["path"]),
+                    size=int(payload["size"]) if payload.get("size") not in (None, "") else None,
+                    last_modified=(
+                        str(payload["last_modified"])
+                        if payload.get("last_modified") not in (None, "")
+                        else None
+                    ),
+                )
+            )
     return rows
 
 
@@ -762,7 +830,16 @@ def iter_candidate_rows(path: str) -> Iterable[InventoryRow]:
             if not line:
                 continue
             payload = json.loads(line)
-            yield InventoryRow(image_id=str(payload["image_id"]), path=str(payload["path"]))
+            yield InventoryRow(
+                image_id=str(payload["image_id"]),
+                path=str(payload["path"]),
+                size=int(payload["size"]) if payload.get("size") not in (None, "") else None,
+                last_modified=(
+                    str(payload["last_modified"])
+                    if payload.get("last_modified") not in (None, "")
+                    else None
+                ),
+            )
 
 
 def _slice_candidate_rows(
@@ -802,7 +879,16 @@ def write_candidate_shards(
         for index, row in enumerate(rows):
             task_index = min(index // rows_per_task, task_count - 1)
             handles[task_index].write(
-                json.dumps({"image_id": row.image_id, "path": row.path}, sort_keys=True) + "\n"
+                json.dumps(
+                    {
+                        "image_id": row.image_id,
+                        "path": row.path,
+                        "size": row.size,
+                        "last_modified": row.last_modified,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
             )
     finally:
         for handle in handles:
@@ -851,11 +937,17 @@ def process_candidate_rows(
                     master_size=master_size,
                     timeout_sec=timeout_sec,
                 )
+                metadata = json.loads(artifact.get("tile_metadata_json") or "{}")
+                metadata["identity_version"] = IDENTITY_VERSION
+                metadata["decode_policy_version"] = decode_policy_version()
+                metadata["source_fingerprint"] = source_fingerprint(row)
+                artifact["tile_metadata_json"] = json.dumps(metadata, separators=(",", ":"))
                 _append_result(
                     result_handle,
                     {
                         "image_id": artifact["image_id"],
                         "source_path": artifact["source_path"],
+                        "source_fingerprint": source_fingerprint(row),
                         "artifact_uri": artifact["artifact_uri"],
                         "width": int(artifact["width"]),
                         "height": int(artifact["height"]),
@@ -879,6 +971,7 @@ def process_candidate_rows(
                     {
                         "image_id": row.image_id,
                         "source_path": row.path,
+                        "source_fingerprint": source_fingerprint(row),
                         "artifact_uri": artifact_uri,
                         "width": None,
                         "height": None,
@@ -945,6 +1038,7 @@ USING (
 {source_sql}
 ) AS source
 ON target.image_id = source.image_id
+AND target.source_path = source.source_path
 WHEN MATCHED THEN UPDATE SET
     target.source_path = source.source_path,
     target.artifact_uri = source.artifact_uri,
@@ -1027,6 +1121,10 @@ def _successful_registry_for_inventory(
         if row.status == "success"
         and row.image_id in inventory_by_image_id
         and row.source_path == inventory_by_image_id[row.image_id].path
+        and (
+            source_fingerprint(inventory_by_image_id[row.image_id]) is None
+            or row.source_fingerprint == source_fingerprint(inventory_by_image_id[row.image_id])
+        )
     ]
 
 
@@ -1043,6 +1141,7 @@ def _build_manifest_from_registry(
             "height": row.height,
             "content_type": row.content_type or "image/jpeg",
             "source_uri": row.source_path,
+            "source_fingerprint": row.source_fingerprint,
         }
         for row in registry_rows
     }

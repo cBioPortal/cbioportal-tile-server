@@ -18,6 +18,13 @@ def _jpeg_size(payload: bytes) -> tuple[int, int]:
     return image.size
 
 
+def test_thumbnail_candidates_follow_effective_serving_manifest():
+    assert "wsi_serving_manifest" in module.SERVABLE_SLIDES_SQL
+    assert "slide_path AS path" in module.SERVABLE_SLIDES_SQL
+    assert "serving_size AS size" in module.SERVABLE_SLIDES_SQL
+    assert "certification_status = 'valid'" in module.SERVABLE_SLIDES_SQL
+
+
 def _result_record(image_id: str, path: str, *, status: str = "success") -> dict:
     return {
         "image_id": image_id,
@@ -306,7 +313,13 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=json.dumps(
+                    {
+                        "width": 1024,
+                        "height": 768,
+                        "decode_policy_version": module.decode_policy_version(),
+                    }
+                ),
             )
         ]
 
@@ -332,7 +345,13 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=json.dumps(
+                    {
+                        "width": 1024,
+                        "height": 768,
+                        "decode_policy_version": module.decode_policy_version(),
+                    }
+                ),
             )
         ]
 
@@ -383,7 +402,7 @@ class TestDeltaSelection:
             retry_failures_only=True,
         )
 
-        assert rows == [inventory[1]]
+        assert rows == inventory
 
     def test_legacy_success_without_metadata_is_regenerated(self):
         inventory = [module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs")]
@@ -499,7 +518,13 @@ class TestRunIncrementalPipeline:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=json.dumps(
+                    {
+                        "width": 1024,
+                        "height": 768,
+                        "decode_policy_version": module.decode_policy_version(),
+                    }
+                ),
             )
         ]
         second_registry = first_registry + [
