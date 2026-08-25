@@ -118,6 +118,37 @@ def max_zoom(slide: TiffSlide) -> int:
     return math.ceil(math.log2(max(w, h) / TILE_SIZE))
 
 
+def safe_min_level(slide: TiffSlide) -> int | None:
+    """Return the first ZXY level whose worst edge/interior tile is bounded."""
+    slide_w, slide_h = slide.dimensions
+    for z in range(max_zoom(slide) + 1):
+        target_ds = 2 ** (max_zoom(slide) - z)
+        tiles_x = max(1, math.ceil(slide_w / (TILE_SIZE * target_ds)))
+        tiles_y = max(1, math.ceil(slide_h / (TILE_SIZE * target_ds)))
+        worst_pixels = 0
+        for x in {0, tiles_x - 1}:
+            for y in {0, tiles_y - 1}:
+                try:
+                    _, _, x0, y0, src_w, src_h, _, _ = _tile_geometry(slide, z, x, y)
+                    best_level = slide.get_best_level_for_downsample(target_ds)
+                    level_ds = max(1.0, float(slide.level_downsamples[best_level]))
+                    level_w, level_h = slide.level_dimensions[best_level]
+                    read_w = min(
+                        math.ceil(src_w / level_ds),
+                        level_w - math.floor(x0 / level_ds),
+                    )
+                    read_h = min(
+                        math.ceil(src_h / level_ds),
+                        level_h - math.floor(y0 / level_ds),
+                    )
+                    worst_pixels = max(worst_pixels, max(0, read_w) * max(0, read_h))
+                except (IndexError, ValueError, TypeError):
+                    return None
+        if worst_pixels <= settings.max_decode_pixels:
+            return z
+    return None
+
+
 def _slide_properties_metadata(slide: TiffSlide) -> tuple[float, float, str, int | None]:
     try:
         props = slide.properties
@@ -150,6 +181,7 @@ def slide_metadata(slide: TiffSlide) -> dict:
         "mpp": {"x": mpp_x, "y": mpp_y},
         "objective_power": objective_power,
         "vendor": vendor,
+        "safe_min_level": safe_min_level(slide),
         "identity_version": "v2",
         "decode_policy_version": DECODE_POLICY_VERSION,
         "max_decode_pixels": settings.max_decode_pixels,

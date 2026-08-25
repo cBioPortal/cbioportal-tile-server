@@ -16,6 +16,7 @@ from app.tiles import (
     get_thumbnail_bytes,
     get_thumbnail_bytes_with_plan,
     max_zoom,
+    safe_min_level,
 )
 from tests.conftest import make_mock_slide
 
@@ -35,6 +36,14 @@ class TestMaxZoom:
     def test_tall_slide_uses_larger_dimension(self):
         slide = make_mock_slide(512, 4096)
         assert max_zoom(slide) == math.ceil(math.log2(4096 / TILE_SIZE))
+
+    def test_safe_min_level_is_geometry_only_and_bounded(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=1)
+        monkeypatch.setattr("app.tiles.settings.max_decode_pixels", 4_194_304)
+        slide.read_region = MagicMock(side_effect=AssertionError("must not decode"))
+
+        assert safe_min_level(slide) == 1
+        slide.read_region.assert_not_called()
 
 
 class TestTileHelpers:
