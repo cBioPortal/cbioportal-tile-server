@@ -7,6 +7,7 @@ import argparse
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import fsspec
@@ -105,7 +106,10 @@ def _dimensions(uri: str) -> tuple[int, int]:
 
 def _write(uri: str, payload: bytes) -> None:
     fs = _filesystem(uri)
-    with fs.open(_path(uri), "wb") as handle:
+    path = _path(uri)
+    if not uri.startswith("s3://"):
+        fs.makedirs(str(Path(path).parent), exist_ok=True)
+    with fs.open(path, "wb") as handle:
         handle.write(payload)
 
 
