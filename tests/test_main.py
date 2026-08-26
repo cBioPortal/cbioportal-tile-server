@@ -1,5 +1,5 @@
 import asyncio
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -155,3 +155,96 @@ class TestCorsPreflight:
 
         response = await main_module.require_wsi_capability(starlette_request, call_next)
         assert response.status_code == 204
+
+
+class TestSourceBinding:
+    def test_source_header_is_used_when_query_is_absent(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/thumbnail.jpg"},
+        )
+
+        assert main_module._source_from_request(request, None) == "s3://bucket/thumbnail.jpg"
+
+    def test_query_source_remains_supported(self):
+        request = httpx.Request("GET", "http://test/thumbnails")
+
+        assert main_module._source_from_request(request, "s3://bucket/thumbnail.jpg") == (
+            "s3://bucket/thumbnail.jpg"
+        )
+
+    def test_matching_header_and_query_source_are_accepted(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/thumbnail.jpg"},
+        )
+
+        assert main_module._source_from_request(
+            request, "s3://bucket/thumbnail.jpg"
+        ) == "s3://bucket/thumbnail.jpg"
+
+    def test_conflicting_source_bindings_are_rejected(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/header.jpg"},
+        )
+
+        with pytest.raises(main_module.HTTPException) as exc_info:
+            main_module._source_from_request(request, "s3://bucket/query.jpg")
+
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_tile_route_accepts_header_only_source(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/tiles/zxy/0/0/0",
+            headers={"X-WSI-Source": "s3://bucket/slide.svs"},
+        )
+        cached_tile = b"tile"
+
+        with (
+            patch.object(
+                main_module,
+                "_authorize_source",
+                return_value=("s3://bucket/slide.svs", {"sub": "test-user"}),
+            ) as authorize,
+            patch.object(
+                main_module.tile_cache,
+                "get_tile",
+                new=AsyncMock(return_value=cached_tile),
+            ),
+        ):
+            response = await main_module.tile(request, 0, 0, 0, None)
+
+        authorize.assert_called_once_with(request, "s3://bucket/slide.svs", "tile")
+        assert response.body == cached_tile
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_route_accepts_header_only_source(self):
+        request = httpx.Request(
+            "GET",
+            "http://test/thumbnails",
+            headers={"X-WSI-Source": "s3://bucket/thumbnail.jpg"},
+        )
+        cached_thumbnail = b"thumbnail"
+
+        with (
+            patch.object(
+                main_module,
+                "_authorize_source",
+                return_value=("s3://bucket/thumbnail.jpg", {"sub": "test-user"}),
+            ) as authorize,
+            patch.object(
+                main_module.tile_cache,
+                "get_thumbnail",
+                new=AsyncMock(return_value=cached_thumbnail),
+            ),
+        ):
+            response = await main_module.thumbnail(request, None, 128, 96)
+
+        authorize.assert_called_once_with(request, "s3://bucket/thumbnail.jpg", "thumbnail")
+        assert response.body == cached_thumbnail
