@@ -286,6 +286,14 @@ def _authorize_source(request: Request, source: str, operation: str) -> tuple[st
     return source, claims
 
 
+def _source_from_request(request: Request, query_source: str | None) -> str:
+    header_source = request.headers.get("x-wsi-source", "").strip()
+    query_source = (query_source or "").strip()
+    if header_source and query_source and not hmac.compare_digest(header_source, query_source):
+        raise HTTPException(status_code=400, detail="conflicting source bindings")
+    return header_source or query_source
+
+
 def _run_slide_operation(source: str, operation, *args):
     try:
         if not isinstance(_slides, SlideCache):
@@ -365,8 +373,9 @@ async def tile(
     z: int,
     x: int,
     y: int,
-    source: str = Query(...),
+    source: str | None = Query(None),
 ):
+    source = _source_from_request(request, source)
     source, claims = _authorize_source(request, source, "tile")
     cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
@@ -411,10 +420,11 @@ async def tile(
 @app.get("/thumbnails")
 async def thumbnail(
     request: Request,
-    source: str = Query(...),
+    source: str | None = Query(None),
     width: int = 256,
     height: int = 256,
 ):
+    source = _source_from_request(request, source)
     source, claims = _authorize_source(request, source, "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
