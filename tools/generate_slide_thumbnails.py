@@ -51,6 +51,13 @@ def source_fingerprint(row: Any) -> str | None:
     return canonical_source_fingerprint(path, size, last_modified)
 
 
+def _require_source_fingerprint(row: InventoryRow) -> str:
+    fingerprint = source_fingerprint(row)
+    if fingerprint is None:
+        raise ValueError("serving manifest row has incomplete source identity")
+    return fingerprint
+
+
 def _metadata_source_fingerprint(metadata_json: str) -> str | None:
     try:
         value = json.loads(metadata_json).get("source_fingerprint")
@@ -654,6 +661,19 @@ def _normalize_inventory_rows(rows: list[dict[str, Any]]) -> list[InventoryRow]:
         )
         for row in rows
     ]
+def _validate_inventory_identity(rows: Iterable[InventoryRow]) -> None:
+    invalid_count = 0
+    for row in rows:
+        try:
+            if source_fingerprint(row) is None:
+                invalid_count += 1
+        except (TypeError, ValueError, OverflowError):
+            invalid_count += 1
+    if invalid_count:
+        raise ValueError(
+            "serving manifest contains "
+            f"{invalid_count} rows with incomplete or invalid source identity"
+        )
 
 
 def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
@@ -677,7 +697,9 @@ def _normalize_registry_rows(rows: list[dict[str, Any]]) -> list[RegistryRow]:
 
 
 def _fetch_inventory_rows(warehouse_id: str) -> list[InventoryRow]:
-    return _normalize_inventory_rows(run_query_external(SERVABLE_SLIDES_SQL, warehouse_id))
+    rows = _normalize_inventory_rows(run_query_external(SERVABLE_SLIDES_SQL, warehouse_id))
+    _validate_inventory_identity(rows)
+    return rows
 
 
 def _fetch_registry_rows(warehouse_id: str) -> list[RegistryRow]:
@@ -725,16 +747,30 @@ def _registry_by_image_id(rows: list[RegistryRow]) -> dict[str, RegistryRow]:
     return by_image_id
 
 
+def _registry_by_image_id_and_source(rows: list[RegistryRow]) -> dict[tuple[str, str], RegistryRow]:
+    by_image_and_source: dict[tuple[str, str], RegistryRow] = {}
+    for row in rows:
+        key = (row.image_id, row.source_path)
+        existing = by_image_and_source.get(key)
+        if existing is None or (row.rendered_at, row.manifest_version) > (
+            existing.rendered_at,
+            existing.manifest_version,
+        ):
+            by_image_and_source[key] = row
+    return by_image_and_source
+
+
 def _select_candidate_rows(
     inventory_rows: list[InventoryRow],
     registry_rows: list[RegistryRow],
     *,
     retry_failures_only: bool,
 ) -> list[InventoryRow]:
-    registry_by_image_id = _registry_by_image_id(registry_rows)
+    _validate_inventory_identity(inventory_rows)
+    registry_by_image_and_source = _registry_by_image_id_and_source(registry_rows)
     candidates: list[InventoryRow] = []
     for row in inventory_rows:
-        registry_row = registry_by_image_id.get(row.image_id)
+        registry_row = registry_by_image_and_source.get((row.image_id, row.path))
         if registry_row is None:
             if not retry_failures_only:
                 candidates.append(row)
@@ -747,20 +783,16 @@ def _select_candidate_rows(
             _metadata_policy_version(registry_row.tile_metadata_json or "")
             != decode_policy_version()
         )
-        if retry_failures_only:
-            if registry_row.status != "success" or metadata_missing or policy_stale:
-                candidates.append(row)
-            continue
-        current_fingerprint = source_fingerprint(row)
-        if registry_row.status == "success" and (
-            registry_row.source_path != row.path
-            or (
-                current_fingerprint is not None
-                and registry_row.source_fingerprint != current_fingerprint
-            )
+        current_fingerprint = _require_source_fingerprint(row)
+        needs_regeneration = (
+            registry_row.source_fingerprint != current_fingerprint
             or metadata_missing
             or policy_stale
-        ):
+        )
+        if retry_failures_only:
+            if registry_row.status != "success" or needs_regeneration:
+                candidates.append(row)
+        elif registry_row.status == "success" and needs_regeneration:
             candidates.append(row)
     return candidates
 
@@ -928,6 +960,7 @@ def process_candidate_rows(
     try:
         for index, row in enumerate(rows, start=1):
             logger.info("processing thumbnail candidate index=%d", index)
+            current_fingerprint = _require_source_fingerprint(row)
             artifact_uri = _join_uri(root_uri, f"{row.image_id}.jpg")
             try:
                 artifact = _render_candidate_artifact_subprocess(
@@ -940,14 +973,14 @@ def process_candidate_rows(
                 metadata = json.loads(artifact.get("tile_metadata_json") or "{}")
                 metadata["identity_version"] = IDENTITY_VERSION
                 metadata["decode_policy_version"] = decode_policy_version()
-                metadata["source_fingerprint"] = source_fingerprint(row)
+                metadata["source_fingerprint"] = current_fingerprint
                 artifact["tile_metadata_json"] = json.dumps(metadata, separators=(",", ":"))
                 _append_result(
                     result_handle,
                     {
                         "image_id": artifact["image_id"],
                         "source_path": artifact["source_path"],
-                        "source_fingerprint": source_fingerprint(row),
+                        "source_fingerprint": current_fingerprint,
                         "artifact_uri": artifact["artifact_uri"],
                         "width": int(artifact["width"]),
                         "height": int(artifact["height"]),
@@ -971,7 +1004,7 @@ def process_candidate_rows(
                     {
                         "image_id": row.image_id,
                         "source_path": row.path,
-                        "source_fingerprint": source_fingerprint(row),
+                        "source_fingerprint": current_fingerprint,
                         "artifact_uri": artifact_uri,
                         "width": None,
                         "height": None,
@@ -1114,18 +1147,25 @@ def _successful_registry_for_inventory(
     inventory_rows: list[InventoryRow],
     registry_rows: list[RegistryRow],
 ) -> list[RegistryRow]:
-    inventory_by_image_id = {row.image_id: row for row in inventory_rows}
-    return [
-        row
-        for row in registry_rows
-        if row.status == "success"
-        and row.image_id in inventory_by_image_id
-        and row.source_path == inventory_by_image_id[row.image_id].path
-        and (
-            source_fingerprint(inventory_by_image_id[row.image_id]) is None
-            or row.source_fingerprint == source_fingerprint(inventory_by_image_id[row.image_id])
-        )
-    ]
+    _validate_inventory_identity(inventory_rows)
+    inventory_by_image_and_source = {
+        (row.image_id, row.path): row for row in inventory_rows
+    }
+    registry_by_image_and_source = _registry_by_image_id_and_source(registry_rows)
+    complete: list[RegistryRow] = []
+    for key, inventory_row in inventory_by_image_and_source.items():
+        row = registry_by_image_and_source.get(key)
+        if row is None or row.status != "success":
+            continue
+        current_fingerprint = _require_source_fingerprint(inventory_row)
+        if row.source_fingerprint != current_fingerprint:
+            continue
+        if not (row.tile_metadata_json or "").strip():
+            continue
+        if _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
+            continue
+        complete.append(row)
+    return complete
 
 
 def _build_manifest_from_registry(
