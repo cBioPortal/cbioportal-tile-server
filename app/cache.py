@@ -40,6 +40,13 @@ end
 return 0
 """
 
+_RENEW_LOCK_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('pexpire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
 _CACHE_MISS_LIMIT_SCRIPT = """
 local now = tonumber(ARGV[1])
 local window = tonumber(ARGV[2])
@@ -87,8 +94,8 @@ def _lock_key(cache_key: str) -> str:
     return f"lock:{cache_key}"
 
 
-def _miss_limit_key(subject: str) -> str:
-    digest = hashlib.sha256(subject.encode("utf-8")).hexdigest()
+def _miss_limit_key(subject: str, scope: str) -> str:
+    digest = hashlib.sha256(f"{subject}\0{scope}".encode("utf-8")).hexdigest()
     return f"rate:cache-miss:{digest}"
 
 
@@ -231,8 +238,35 @@ async def release_miss_lock(cache_key: str, token: str) -> None:
         _trip_redis_breaker("release_miss_lock")
 
 
-async def allow_cache_miss(subject: str) -> tuple[bool, int]:
-    """Atomically apply the shared cache-miss limit and return (allowed, retry seconds)."""
+async def renew_miss_lock(cache_key: str, token: str) -> bool:
+    """Extend an owned miss lock without changing ownership."""
+    if not _redis_available():
+        return False
+    started = time.perf_counter()
+    try:
+        renewed = await _redis.eval(
+            _RENEW_LOCK_SCRIPT,
+            1,
+            _lock_key(cache_key),
+            token,
+            max(1, settings.cache_miss_lock_ttl_seconds) * 1000,
+        )
+        REDIS_OPERATION_SECONDS.labels(operation="renew_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        _record_redis_recovery()
+        return bool(int(renewed))
+    except Exception:
+        REDIS_OPERATION_SECONDS.labels(operation="renew_miss_lock").observe(
+            time.perf_counter() - started
+        )
+        REDIS_ERRORS.labels(operation="renew_miss_lock").inc()
+        _trip_redis_breaker("renew_miss_lock")
+        return False
+
+
+async def allow_cache_miss(subject: str, scope: str) -> tuple[bool, int]:
+    """Atomically apply the shared per-source cache-miss limit and return (allowed, retry seconds)."""
     limit = settings.cache_miss_rate_limit_per_minute
     if limit <= 0 or not _redis_available():
         CACHE_MISS_RATE_LIMITS.labels(result="bypassed").inc()
@@ -245,7 +279,7 @@ async def allow_cache_miss(subject: str) -> tuple[bool, int]:
         result = await _redis.eval(
             _CACHE_MISS_LIMIT_SCRIPT,
             1,
-            _miss_limit_key(subject),
+            _miss_limit_key(subject, scope),
             now_ms,
             window_ms,
             limit,

@@ -56,6 +56,12 @@ def test_dev_materializer_keeps_canonical_and_raw_stain_fields():
     assert "stain_name_key LIKE '%fish%'" in source
 
 
+def test_dev_materializer_does_not_publish_thumbnail_variants():
+    source = module.Path(module.__file__).read_text(encoding="utf-8")
+    assert "generate_thumbnail_variants" not in source
+    assert "variant-root-uri" not in source
+
+
 def test_sql_literals_escape_text_and_preserve_booleans():
     assert _literal("O'Brien") == "'O''Brien'"
     assert _literal(True, "bool") == "TRUE"

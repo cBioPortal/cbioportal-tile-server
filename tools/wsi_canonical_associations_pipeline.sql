@@ -60,21 +60,54 @@ inventory_paths AS (
     WHERE row_num = 1
 ),
 thumbnail_registry AS (
-    SELECT image_id, artifact_uri, width, height, content_type, tile_metadata_json
+    SELECT
+        image_id,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_artifact_uri
+            ELSE artifact_uri
+        END AS artifact_uri,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_width
+            ELSE width
+        END AS width,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_height
+            ELSE height
+        END AS height,
+        content_type,
+        tile_metadata_json
     FROM (
         SELECT
-            CAST(image_id AS STRING) AS image_id,
-            artifact_uri,
-            width,
-            height,
-            content_type,
-            tile_metadata_json,
+            CAST(registry.image_id AS STRING) AS image_id,
+            registry.artifact_uri,
+            registry.width,
+            registry.height,
+            registry.serving_artifact_uri,
+            registry.serving_width,
+            registry.serving_height,
+            registry.content_type,
+            registry.tile_metadata_json,
             ROW_NUMBER() OVER (
-                PARTITION BY CAST(image_id AS STRING)
-                ORDER BY rendered_at DESC, manifest_version DESC
+                PARTITION BY CAST(registry.image_id AS STRING)
+                ORDER BY registry.rendered_at DESC, registry.manifest_version DESC
             ) AS row_num
-        FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry
-        WHERE status = 'success'
+        FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry registry
+        INNER JOIN inventory_paths inventory
+            ON CAST(registry.image_id AS STRING) = inventory.image_id
+           AND registry.source_path = inventory.path
+        WHERE registry.status = 'success'
     ) ranked_thumbnails
     WHERE row_num = 1
 ),

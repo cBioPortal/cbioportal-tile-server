@@ -36,6 +36,19 @@ def test_canonical_pipeline_prefers_reef_inventory_paths():
     assert reef_pattern in sql
 
 
+def test_canonical_pipeline_requires_a_complete_serving_pointer():
+    sql_path = (
+        Path(__file__).resolve().parent.parent
+        / "tools"
+        / "wsi_canonical_associations_pipeline.sql"
+    )
+    sql = sql_path.read_text(encoding="utf-8")
+
+    assert "serving_width > 0" in sql
+    assert "serving_height > 0" in sql
+    assert "registry.source_path = inventory.path" in sql
+
+
 def test_canonical_pipeline_emits_the_normalized_loader_contract():
     sql_path = (
         Path(__file__).resolve().parent.parent

@@ -44,7 +44,8 @@ services:
       TILE_CACHE_TTL: ${TILE_CACHE_TTL:-86400}
       THUMBNAIL_CACHE_TTL: ${THUMBNAIL_CACHE_TTL:-86400}
       CACHE_MISS_LOCK_TTL_SECONDS: ${CACHE_MISS_LOCK_TTL_SECONDS:-120}
-      CACHE_MISS_WAIT_TIMEOUT_SECONDS: ${CACHE_MISS_WAIT_TIMEOUT_SECONDS:-30}
+      CACHE_MISS_WAIT_TIMEOUT_SECONDS: ${CACHE_MISS_WAIT_TIMEOUT_SECONDS:-60}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-180}
 
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}

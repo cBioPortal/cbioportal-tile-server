@@ -34,6 +34,7 @@ def _make_redis():
     r.get    = AsyncMock(return_value=None)
     r.set    = AsyncMock()
     r.setex  = AsyncMock()
+    r.eval   = AsyncMock(return_value=1)
     return r
 
 
@@ -49,6 +50,35 @@ class TestKeyFormats:
         with patch.object(cache_module, "_redis", r):
             await cache_module.get_thumbnail("abc", 256, 128)
         r.get.assert_called_once_with("thumbnail:abc:256:128")
+
+class TestMissLimitKey:
+    def test_miss_limit_key_is_scoped_by_slide(self):
+        first = cache_module._miss_limit_key("subject", "slide-a")
+        same = cache_module._miss_limit_key("subject", "slide-a")
+        other_slide = cache_module._miss_limit_key("subject", "slide-b")
+        other_subject = cache_module._miss_limit_key("other", "slide-a")
+
+        assert first == same
+        assert first != other_slide
+        assert first != other_subject
+        assert "slide-a" not in first
+
+
+class TestMissLock:
+    async def test_renew_miss_lock_extends_only_owned_lock(self, monkeypatch):
+        r = _make_redis()
+        monkeypatch.setattr(cache_module.settings, "cache_miss_lock_ttl_seconds", 120)
+        with patch.object(cache_module, "_redis", r):
+            renewed = await cache_module.renew_miss_lock("tile:abc", "token")
+
+        assert renewed is True
+        r.eval.assert_awaited_once_with(
+            cache_module._RENEW_LOCK_SCRIPT,
+            1,
+            "lock:tile:abc",
+            "token",
+            120_000,
+        )
 
 
 # ---------------------------------------------------------------------------

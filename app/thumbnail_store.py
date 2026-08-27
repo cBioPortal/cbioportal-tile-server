@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -8,8 +9,11 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import urlparse
 
+import boto3
 import fsspec
+from botocore.config import Config
 from PIL import Image
 
 from .config import settings
@@ -113,6 +117,68 @@ class ThumbnailManifestCache:
 
 manifest_cache = ThumbnailManifestCache()
 
+_runtime_s3_client = None
+_runtime_s3_lock = threading.Lock()
+
+
+def _s3_location(uri: str) -> tuple[str, str]:
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise FileNotFoundError(f"Malformed thumbnail URI: {uri!r}")
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def _new_runtime_s3_client():
+    config = Config(
+        max_pool_connections=max(1, settings.thumbnail_s3_max_connections),
+        connect_timeout=max(0.1, settings.thumbnail_s3_connect_timeout_sec),
+        read_timeout=max(0.1, settings.thumbnail_s3_read_timeout_sec),
+        retries={
+            "mode": "standard",
+            "max_attempts": max(1, settings.thumbnail_s3_max_attempts),
+        },
+        s3={"addressing_style": "path"},
+    )
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.aws_endpoint_url or None,
+        aws_access_key_id=settings.aws_access_key_id or None,
+        aws_secret_access_key=settings.aws_secret_access_key or None,
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+        config=config,
+    )
+
+
+def initialize_runtime_store() -> None:
+    """Create and optionally prewarm one S3 client per application worker."""
+    global _runtime_s3_client
+    with _runtime_s3_lock:
+        if _runtime_s3_client is None:
+            _runtime_s3_client = _new_runtime_s3_client()
+        client = _runtime_s3_client
+    prewarm_uri = settings.thumbnail_prewarm_uri.strip()
+    if prewarm_uri:
+        bucket, key = _s3_location(prewarm_uri)
+        client.head_object(Bucket=bucket, Key=key)
+
+
+def close_runtime_store() -> None:
+    global _runtime_s3_client
+    with _runtime_s3_lock:
+        client = _runtime_s3_client
+        _runtime_s3_client = None
+    if client is not None:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+
+
+def _runtime_s3() -> Any:
+    global _runtime_s3_client
+    if _runtime_s3_client is None:
+        initialize_runtime_store()
+    return _runtime_s3_client
+
 
 def get_thumbnail_record(image_id: str) -> ThumbnailRecord | None:
     return manifest_cache.get(image_id)
@@ -185,17 +251,25 @@ def store_generated_thumbnail(image_id: str, payload: bytes) -> ThumbnailRecord 
 
 
 def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
+    if record.uri.startswith("s3://"):
+        bucket, key = _s3_location(record.uri)
+        response = _runtime_s3().get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
     fs = _filesystem_for_uri(record.uri)
     with fs.open(_filesystem_path(record.uri), "rb") as handle:
         return handle.read()
 
 
-def render_thumbnail_response(
+def render_thumbnail_payload(
+    payload: bytes,
     record: ThumbnailRecord,
     requested_width: int,
     requested_height: int,
 ) -> tuple[bytes, dict[str, Any]]:
-    payload = read_thumbnail_bytes(record)
     if requested_width >= record.width and requested_height >= record.height:
         return payload, {"status": "ok", "reason": "master"}
 
@@ -205,3 +279,12 @@ def render_thumbnail_response(
         out = BytesIO()
         working.save(out, format="JPEG", quality=settings.jpeg_quality)
     return out.getvalue(), {"status": "ok", "reason": "resized"}
+
+
+def render_thumbnail_response(
+    record: ThumbnailRecord,
+    requested_width: int,
+    requested_height: int,
+) -> tuple[bytes, dict[str, Any]]:
+    payload = read_thumbnail_bytes(record)
+    return render_thumbnail_payload(payload, record, requested_width, requested_height)

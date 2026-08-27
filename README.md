@@ -33,13 +33,19 @@ handlers. The production sequence is:
    `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
    `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
    `content_type`.
-3. The Databricks canonical-association job joins the source path to the
+3. The thumbnail publisher automatically runs
+   `tools/generate_thumbnail_variants.py` after the master registry is
+   published. It creates 128×96 navigation derivatives under a
+   manifest-versioned prefix and publishes their serving pointers. The first
+   run adds the serving-pointer columns to the existing registry; reruns are
+   idempotent.
+4. The Databricks canonical-association job joins the source path to the
    latest successful registry row and computes `can_serve_tiles`. The
    canonical job must run only after the thumbnail batch has completed for the
    input inventory (use a job dependency or completion watermark).
-4. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
+5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
    dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`.
-5. cBioPortal core imports that complete snapshot and is the sole ClickHouse
+6. cBioPortal core imports that complete snapshot and is the sole ClickHouse
    writer.
 
 The frontend is read-only: it requests the backend access bundle and then
@@ -86,15 +92,22 @@ optional Redis cache:
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
 | `REDIS_URL` | `redis://redis:6379` | Optional tile/thumbnail cache |
+| `THUMBNAIL_FETCH_CONCURRENCY` | `8` | Per-worker concurrent thumbnail object fetches |
+| `THUMBNAIL_S3_MAX_CONNECTIONS` | `32` | Per-worker pooled S3 connections |
+| `THUMBNAIL_S3_CONNECT_TIMEOUT_SEC` | `1` | S3 connection timeout |
+| `THUMBNAIL_S3_READ_TIMEOUT_SEC` | `5` | S3 object-read timeout |
+| `THUMBNAIL_S3_MAX_ATTEMPTS` | `2` | S3 client retry limit |
+| `THUMBNAIL_PREWARM_URI` | — | Optional stable thumbnail object used to prewarm each worker |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `4194304` | Maximum on-demand tile decode |
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |
-| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per capability subject; `0` disables it |
-| `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Cross-worker extraction lock lifetime |
-| `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `30` | Maximum follower wait for another worker's extraction |
+| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per capability subject and source; `0` disables it |
+| `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Renewable cross-worker extraction lock lease |
+| `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `60` | Maximum follower wait for another worker's extraction |
+| `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
@@ -127,7 +140,8 @@ The `/metrics` endpoint is intended for internal monitoring and is not a WSI
 capability endpoint. Production ingress should expose only the tile,
 thumbnail, health, and readiness paths; scrape `/metrics` through the internal
 Kubernetes service. Important metrics include image-operation queue time,
-slide-open latency, Redis errors/latency, cache hit/miss counts, distributed
+thumbnail fetch/resize latency and fetch-slot queue time, slide-open latency,
+Redis errors/latency, cache hit/miss counts, distributed
 miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ## Quick start
@@ -151,10 +165,19 @@ exporter and SQL pipeline are intentionally offline tooling; none of their
 metadata clients are imported by the FastAPI runtime.
 
 Run the thumbnail batch as a separate scheduled process before the canonical
-Databricks refresh. A successful thumbnail run must publish both the object
-store artifacts and the matching registry rows; writing only a JPEG or only a
-manifest is insufficient. Legacy successful rows with missing
-`tile_metadata_json` must be backfilled or regenerated before export.
+Databricks refresh. The Slurm wrapper runs the navigation-variant job after
+master publication. For a standalone backfill or repair, run:
+
+```bash
+python3 tools/generate_thumbnail_variants.py \
+  --warehouse-id "$DATABRICKS_WAREHOUSE_ID" \
+  --variant-root-uri s3://mskmind-bkt/wsi-thumbnails/variants/nav-128x96
+```
+
+A successful run must publish both the object-store artifacts and the matching
+registry rows; writing only a JPEG or only a manifest is insufficient. Legacy
+successful rows with missing `tile_metadata_json` must be backfilled or
+regenerated before export.
 
 The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
 `data_wsi.txt` pair. Export it from the canonical association table with:
@@ -205,9 +228,10 @@ tables to inspect coverage, conflicts, and the ranked non-binary queue before
 publishing a release.
 
 For development or rehearsal, use the Databricks `dev` profile and its
-warehouse, and point all four `WSI_*_TABLE` variables at the isolated
-`cdsi_dev.wsi_test` schema. Set `THUMBNAIL_MANIFEST_URI` to a separate
-object-store prefix such as
+warehouse, and point the WSI tables at an isolated `cdsi_dev.wsi_test`
+schema. The dev materializer loads only the supplied snapshot and master
+thumbnail registry; it does not generate or publish thumbnail variants. Set
+`THUMBNAIL_MANIFEST_URI` to a separate object-store prefix such as
 `s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does
 not expose the production PHI catalogs, so load a validated study snapshot and
 the offline registry with:
@@ -224,13 +248,20 @@ DATABRICKS_CONFIG_PROFILE=dev PYTHONPATH=. .venv/bin/python \
 ```
 
 This writes only the dev source, registry, canonical, and summary tables and
-publishes thumbnails below the separate `wsi-thumbnails-dev/` prefix. The
-materializer rejects registry rows whose artifact URI is not exactly below the
-dev artifact root, retains failed registry rows for diagnostics, and publishes
-only complete successful rows in the manifest. The
+publishes the supplied manifest below the separate `wsi-thumbnails-dev/`
+prefix. The materializer rejects registry rows whose artifact URI is not
+exactly below the dev artifact root, retains failed registry rows for
+diagnostics, and publishes only complete successful rows in the manifest. The
 production Databricks SQL templates remain available through
 `tools/run_wsi_pipelines.py` for a workspace with the production source
 catalogs; leaving the variables unset preserves production defaults.
+
+Beta does not require these dev tables. To prepare a beta study, run the
+exporter against the production canonical association table using a read-only
+Databricks identity, then import the resulting study files into the beta
+ClickHouse database. The imported `THUMBNAIL_URL` values point to the already
+published production S3 artifacts; beta does not connect to or write the
+production Databricks tables.
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
 issue a v2 capability whose source URL is the mounted file URI. The normal

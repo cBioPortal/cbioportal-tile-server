@@ -367,12 +367,19 @@ def _derive(warehouse_id: str, tables: dict[str, str]) -> None:
     )
     meta_store.run_statement(
         f"""CREATE TABLE {canonical} USING DELTA AS
-WITH ranked_registry AS (
-  SELECT image_id, source_path, artifact_uri, width, height, content_type, tile_metadata_json,
-         ROW_NUMBER() OVER (PARTITION BY image_id ORDER BY rendered_at DESC, manifest_version DESC) AS rn
-  FROM {registry} WHERE status = 'success'
-), source_rows AS (
+WITH source_rows AS (
   SELECT *, NULLIF(sample_id, '') AS normalized_sample_id FROM {source}
+), ranked_registry AS (
+  SELECT r.image_id, r.source_path, r.artifact_uri, r.width, r.height,
+         r.content_type, r.tile_metadata_json,
+         ROW_NUMBER() OVER (
+           PARTITION BY r.image_id, r.source_path
+           ORDER BY r.rendered_at DESC, r.manifest_version DESC
+         ) AS rn
+  FROM {registry} r
+  INNER JOIN (SELECT DISTINCT image_id, source_url FROM source_rows) current_source
+    ON r.image_id = current_source.image_id AND r.source_path = current_source.source_url
+  WHERE r.status = 'success'
 ), normalized_stains AS (
   SELECT
     source_rows.*,
@@ -453,7 +460,8 @@ SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTA
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.tile_metadata_json END AS tile_metadata_json,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.artifact_uri END AS thumbnail_url,
-  r.width AS thumbnail_width, r.height AS thumbnail_height, r.content_type AS thumbnail_content_type
+  r.width AS thumbnail_width, r.height AS thumbnail_height,
+  r.content_type AS thumbnail_content_type
 FROM typed_stains s
 LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source_path = s.source_url""",
         warehouse_id,
