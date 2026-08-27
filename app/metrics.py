@@ -63,6 +63,21 @@ IMAGE_OPERATION_QUEUE_SECONDS = Histogram(
     "Time spent waiting for an image-operation slot.",
     ("kind",),
 )
+IMAGE_OPERATION_QUEUE_TIMEOUTS = Counter(
+    "tile_server_image_operation_queue_timeouts_total",
+    "Image operations rejected after waiting too long for a worker slot.",
+    ("kind",),
+)
+SLIDE_OPEN_SECONDS = Histogram(
+    "tile_server_slide_open_seconds",
+    "Time spent opening a slide through the block cache and ECS.",
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, float("inf")),
+)
+SLIDE_OPEN_ERRORS = Counter(
+    "tile_server_slide_open_errors_total",
+    "Slide-open failures by coarse exception type.",
+    ("error_type",),
+)
 THUMBNAIL_FETCH_SECONDS = Histogram(
     "tile_server_thumbnail_fetch_seconds",
     "Time spent fetching a thumbnail object from object storage.",

@@ -18,6 +18,15 @@ def s3_opts() -> dict:
         opts["key"] = settings.aws_access_key_id
     if settings.aws_secret_access_key:
         opts["secret"] = settings.aws_secret_access_key
+    opts["config_kwargs"] = {
+        "connect_timeout": max(0.1, settings.slide_s3_connect_timeout_seconds),
+        "read_timeout": max(0.1, settings.slide_s3_read_timeout_seconds),
+        "max_pool_connections": max(1, settings.slide_s3_max_connections),
+        "retries": {
+            "mode": "standard",
+            "max_attempts": max(1, settings.slide_s3_max_attempts),
+        },
+    }
     return opts
 
 

@@ -13,12 +13,20 @@ def _settings(
     aws_access_key_id="key",
     aws_secret_access_key="secret",
     blockcache_path="",
+    slide_s3_connect_timeout_seconds=1.0,
+    slide_s3_read_timeout_seconds=10.0,
+    slide_s3_max_attempts=2,
+    slide_s3_max_connections=16,
 ):
     m = MagicMock()
     m.aws_endpoint_url      = aws_endpoint_url
     m.aws_access_key_id     = aws_access_key_id
     m.aws_secret_access_key = aws_secret_access_key
     m.blockcache_path       = blockcache_path
+    m.slide_s3_connect_timeout_seconds = slide_s3_connect_timeout_seconds
+    m.slide_s3_read_timeout_seconds = slide_s3_read_timeout_seconds
+    m.slide_s3_max_attempts = slide_s3_max_attempts
+    m.slide_s3_max_connections = slide_s3_max_connections
     return m
 
 
@@ -48,6 +56,21 @@ class TestValidS3Uris:
         _, _, opts = resolve("s3://bucket/key.svs", aws_access_key_id="k", aws_secret_access_key="s")
         assert opts["key"] == "k"
         assert opts["secret"] == "s"
+
+    def test_opts_include_s3_client_guardrails(self):
+        _, _, opts = resolve(
+            "s3://bucket/key.svs",
+            slide_s3_connect_timeout_seconds=0.5,
+            slide_s3_read_timeout_seconds=7,
+            slide_s3_max_attempts=3,
+            slide_s3_max_connections=24,
+        )
+        assert opts["config_kwargs"] == {
+            "connect_timeout": 0.5,
+            "read_timeout": 7,
+            "max_pool_connections": 24,
+            "retries": {"mode": "standard", "max_attempts": 3},
+        }
 
     def test_opts_omit_empty_endpoint(self):
         _, _, opts = resolve("s3://bucket/key.svs", aws_endpoint_url="")

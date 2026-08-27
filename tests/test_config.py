@@ -19,7 +19,8 @@ def make_settings(**env):
              if not k.startswith(("AWS_", "DATABRICKS_", "REDIS", "TILE_",
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
-                                   "CORS_", "CACHE_", "PATIENT_", "WSI_"))}
+                                   "CORS_", "CACHE_", "PATIENT_", "WSI_",
+                                   "IMAGE_", "SLIDE_S3_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -82,6 +83,14 @@ class TestOtherSettings:
     def test_max_image_operations_default(self):
         s = make_settings()
         assert s.max_image_operations == 2
+
+    def test_cold_read_operation_guardrails_default(self):
+        s = make_settings()
+        assert s.image_operation_queue_timeout_seconds == 2.0
+        assert s.slide_s3_connect_timeout_seconds == 1.0
+        assert s.slide_s3_read_timeout_seconds == 10.0
+        assert s.slide_s3_max_attempts == 2
+        assert s.slide_s3_max_connections == 16
 
     def test_cold_read_timeout_guardrails_default(self):
         s = make_settings()

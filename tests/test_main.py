@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from botocore.exceptions import EndpointConnectionError
 
 import app.main as main_module
 
@@ -154,6 +155,35 @@ class TestImageOperationGate:
 
         assert results == [0, 1, 2, 3]
         assert peak == 1
+
+    @pytest.mark.asyncio
+    async def test_queue_timeout_rejects_work_without_waiting_for_a_slot(self, monkeypatch):
+        main_module._image_operation_semaphore = asyncio.Semaphore(1)
+        await main_module._image_operation_semaphore.acquire()
+        monkeypatch.setattr(main_module.settings, "image_operation_queue_timeout_seconds", 0.1)
+
+        with pytest.raises(main_module.ImageOperationQueueTimeout):
+            await main_module._run_image_operation(lambda: b"never-starts")
+
+        main_module._image_operation_semaphore.release()
+
+
+class TestTransientSourceFailures:
+    def test_slide_source_timeout_maps_to_retryable_response(self):
+        slides = object.__new__(main_module.SlideCache)
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(
+                main_module.SlideCache,
+                "run",
+                side_effect=EndpointConnectionError(endpoint_url="http://ecs:9020"),
+            ),
+        ):
+            with pytest.raises(main_module.HTTPException) as exc_info:
+                main_module._run_slide_operation("s3://bucket/slide.svs", lambda _: None)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers["Retry-After"] == "1"
 
 
 class TestCorsPreflight:
