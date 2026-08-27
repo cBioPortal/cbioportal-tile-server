@@ -72,9 +72,9 @@ class Settings:
     # Tile settings
     tile_size: int = field(default_factory=lambda: _env_int("TILE_SIZE", 256))
     jpeg_quality: int = field(default_factory=lambda: _env_int("JPEG_QUALITY", 85))
-    max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 4_194_304))
+    max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 16_777_216))
     thumbnail_max_decode_pixels: int = field(
-        default_factory=lambda: _env_int("THUMBNAIL_MAX_DECODE_PIXELS", 16_000_000)
+        default_factory=lambda: _env_int("THUMBNAIL_MAX_DECODE_PIXELS", 16_777_216)
     )
     thumbnail_timeout_sec: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_TIMEOUT_SEC", 8)

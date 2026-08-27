@@ -17,13 +17,11 @@ from PIL import Image, ImageDraw
 from tiffslide import TiffSlide
 
 from .config import settings
+from .identity import IDENTITY_VERSION, TILE_METADATA_SCHEMA_VERSION, decode_policy_version
 from .metrics import DECODE_SOURCE_PIXELS
 
 TILE_SIZE = settings.tile_size
-DECODE_POLICY_VERSION = (
-    f"geometry-v1;tile-max={settings.max_decode_pixels};"
-    f"thumbnail-max={settings.thumbnail_max_decode_pixels}"
-)
+DECODE_POLICY_VERSION = decode_policy_version()
 
 
 class OverviewTooLarge(RuntimeError):
@@ -115,7 +113,65 @@ def max_zoom(slide: TiffSlide) -> int:
     rounding to the nearest power-of-two pyramid level).
     """
     w, h = slide.dimensions
-    return math.ceil(math.log2(max(w, h) / TILE_SIZE))
+    return max(0, math.ceil(math.log2(max(w, h) / TILE_SIZE)))
+
+
+def _best_level_for_downsample(level_downsamples: list[float], downsample: float) -> int:
+    """Match tiffslide's level selection without opening or decoding a slide."""
+    if downsample <= 1.0:
+        return 0
+    for level, level_downsample in enumerate(level_downsamples):
+        if level_downsample > downsample:
+            return max(0, level - 1)
+    return len(level_downsamples) - 1
+
+
+def safe_min_level_from_geometry(
+    *,
+    width: int,
+    height: int,
+    level_dimensions: list[tuple[int, int]],
+    level_downsamples: list[float],
+    tile_size: int,
+    max_decode_pixels: int,
+) -> int | None:
+    """Compute the first safe ZXY level using only intrinsic pyramid geometry."""
+    if (
+        width <= 0
+        or height <= 0
+        or not level_dimensions
+        or len(level_dimensions) != len(level_downsamples)
+        or tile_size <= 0
+        or max_decode_pixels <= 0
+    ):
+        return None
+    pyramid_max_zoom = max(0, math.ceil(math.log2(max(width, height) / tile_size)))
+    for z in range(pyramid_max_zoom + 1):
+        target_ds = 2 ** (pyramid_max_zoom - z)
+        tiles_x = max(1, math.ceil(width / (tile_size * target_ds)))
+        tiles_y = max(1, math.ceil(height / (tile_size * target_ds)))
+        worst_pixels = 0
+        best_level = _best_level_for_downsample(level_downsamples, target_ds)
+        level_w, level_h = level_dimensions[best_level]
+        level_ds = max(1.0, float(level_downsamples[best_level]))
+        for x in {0, tiles_x - 1}:
+            for y in {0, tiles_y - 1}:
+                x0 = x * tile_size * target_ds
+                y0 = y * tile_size * target_ds
+                src_w = min(tile_size * target_ds, width - x0)
+                src_h = min(tile_size * target_ds, height - y0)
+                read_w = min(
+                    math.ceil(src_w / level_ds),
+                    level_w - math.floor(x0 / level_ds),
+                )
+                read_h = min(
+                    math.ceil(src_h / level_ds),
+                    level_h - math.floor(y0 / level_ds),
+                )
+                worst_pixels = max(worst_pixels, max(0, read_w) * max(0, read_h))
+        if worst_pixels <= max_decode_pixels:
+            return z
+    return None
 
 
 def safe_min_level(slide: TiffSlide) -> int | None:
@@ -125,33 +181,17 @@ def safe_min_level(slide: TiffSlide) -> int | None:
     result is emitted into offline tile metadata and remains advisory because
     the request path independently enforces the same pixel budget.
     """
-    slide_w, slide_h = slide.dimensions
-    for z in range(max_zoom(slide) + 1):
-        target_ds = 2 ** (max_zoom(slide) - z)
-        tiles_x = max(1, math.ceil(slide_w / (TILE_SIZE * target_ds)))
-        tiles_y = max(1, math.ceil(slide_h / (TILE_SIZE * target_ds)))
-        worst_pixels = 0
-        for x in {0, tiles_x - 1}:
-            for y in {0, tiles_y - 1}:
-                try:
-                    _, _, x0, y0, src_w, src_h, _, _ = _tile_geometry(slide, z, x, y)
-                    best_level = slide.get_best_level_for_downsample(target_ds)
-                    level_ds = max(1.0, float(slide.level_downsamples[best_level]))
-                    level_w, level_h = slide.level_dimensions[best_level]
-                    read_w = min(
-                        math.ceil(src_w / level_ds),
-                        level_w - math.floor(x0 / level_ds),
-                    )
-                    read_h = min(
-                        math.ceil(src_h / level_ds),
-                        level_h - math.floor(y0 / level_ds),
-                    )
-                    worst_pixels = max(worst_pixels, max(0, read_w) * max(0, read_h))
-                except (IndexError, ValueError, TypeError):
-                    return None
-        if worst_pixels <= settings.max_decode_pixels:
-            return z
-    return None
+    try:
+        return safe_min_level_from_geometry(
+            width=int(slide.dimensions[0]),
+            height=int(slide.dimensions[1]),
+            level_dimensions=[(int(width), int(height)) for width, height in slide.level_dimensions],
+            level_downsamples=[float(value) for value in slide.level_downsamples],
+            tile_size=TILE_SIZE,
+            max_decode_pixels=settings.max_decode_pixels,
+        )
+    except (IndexError, ValueError, TypeError, ZeroDivisionError):
+        return None
 
 
 def _slide_properties_metadata(slide: TiffSlide) -> tuple[float, float, str, int | None]:
@@ -187,7 +227,8 @@ def slide_metadata(slide: TiffSlide) -> dict:
         "objective_power": objective_power,
         "vendor": vendor,
         "safe_min_level": safe_min_level(slide),
-        "identity_version": "v2",
+        "identity_version": IDENTITY_VERSION,
+        "tile_metadata_schema_version": TILE_METADATA_SCHEMA_VERSION,
         "decode_policy_version": DECODE_POLICY_VERSION,
         "max_decode_pixels": settings.max_decode_pixels,
         "thumbnail_max_decode_pixels": settings.thumbnail_max_decode_pixels,

@@ -8,6 +8,7 @@ from typing import Any
 
 
 IDENTITY_VERSION = "v2"
+TILE_METADATA_SCHEMA_VERSION = 2
 
 
 def timestamp_to_epoch_ms(value: Any) -> int | None:
@@ -39,7 +40,7 @@ def source_fingerprint(path: Any, size: Any, last_modified: Any) -> str | None:
 
 
 def decode_policy_version() -> str:
-    return f"geometry-v1;tile-max={settings.max_decode_pixels};thumbnail-max={settings.thumbnail_max_decode_pixels}"
+    return f"geometry-v2;tile-max={settings.max_decode_pixels};thumbnail-max={settings.thumbnail_max_decode_pixels}"
 
 
 from .config import settings  # noqa: E402  (settings is needed by policy helper)

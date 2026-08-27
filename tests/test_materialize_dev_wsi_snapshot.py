@@ -142,7 +142,11 @@ def test_manifest_rows_require_current_complete_successes():
             rendered_at="2026-08-17T00:00:00+00:00",
             error_message="",
             manifest_version="v1",
-            tile_metadata_json='{"width":100}',
+            tile_metadata_json=(
+                '{"dimensions":{"width":256,"height":256},"levels":1,'
+                '"level_dimensions":[{"width":256,"height":256}],'
+                '"max_zoom":0,"tile_size":256}'
+            ),
         ),
         RegistryRow(
             image_id="2",
@@ -167,7 +171,11 @@ def test_manifest_rows_require_current_complete_successes():
             rendered_at="2026-08-17T00:00:00+00:00",
             error_message="",
             manifest_version="v1",
-            tile_metadata_json='{"width":100}',
+            tile_metadata_json=(
+                '{"dimensions":{"width":256,"height":256},"levels":1,'
+                '"level_dimensions":[{"width":256,"height":256}],'
+                '"max_zoom":0,"tile_size":256}'
+            ),
         ),
     ]
 

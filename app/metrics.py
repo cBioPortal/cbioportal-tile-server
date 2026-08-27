@@ -16,7 +16,7 @@ ACTIVE_THUMBNAIL_FETCHES = Gauge(
 DECODE_SOURCE_PIXELS = Histogram(
     "tile_server_decode_source_pixels",
     "Source pixels decoded for a tile or thumbnail request.",
-    buckets=(0, 65_536, 262_144, 1_048_576, 4_194_304, 8_388_608, float("inf")),
+    buckets=(0, 65_536, 262_144, 1_048_576, 4_194_304, 8_388_608, 16_777_216, float("inf")),
 )
 OVERSIZED_DECODE_REJECTIONS = Counter(
     "tile_server_oversized_decode_rejections_total",

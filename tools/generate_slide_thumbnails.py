@@ -25,8 +25,14 @@ from PIL import Image
 
 from app.config import settings
 from app.constants import SERVING_MANIFEST_TABLE, THUMBNAIL_REGISTRY_TABLE
-from app.identity import IDENTITY_VERSION, decode_policy_version, source_fingerprint as canonical_source_fingerprint
+from app.identity import (
+    IDENTITY_VERSION,
+    TILE_METADATA_SCHEMA_VERSION,
+    decode_policy_version,
+    source_fingerprint as canonical_source_fingerprint,
+)
 from app.meta_store import run_query_external, run_statement
+from app.metadata_contract import validate_tile_metadata
 from app.slide_store import open_slide, s3_opts
 from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan, slide_metadata
 
@@ -72,6 +78,14 @@ def _metadata_policy_version(metadata_json: str) -> str | None:
     except (TypeError, json.JSONDecodeError):
         return None
     return str(value) if value not in (None, "") else None
+
+
+def _metadata_schema_version(metadata_json: str) -> int | None:
+    try:
+        value = json.loads(metadata_json).get("tile_metadata_schema_version")
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 SERVABLE_SLIDES_SQL = """
 SELECT
@@ -518,14 +532,13 @@ def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> 
     with _without_blockcache():
         slide, fileobj = open_slide(slide_uri, logger)
     try:
-        # A real OpenSlide object always exposes the intrinsic pyramid.  Keep
-        # the renderer's artifact path usable for legacy/test doubles that do
-        # not implement those fields; the core importer/backend will fail closed when
-        # the resulting metadata JSON is not a valid tile contract.
         try:
             metadata = slide_metadata(slide)
-        except (AttributeError, TypeError, ValueError):
-            metadata = {}
+        except Exception as exc:
+            raise RuntimeError(f"slide metadata extraction failed for {image_id}") from exc
+        valid, reason = validate_tile_metadata(metadata, allow_legacy=False)
+        if not valid:
+            raise RuntimeError(f"invalid v2 slide metadata for {image_id}: {reason}")
         try:
             thumb_bytes, plan = get_thumbnail_bytes_with_plan(slide, master_size, master_size)
         except NoSafeThumbnailOverview:
@@ -556,6 +569,61 @@ def _build_thumbnail_record(image_id: str, slide_uri: str, master_size: int) -> 
         "height": height,
         "level": None if plan is None else plan.level,
         "requested_pixels": None if plan is None else plan.requested_pixels,
+        "tile_metadata_json": json.dumps(metadata, separators=(",", ":")),
+    }
+
+
+def _artifact_exists(uri: str) -> bool:
+    try:
+        return bool(_filesystem_for_uri(uri).exists(_filesystem_path(uri)))
+    except Exception:
+        return False
+
+
+def _build_metadata_only_record(
+    *,
+    image_id: str,
+    slide_uri: str,
+    existing: RegistryRow,
+    source_fingerprint: str,
+) -> dict[str, Any]:
+    """Upgrade registry metadata while retaining an existing thumbnail object."""
+    if (
+        existing.status != "success"
+        or existing.source_path != slide_uri
+        or not existing.artifact_uri
+        or not _artifact_exists(existing.artifact_uri)
+        or existing.width <= 0
+        or existing.height <= 0
+    ):
+        raise RuntimeError(f"existing thumbnail artifact is not reusable for {image_id}")
+    with _without_blockcache():
+        slide, fileobj = open_slide(slide_uri, logger)
+    try:
+        metadata = slide_metadata(slide)
+    finally:
+        try:
+            slide.close()
+        except Exception:
+            pass
+        if fileobj is not None:
+            try:
+                fileobj.close()
+            except Exception:
+                pass
+    valid, reason = validate_tile_metadata(metadata, allow_legacy=False)
+    if not valid:
+        raise RuntimeError(f"invalid v2 slide metadata for {image_id}: {reason}")
+    metadata["source_fingerprint"] = source_fingerprint
+    return {
+        "image_id": image_id,
+        "source_path": slide_uri,
+        "artifact_uri": existing.artifact_uri,
+        "width": existing.width,
+        "height": existing.height,
+        "content_type": existing.content_type or "image/jpeg",
+        "level": None,
+        "requested_pixels": None,
         "tile_metadata_json": json.dumps(metadata, separators=(",", ":")),
     }
 
@@ -783,11 +851,16 @@ def _select_candidate_rows(
             _metadata_policy_version(registry_row.tile_metadata_json or "")
             != decode_policy_version()
         )
+        schema_stale = (
+            _metadata_schema_version(registry_row.tile_metadata_json or "")
+            != TILE_METADATA_SCHEMA_VERSION
+        )
         current_fingerprint = _require_source_fingerprint(row)
         needs_regeneration = (
             registry_row.source_fingerprint != current_fingerprint
             or metadata_missing
             or policy_stale
+            or schema_stale
         )
         if retry_failures_only:
             if registry_row.status != "success" or needs_regeneration:
@@ -802,9 +875,11 @@ def discover_candidate_rows(
     warehouse_id: str,
     retry_failures_only: bool,
     limit: int | None = None,
+    registry_rows: list[RegistryRow] | None = None,
 ) -> list[InventoryRow]:
     inventory_rows = _dedupe_inventory_rows(_fetch_inventory_rows(warehouse_id))
-    registry_rows = _fetch_registry_rows(warehouse_id)
+    if registry_rows is None:
+        registry_rows = _fetch_registry_rows(warehouse_id)
     candidates = _select_candidate_rows(
         inventory_rows,
         registry_rows,
@@ -948,8 +1023,10 @@ def process_candidate_rows(
     manifest_version: str,
     result_path: str | None = None,
     timeout_sec: int | None = None,
+    registry_rows: Iterable[RegistryRow] = (),
 ) -> list[dict[str, Any]]:
     del warehouse_id  # Registry writes are intentionally reserved for the finalizer.
+    registry_by_image_and_source = _registry_by_image_id_and_source(list(registry_rows))
     failures: list[dict[str, Any]] = []
     result_handle = None
     if result_path:
@@ -963,16 +1040,30 @@ def process_candidate_rows(
             current_fingerprint = _require_source_fingerprint(row)
             artifact_uri = _join_uri(root_uri, f"{row.image_id}.jpg")
             try:
-                artifact = _render_candidate_artifact_subprocess(
-                    image_id=row.image_id,
-                    slide_uri=row.path,
-                    artifact_uri=artifact_uri,
-                    master_size=master_size,
-                    timeout_sec=timeout_sec,
-                )
+                existing = registry_by_image_and_source.get((row.image_id, row.path))
+                if (
+                    existing is not None
+                    and existing.source_fingerprint in (None, current_fingerprint)
+                    and _artifact_exists(existing.artifact_uri)
+                ):
+                    artifact = _build_metadata_only_record(
+                        image_id=row.image_id,
+                        slide_uri=row.path,
+                        existing=existing,
+                        source_fingerprint=current_fingerprint,
+                    )
+                else:
+                    artifact = _render_candidate_artifact_subprocess(
+                        image_id=row.image_id,
+                        slide_uri=row.path,
+                        artifact_uri=artifact_uri,
+                        master_size=master_size,
+                        timeout_sec=timeout_sec,
+                    )
                 metadata = json.loads(artifact.get("tile_metadata_json") or "{}")
-                metadata["identity_version"] = IDENTITY_VERSION
-                metadata["decode_policy_version"] = decode_policy_version()
+                valid, reason = validate_tile_metadata(metadata, allow_legacy=False)
+                if not valid:
+                    raise RuntimeError(f"invalid thumbnail metadata for {row.image_id}: {reason}")
                 metadata["source_fingerprint"] = current_fingerprint
                 artifact["tile_metadata_json"] = json.dumps(metadata, separators=(",", ":"))
                 _append_result(
@@ -1158,11 +1249,19 @@ def _successful_registry_for_inventory(
         if row is None or row.status != "success":
             continue
         current_fingerprint = _require_source_fingerprint(inventory_row)
-        if row.source_fingerprint != current_fingerprint:
+        schema = _metadata_schema_version(row.tile_metadata_json)
+        if row.source_fingerprint not in (None, current_fingerprint):
             continue
         if not (row.tile_metadata_json or "").strip():
             continue
-        if _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
+        try:
+            metadata = json.loads(row.tile_metadata_json)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        valid, _ = validate_tile_metadata(metadata, allow_legacy=True)
+        if not valid:
+            continue
+        if schema == TILE_METADATA_SCHEMA_VERSION and _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
             continue
         complete.append(row)
     return complete
@@ -1238,10 +1337,12 @@ def run_incremental_pipeline(
     retry_failures_only: bool,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[InventoryRow]]:
     _ensure_registry_table(warehouse_id)
+    registry_rows = _fetch_registry_rows(warehouse_id)
     candidates = discover_candidate_rows(
         warehouse_id=warehouse_id,
         retry_failures_only=retry_failures_only,
         limit=limit,
+        registry_rows=registry_rows,
     )
     manifest_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     with tempfile.TemporaryDirectory(
@@ -1256,6 +1357,7 @@ def run_incremental_pipeline(
             rows=candidates,
             manifest_version=manifest_version,
             result_path=result_path,
+            registry_rows=registry_rows,
         )
         publish_registry_results(warehouse_id, [result_path])
     manifest = publish_manifest_for_current_inventory(

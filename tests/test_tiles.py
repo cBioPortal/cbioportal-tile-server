@@ -17,7 +17,9 @@ from app.tiles import (
     get_thumbnail_bytes_with_plan,
     max_zoom,
     safe_min_level,
+    safe_min_level_from_geometry,
 )
+from app.metadata_contract import validate_tile_metadata
 from tests.conftest import make_mock_slide
 
 
@@ -44,6 +46,61 @@ class TestMaxZoom:
 
         assert safe_min_level(slide) == 1
         slide.read_region.assert_not_called()
+
+    def test_safe_min_level_geometry_matches_slide_helper(self, monkeypatch):
+        slide = make_mock_slide(4096, 4096, levels=1)
+        monkeypatch.setattr("app.tiles.settings.max_decode_pixels", 4_194_304)
+
+        assert safe_min_level_from_geometry(
+            width=slide.dimensions[0],
+            height=slide.dimensions[1],
+            level_dimensions=list(slide.level_dimensions),
+            level_downsamples=list(slide.level_downsamples),
+            tile_size=256,
+            max_decode_pixels=4_194_304,
+        ) == safe_min_level(slide)
+
+    def test_v2_metadata_requires_complete_bounded_contract(self):
+        metadata = {
+            "dimensions": {"width": 4096, "height": 4096},
+            "levels": 1,
+            "level_dimensions": [{"width": 4096, "height": 4096}],
+            "level_downsamples": [1.0],
+            "max_zoom": 4,
+            "tile_size": 256,
+            "safe_min_level": 1,
+            "tile_metadata_schema_version": 2,
+            "decode_policy_version": "geometry-v2;tile-max=16777216;thumbnail-max=16777216",
+            "max_decode_pixels": 16_777_216,
+            "thumbnail_max_decode_pixels": 16_777_216,
+        }
+        assert validate_tile_metadata(metadata) == (True, None)
+
+    def test_v2_metadata_rejects_missing_safe_level(self):
+        metadata = {
+            "dimensions": {"width": 256, "height": 256},
+            "levels": 1,
+            "level_dimensions": [{"width": 256, "height": 256}],
+            "level_downsamples": [1.0],
+            "max_zoom": 0,
+            "tile_size": 256,
+            "tile_metadata_schema_version": 2,
+            "decode_policy_version": "geometry-v2;tile-max=16777216;thumbnail-max=16777216",
+            "max_decode_pixels": 16_777_216,
+            "thumbnail_max_decode_pixels": 16_777_216,
+        }
+        assert validate_tile_metadata(metadata) == (False, "missing_safe_min_level")
+
+    def test_schema_null_metadata_remains_legacy_compatible(self):
+        assert validate_tile_metadata(
+            {
+                "dimensions": {"width": 256, "height": 256},
+                "levels": 1,
+                "level_dimensions": [{"width": 256, "height": 256}],
+                "max_zoom": 0,
+                "tile_size": 256,
+            }
+        ) == (True, None)
 
 
 class TestTileHelpers:
