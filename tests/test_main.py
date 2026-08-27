@@ -173,6 +173,39 @@ class TestCorsPreflight:
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "https://cbioportal.mskcc.org"
         assert "authorization" in response.headers["access-control-allow-headers"].lower()
+    @pytest.mark.asyncio
+    async def test_private_network_preflight_allows_browser_access(self):
+        transport = httpx.ASGITransport(app=main_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.options(
+                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                headers={
+                    "Origin": "https://cbioportal.mskcc.org",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "Authorization",
+                    "Access-Control-Request-Private-Network": "true",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-private-network"] == "true"
+    @pytest.mark.asyncio
+    async def test_private_network_preflight_still_rejects_unknown_origin(self):
+        transport = httpx.ASGITransport(app=main_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.options(
+                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                headers={
+                    "Origin": "https://untrusted.example",
+                    "Access-Control-Request-Method": "GET",
+                    "Access-Control-Request-Headers": "Authorization",
+                    "Access-Control-Request-Private-Network": "true",
+                },
+            )
+
+        assert response.status_code == 400
+        assert response.text == "Disallowed CORS origin"
+        assert "access-control-allow-origin" not in response.headers
 
     @pytest.mark.asyncio
     async def test_unauthenticated_tile_get_remains_protected(self):

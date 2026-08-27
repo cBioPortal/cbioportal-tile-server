@@ -216,6 +216,7 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_methods=["GET"],
     allow_headers=["*"],
+    allow_private_network=True,
     expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason", "Retry-After"],
 )
 
