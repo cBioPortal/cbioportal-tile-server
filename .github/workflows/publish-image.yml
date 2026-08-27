@@ -51,12 +51,14 @@ jobs:
           curl --fail --silent http://127.0.0.1:18080/ready
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
             http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)" = 401
-          curl --fail --silent --include --request OPTIONS \
+          cors_headers="$(curl --fail --silent --include --request OPTIONS \
             --header 'Origin: https://triage-beta.cbioportal.aws.mskcc.org' \
             --header 'Access-Control-Request-Method: GET' \
             --header 'Access-Control-Request-Headers: authorization' \
-            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs \
-            | grep -i '^access-control-allow-origin: https://triage-beta.cbioportal.aws.mskcc.org'
+            --header 'Access-Control-Request-Private-Network: true' \
+            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)"
+          printf '%s\n' "$cors_headers" | grep -i '^access-control-allow-origin: https://triage-beta.cbioportal.aws.mskcc.org'
+          printf '%s\n' "$cors_headers" | grep -i '^access-control-allow-private-network: true'
           ! docker logs "$container_id" 2>&1 | grep -q 'Control server error'
 
   # Build each architecture on its own native runner and push to the registry by
