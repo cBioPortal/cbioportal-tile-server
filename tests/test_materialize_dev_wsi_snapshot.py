@@ -42,6 +42,26 @@ def test_source_rows_use_validated_slide_path_as_source_url():
     assert rows[0]["is_hne"] is True
 
 
+def test_dev_materializer_keeps_canonical_and_raw_stain_fields():
+    source = module.Path(module.__file__).read_text(encoding="utf-8")
+    assert "stain_name_canonical" in source
+    assert "stain_group_canonical" in source
+    assert "stain_name_raw" in source
+    assert "stain_group_raw" in source
+    assert "'&amp;', '&'" in source
+    assert "'[[:cntrl:]]'" in source
+    assert "IMPACT - Tumor" in source
+    assert "REGEXP_REPLACE(LOWER(COALESCE(stain_name_clean" in source
+    assert "stain_name_key = 'sslhe'" in source
+    assert "stain_name_key LIKE '%fish%'" in source
+
+
+def test_dev_materializer_does_not_publish_thumbnail_variants():
+    source = module.Path(module.__file__).read_text(encoding="utf-8")
+    assert "generate_thumbnail_variants" not in source
+    assert "variant-root-uri" not in source
+
+
 def test_sql_literals_escape_text_and_preserve_booleans():
     assert _literal("O'Brien") == "'O''Brien'"
     assert _literal(True, "bool") == "TRUE"

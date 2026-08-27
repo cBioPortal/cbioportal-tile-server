@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> None:
         "CORS_ORIGINS=http://localhost:8080,http://localhost:3000",
         "SERVER_PORT=8081",
         "WSI_ALLOWED_SOURCE_SCHEMES=s3,file",
+        "WSI_ALLOW_FILE_SOURCES=true",
         "WSI_AUTH_AUDIENCE=cbioportal-wsi",
         "WSI_AUTH_MAX_TTL=300",
         f"WSI_AUTH_SECRET={os.environ.get('WSI_AUTH_SECRET', 'local-dev-wsi-secret-change-me-32chars')}",
@@ -80,6 +81,7 @@ def main(argv: list[str] | None = None) -> None:
         "WSI_THUMBNAIL_REGISTRY_TABLE=cdsi_dev.wsi_test.slide_thumbnail_registry",
         "WSI_CANONICAL_ASSOCIATION_TABLE=cdsi_dev.wsi_test.canonical_slide_associations",
         "WSI_SUMMARY_TABLE=cdsi_dev.wsi_test.sample_wsi_summary",
+        "WSI_STAIN_CLASSIFICATION_TABLE=cdsi_dev.wsi_test.slide_stain_classification",
         "THUMBNAIL_ARTIFACT_ROOT_URI=s3://mskmind-bkt/wsi-thumbnails-dev/masters",
         "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json",
     ]

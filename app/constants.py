@@ -33,8 +33,11 @@ PART_MATCH_TABLE = "cdsi_eng_phi.pdm_base_tables.impact_matched_slides"
 #: Cleaned slide-level universe used to scope diagnostic pathology coverage
 CLEANED_SLIDE_TABLE = "cdsi_eng_phi.pdm_base_tables_dev.case_breakdown_cleaned_v2"
 
-#: Slide file inventory — contains s3:// paths for each image_id
-INVENTORY_TABLE = "cdsi_eng_phi.pdm_base_tables.slide_inventory"
+#: Slide file inventory — contains s3:// paths for each image_id. The isolated
+#: dev snapshot overrides this with its source table.
+INVENTORY_TABLE = _table_name(
+    "WSI_INVENTORY_TABLE", "cdsi_eng_phi.pdm_base_tables.slide_inventory"
+)
 
 #: Default Databricks SQL warehouse (can be overridden via DATABRICKS_WAREHOUSE_ID)
 DEFAULT_WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "0b49b7d78734ad5c")
@@ -42,6 +45,13 @@ DEFAULT_WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "0b49b7d78734ad
 #: Pre-computed slide availability summary table (written nightly by the Asset Bundle job)
 SUMMARY_TABLE = _table_name(
     "WSI_SUMMARY_TABLE", "cdsi_prod.pathology_data_mining.sample_wsi_summary"
+)
+
+# Approved image-assisted stain classifications. Missing rows intentionally
+# fall back to the source metadata classification.
+STAIN_CLASSIFICATION_TABLE = _table_name(
+    "WSI_STAIN_CLASSIFICATION_TABLE",
+    "cdsi_prod.pathology_data_mining.slide_stain_classification",
 )
 
 #: Canonical patient/sample/slide association table (written nightly by the Asset Bundle job)
@@ -54,4 +64,12 @@ CANONICAL_ASSOCIATION_TABLE = _table_name(
 THUMBNAIL_REGISTRY_TABLE = _table_name(
     "WSI_THUMBNAIL_REGISTRY_TABLE",
     "cdsi_prod.pathology_data_mining.slide_thumbnail_registry",
+)
+
+# Effective, fingerprint-bound serving pointers produced by the PDM control
+# plane. Thumbnail generation follows this table so immutable promotions are
+# rendered at their promoted URI instead of regenerating the original object.
+SERVING_MANIFEST_TABLE = _table_name(
+    "WSI_SERVING_MANIFEST_TABLE",
+    "cdsi_prod.pathology_data_mining.wsi_serving_manifest",
 )

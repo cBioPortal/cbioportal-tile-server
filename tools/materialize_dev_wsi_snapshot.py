@@ -367,19 +367,88 @@ def _derive(warehouse_id: str, tables: dict[str, str]) -> None:
     )
     meta_store.run_statement(
         f"""CREATE TABLE {canonical} USING DELTA AS
-WITH ranked_registry AS (
-  SELECT image_id, source_path, artifact_uri, width, height, content_type, tile_metadata_json,
-         ROW_NUMBER() OVER (PARTITION BY image_id ORDER BY rendered_at DESC, manifest_version DESC) AS rn
-  FROM {registry} WHERE status = 'success'
-), source_rows AS (
+WITH source_rows AS (
   SELECT *, NULLIF(sample_id, '') AS normalized_sample_id FROM {source}
+), ranked_registry AS (
+  SELECT r.image_id, r.source_path, r.artifact_uri, r.width, r.height,
+         r.content_type, r.tile_metadata_json,
+         ROW_NUMBER() OVER (
+           PARTITION BY r.image_id, r.source_path
+           ORDER BY r.rendered_at DESC, r.manifest_version DESC
+         ) AS rn
+  FROM {registry} r
+  INNER JOIN (SELECT DISTINCT image_id, source_url FROM source_rows) current_source
+    ON r.image_id = current_source.image_id AND r.source_path = current_source.source_url
+  WHERE r.status = 'success'
+), normalized_stains AS (
+  SELECT
+    source_rows.*,
+    NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(COALESCE(stain_name, ''), '&amp;', '&'), '[[:cntrl:]]', ' '), '[[:space:]]+', ' ')), '') AS stain_name_clean,
+    NULLIF(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(COALESCE(stain_group, ''), '&amp;', '&'), '[[:cntrl:]]', ' '), '[[:space:]]+', ' ')), '') AS stain_group_clean
+  FROM source_rows
+), stain_keys AS (
+  SELECT
+    normalized_stains.*,
+    REGEXP_REPLACE(LOWER(COALESCE(stain_name_clean, '')), '[^a-z0-9]+', '') AS stain_name_key,
+    REGEXP_REPLACE(LOWER(COALESCE(stain_group_clean, '')), '[^a-z0-9]+', '') AS stain_group_key
+  FROM normalized_stains
+), canonical_stains AS (
+  SELECT
+    stain_keys.*,
+    CASE
+      WHEN stain_group_key = 'he' THEN 'H&E'
+      WHEN stain_group_key = 'heinitial' THEN 'H&E (Initial)'
+      WHEN stain_group_key = 'heother' THEN 'H&E (Other)'
+      WHEN stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
+      WHEN stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key = 'sslhe' THEN 'H&E (Other)'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key LIKE '%fish%' THEN 'Other'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$' THEN 'H&E (Other)'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)' THEN 'IHC'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN 'Other'
+      ELSE stain_group_clean
+    END AS stain_group_canonical,
+    CASE
+      WHEN stain_name_key = 'impacttumor' THEN 'IMPACT - Tumor'
+      WHEN stain_name_key = 'impactnormaltissue' THEN 'IMPACT - Normal Tissue'
+      WHEN stain_name_key = 'dmherecut' THEN 'DM H&E RECUT'
+      WHEN stain_name_key = 'recutmolecularhe' THEN 'RECUT MOLECULAR H&E'
+      WHEN stain_name_key = 'recutadditionalhe' THEN 'RECUT ADDITIONAL H&E'
+      WHEN stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
+      WHEN stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant') THEN 'ANDROGEN RECEPTOR'
+      WHEN stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe') THEN 'H&E'
+      ELSE stain_name_clean
+    END AS stain_name_canonical
+  FROM stain_keys
+), typed_stains AS (
+  SELECT canonical_stains.*,
+    (
+      stain_name_key NOT LIKE '%fish%'
+      AND (
+        stain_group_key IN ('he', 'heinitial', 'heother')
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe'))
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key LIKE 'recut%he' AND stain_name_key NOT LIKE '%fish%')
+      )
+    ) AS metadata_is_hne,
+    (
+      (stain_group_key IN ('ihc', 'immunohistochemistry') AND stain_name_key NOT LIKE '%fish%')
+      OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+          AND stain_name_key NOT LIKE '%fish%'
+          AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)')
+    ) AS metadata_is_ihc
+  FROM canonical_stains
 )
-SELECT 'canonical_slide_associations_v2' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
+SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
   NULLIF(s.reference_sample_id, '') AS reference_sample_id,
   s.part_key, s.part_number, s.part_designator, s.part_type, s.part_description,
   s.subspecialty, s.path_dx_title, s.block_key, s.block_number, s.block_label,
-  s.image_id, s.stain_name, s.stain_group, s.is_hne, s.is_ihc, s.magnification,
+  s.image_id, s.stain_name_canonical AS stain_name, s.stain_group_canonical AS stain_group,
+  s.stain_name_canonical, s.stain_group_canonical,
+  s.stain_name AS stain_name_raw, s.stain_group AS stain_group_raw,
+  s.metadata_is_hne AS is_hne, s.metadata_is_ihc AS is_ihc, s.magnification,
   s.file_size_bytes,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> ''
@@ -391,8 +460,9 @@ SELECT 'canonical_slide_associations_v2' AS association_version, CURRENT_TIMESTA
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.tile_metadata_json END AS tile_metadata_json,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.artifact_uri END AS thumbnail_url,
-  r.width AS thumbnail_width, r.height AS thumbnail_height, r.content_type AS thumbnail_content_type
-FROM source_rows s
+  r.width AS thumbnail_width, r.height AS thumbnail_height,
+  r.content_type AS thumbnail_content_type
+FROM typed_stains s
 LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source_path = s.source_url""",
         warehouse_id,
     )
@@ -400,12 +470,12 @@ LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source
         f"""CREATE TABLE {summary} USING DELTA AS
 SELECT sample_id, patient_id, MAX(association_version) AS association_version,
  MAX(updated_at) AS updated_at,
- COUNT(DISTINCT CASE WHEN can_serve_tiles AND (LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%') THEN image_id END) AS servable_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' THEN image_id END) AS non_servable_hne_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%' THEN image_id END) AS non_servable_ihc_slide_count,
- MAX(CASE WHEN can_serve_tiles AND LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' THEN 1 ELSE 0 END) AS has_hne,
- MAX(CASE WHEN can_serve_tiles AND LOWER(COALESCE(stain_group, '')) LIKE '%ihc%' THEN 1 ELSE 0 END) AS has_ihc,
- ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (LOWER(COALESCE(stain_group, stain_name, '')) LIKE '%h&e%' OR LOWER(COALESCE(stain_group, '')) LIKE '%ihc%') THEN stain_name END)), ';') AS stain_types
+ COUNT(DISTINCT CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN image_id END) AS servable_slide_count,
+ COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_hne THEN image_id END) AS non_servable_hne_slide_count,
+ COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_ihc THEN image_id END) AS non_servable_ihc_slide_count,
+ MAX(CASE WHEN can_serve_tiles AND is_hne THEN 1 ELSE 0 END) AS has_hne,
+ MAX(CASE WHEN can_serve_tiles AND is_ihc THEN 1 ELSE 0 END) AS has_ihc,
+ ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN COALESCE(slide_type, stain_name) END)), ';') AS stain_types
 FROM {canonical} WHERE sample_id IS NOT NULL GROUP BY sample_id, patient_id""",
         warehouse_id,
     )

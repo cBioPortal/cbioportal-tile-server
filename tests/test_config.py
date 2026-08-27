@@ -83,6 +83,11 @@ class TestOtherSettings:
         s = make_settings()
         assert s.max_image_operations == 2
 
+    def test_cold_read_timeout_guardrails_default(self):
+        s = make_settings()
+        assert s.cache_miss_lock_ttl_seconds == 120
+        assert s.cache_miss_wait_timeout_seconds == 60.0
+
     def test_cache_miss_rate_limit_prefers_new_environment_name(self):
         s = make_settings(
             RATE_LIMIT_PER_MINUTE="7",

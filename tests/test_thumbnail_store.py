@@ -15,6 +15,22 @@ def _jpeg_bytes(size: tuple[int, int]) -> bytes:
 
 
 class TestThumbnailStore:
+    def test_payload_passthrough_for_display_sized_variant(self):
+        thumb_bytes = _jpeg_bytes((128, 79))
+        record = thumbnail_store.ThumbnailRecord(
+            image_id="1492807",
+            uri="s3://bucket/1492807.jpg",
+            width=128,
+            height=79,
+        )
+
+        result, status = thumbnail_store.render_thumbnail_payload(
+            thumb_bytes, record, 128, 96
+        )
+
+        assert result == thumb_bytes
+        assert status == {"status": "ok", "reason": "master"}
+
     def test_returns_master_bytes_without_upscaling(self, tmp_path, monkeypatch):
         thumb_bytes = _jpeg_bytes((1024, 512))
         thumb_path = tmp_path / "1492807.jpg"

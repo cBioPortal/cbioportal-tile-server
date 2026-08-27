@@ -105,6 +105,30 @@ def test_build_pathology_timeline_rows_groups_counts_from_canonical_associations
     ]
 
 
+def test_resolved_flags_override_stale_stain_text_for_timeline_subtype():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-2",
+                "sample_id": "S-2",
+                "match_level": "PART",
+                "image_id": "img-4",
+                "part_number": "1",
+                "part_description": "Lung",
+                "stain_name": "H&E, Initial",
+                "stain_group": "H&E (Initial)",
+                "is_hne": False,
+                "is_ihc": True,
+                "slide_path": "s3://bucket/slide-4.svs",
+                "slide_timepoint_days": 0,
+                "slide_timepoint_source": "resolved",
+            }
+        ],
+        "study_2",
+    )
+    assert rows[0][5] == "IHC"
+
+
 def test_build_pathology_timeline_rows_deduplicates_same_image_across_match_buckets():
     rows = build_pathology_timeline_rows(
         [

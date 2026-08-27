@@ -60,21 +60,54 @@ inventory_paths AS (
     WHERE row_num = 1
 ),
 thumbnail_registry AS (
-    SELECT image_id, artifact_uri, width, height, content_type, tile_metadata_json
+    SELECT
+        image_id,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_artifact_uri
+            ELSE artifact_uri
+        END AS artifact_uri,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_width
+            ELSE width
+        END AS width,
+        CASE
+            WHEN serving_artifact_uri IS NOT NULL
+             AND TRIM(serving_artifact_uri) <> ''
+             AND serving_width > 0
+             AND serving_height > 0
+            THEN serving_height
+            ELSE height
+        END AS height,
+        content_type,
+        tile_metadata_json
     FROM (
         SELECT
-            CAST(image_id AS STRING) AS image_id,
-            artifact_uri,
-            width,
-            height,
-            content_type,
-            tile_metadata_json,
+            CAST(registry.image_id AS STRING) AS image_id,
+            registry.artifact_uri,
+            registry.width,
+            registry.height,
+            registry.serving_artifact_uri,
+            registry.serving_width,
+            registry.serving_height,
+            registry.content_type,
+            registry.tile_metadata_json,
             ROW_NUMBER() OVER (
-                PARTITION BY CAST(image_id AS STRING)
-                ORDER BY rendered_at DESC, manifest_version DESC
+                PARTITION BY CAST(registry.image_id AS STRING)
+                ORDER BY registry.rendered_at DESC, registry.manifest_version DESC
             ) AS row_num
-        FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry
-        WHERE status = 'success'
+        FROM cdsi_prod.pathology_data_mining.slide_thumbnail_registry registry
+        INNER JOIN inventory_paths inventory
+            ON CAST(registry.image_id AS STRING) = inventory.image_id
+           AND registry.source_path = inventory.path
+        WHERE registry.status = 'success'
     ) ranked_thumbnails
     WHERE row_num = 1
 ),
@@ -302,9 +335,196 @@ canonical_associations AS (
         ) association
     ) ranked
     WHERE association_row_num = 1
+),
+normalized_stains AS (
+    SELECT
+        association.*,
+        NULLIF(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REPLACE(COALESCE(CAST(association.stain_group AS STRING), ''), '&amp;', '&'),
+                        '[[:cntrl:]]',
+                        ' '
+                    ),
+                    '[[:space:]]+',
+                    ' '
+                )
+            ),
+            ''
+        ) AS stain_group_clean,
+        NULLIF(
+            TRIM(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(
+                        REPLACE(COALESCE(CAST(association.stain_name AS STRING), ''), '&amp;', '&'),
+                        '[[:cntrl:]]',
+                        ' '
+                    ),
+                    '[[:space:]]+',
+                    ' '
+                )
+            ),
+            ''
+        ) AS stain_name_clean
+    FROM canonical_associations association
+),
+stain_keys AS (
+    SELECT
+        normalized.*,
+        REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_group_clean, '')), '[^a-z0-9]+', '') AS stain_group_key,
+        REGEXP_REPLACE(LOWER(COALESCE(normalized.stain_name_clean, '')), '[^a-z0-9]+', '') AS stain_name_key
+    FROM normalized_stains normalized
+),
+canonical_stains AS (
+    SELECT
+        keyed.*,
+        CASE
+            WHEN keyed.stain_group_key = 'he' THEN 'H&E'
+            WHEN keyed.stain_group_key = 'heinitial' THEN 'H&E (Initial)'
+            WHEN keyed.stain_group_key = 'heother' THEN 'H&E (Other)'
+            WHEN keyed.stain_group_key IN ('ihc', 'immunohistochemistry') THEN 'IHC'
+            WHEN keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown') THEN NULL
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key = 'sslhe'
+                THEN 'H&E (Other)'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key LIKE '%fish%'
+                THEN 'Other'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$'
+                THEN 'H&E (Other)'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+                THEN 'IHC'
+            WHEN (keyed.stain_group_clean IS NULL
+                  OR keyed.stain_group_key IN ('nan', 'null', 'na', 'unknown'))
+                 AND keyed.stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)'
+                THEN 'Other'
+            ELSE keyed.stain_group_clean
+        END AS stain_group_canonical,
+        CASE
+            WHEN keyed.stain_name_key = 'impacttumor' THEN 'IMPACT - Tumor'
+            WHEN keyed.stain_name_key = 'impactnormaltissue' THEN 'IMPACT - Normal Tissue'
+            WHEN keyed.stain_name_key = 'dmherecut' THEN 'DM H&E RECUT'
+            WHEN keyed.stain_name_key = 'recutmolecularhe' THEN 'RECUT MOLECULAR H&E'
+            WHEN keyed.stain_name_key = 'recutadditionalhe' THEN 'RECUT ADDITIONAL H&E'
+            WHEN keyed.stain_name_key LIKE 'immunorecut%' THEN 'IMMUNO RECUT'
+            WHEN keyed.stain_name_key IN ('androgenreceptorquant', 'androgenreceptornonquant')
+                THEN 'ANDROGEN RECEPTOR'
+            WHEN keyed.stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe') THEN 'H&E'
+            ELSE keyed.stain_name_clean
+        END AS stain_name_canonical
+    FROM stain_keys keyed
+),
+typed_stains AS (
+    SELECT
+        canonical.*,
+        (
+            canonical.stain_name_key NOT LIKE '%fish%'
+            AND (
+                canonical.stain_group_key IN ('he', 'heinitial', 'heother')
+            OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key IN ('he', 'hematoxylinandeosin', 'sslhe')
+            )
+            OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key LIKE 'recut%he'
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+            )
+            )
+        ) AS metadata_is_hne,
+        (
+            (
+                canonical.stain_group_key IN ('ihc', 'immunohistochemistry')
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+            ) OR (
+                (canonical.stain_group_clean IS NULL
+                 OR canonical.stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
+                AND canonical.stain_name_key NOT LIKE '%fish%'
+                AND canonical.stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)'
+            )
+        ) AS metadata_is_ihc
+    FROM canonical_stains canonical
+),
+approved_stain_predictions AS (
+    SELECT slide_id, model_version, scored_at, image_probability, manual_label,
+           image_ihc_threshold
+    FROM (
+        SELECT
+            CAST(slide_id AS STRING) AS slide_id,
+            model_version,
+            scored_at,
+            image_probability,
+            manual_label,
+            image_ihc_threshold,
+            ROW_NUMBER() OVER (
+                PARTITION BY CAST(slide_id AS STRING)
+                -- An approved manual adjudication is durable evidence: it
+                -- must not be displaced by a later automatic rescoring row.
+                ORDER BY
+                    CASE
+                        WHEN LOWER(TRIM(COALESCE(manual_label, ''))) IN ('he', 'ihc')
+                            THEN 0
+                        ELSE 1
+                    END,
+                    scored_at DESC,
+                    model_version DESC
+            ) AS row_num
+        FROM cdsi_prod.pathology_data_mining.slide_stain_classification
+        WHERE model_approved = TRUE
+    ) ranked_predictions
+    WHERE row_num = 1
+),
+resolved_associations AS (
+    SELECT
+        association.*,
+        prediction.model_version AS stain_model_version,
+        prediction.scored_at AS stain_scored_at,
+        prediction.image_probability AS stain_image_probability,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) IN ('he', 'ihc') THEN prediction.manual_label
+            WHEN metadata_is_ihc THEN 'metadata'
+            WHEN metadata_is_hne
+                 AND prediction.image_probability IS NOT NULL
+                 AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                THEN 'image_model'
+            WHEN metadata_is_hne THEN 'metadata'
+            ELSE 'metadata_fallback'
+        END AS stain_classification_source,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'he' THEN TRUE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'ihc' THEN FALSE
+            ELSE metadata_is_hne
+                 AND NOT metadata_is_ihc
+                 AND NOT (
+                     prediction.image_probability IS NOT NULL
+                     AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                 )
+        END AS resolved_is_hne,
+        CASE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'ihc' THEN TRUE
+            WHEN LOWER(COALESCE(prediction.manual_label, '')) = 'he' THEN FALSE
+            WHEN metadata_is_ihc THEN TRUE
+            WHEN metadata_is_hne
+                 AND prediction.image_probability IS NOT NULL
+                 AND prediction.image_probability >= COALESCE(prediction.image_ihc_threshold, 0.90)
+                THEN TRUE
+            ELSE FALSE
+        END AS resolved_is_ihc
+    FROM typed_stains association
+    LEFT JOIN approved_stain_predictions prediction
+        ON prediction.slide_id = CAST(association.image_id AS STRING)
 )
 SELECT
-    'canonical_slide_associations_v2' AS association_version,
+    'canonical_slide_associations_v4' AS association_version,
     CURRENT_TIMESTAMP() AS updated_at,
     association.match_level,
     association.patient_id,
@@ -321,14 +541,20 @@ SELECT
     association.block_number,
     association.block_label,
     association.image_id,
-    association.stain_name,
-    association.stain_group,
-    CASE
-        WHEN LOWER(association.stain_group) IN ('h&e (initial)', 'h&e (other)', 'h&e')
-          OR LOWER(TRIM(association.stain_name)) IN ('h&e', 'he') THEN TRUE
-        ELSE FALSE
-    END AS is_hne,
-    CASE WHEN LOWER(association.stain_group) = 'ihc' THEN TRUE ELSE FALSE END AS is_ihc,
+    association.stain_name_canonical AS stain_name,
+    association.stain_group_canonical AS stain_group,
+    association.stain_name_canonical,
+    association.stain_group_canonical,
+    association.stain_name AS stain_name_raw,
+    association.stain_group AS stain_group_raw,
+    association.metadata_is_hne,
+    association.metadata_is_ihc,
+    association.resolved_is_hne AS is_hne,
+    association.resolved_is_ihc AS is_ihc,
+    association.stain_classification_source,
+    association.stain_model_version,
+    association.stain_scored_at,
+    association.stain_image_probability,
     association.magnification,
     association.file_size_bytes,
     CASE
@@ -344,7 +570,11 @@ SELECT
         ELSE FALSE
     END AS can_serve_tiles,
     association.barcode,
-    association.slide_type,
+    CASE
+        WHEN association.resolved_is_hne THEN 'H&E'
+        WHEN association.resolved_is_ihc THEN 'IHC'
+        ELSE association.slide_type
+    END AS slide_type,
     CONCAT(LOWER(association.match_level), '::', association.part_key, '::', association.block_key) AS specimen_key,
     DATEDIFF(association.procedure_date, reference.sequencing_date) AS procedure_date_days,
     CASE
@@ -372,7 +602,7 @@ SELECT
     thumbnail_registry.width AS thumbnail_width,
     thumbnail_registry.height AS thumbnail_height,
     thumbnail_registry.content_type AS thumbnail_content_type
-FROM canonical_associations association
+FROM resolved_associations association
 LEFT JOIN patient_reference reference ON reference.patient_id = association.patient_id
 LEFT JOIN thumbnail_registry
     ON thumbnail_registry.image_id = CAST(association.image_id AS STRING);

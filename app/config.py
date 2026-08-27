@@ -97,6 +97,24 @@ class Settings:
     thumbnail_batch_timeout_sec: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_BATCH_TIMEOUT_SEC", 600)
     )
+    thumbnail_fetch_concurrency: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_FETCH_CONCURRENCY", 8)
+    )
+    thumbnail_s3_max_connections: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_S3_MAX_CONNECTIONS", 32)
+    )
+    thumbnail_s3_connect_timeout_sec: float = field(
+        default_factory=lambda: _env_float("THUMBNAIL_S3_CONNECT_TIMEOUT_SEC", 1.0)
+    )
+    thumbnail_s3_read_timeout_sec: float = field(
+        default_factory=lambda: _env_float("THUMBNAIL_S3_READ_TIMEOUT_SEC", 5.0)
+    )
+    thumbnail_s3_max_attempts: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_S3_MAX_ATTEMPTS", 2)
+    )
+    thumbnail_prewarm_uri: str = field(
+        default_factory=lambda: _env_str("THUMBNAIL_PREWARM_URI")
+    )
 
     # Redis tile cache
     redis_url: str = field(default_factory=lambda: _env_str("REDIS_URL", "redis://redis:6379"))
@@ -115,7 +133,7 @@ class Settings:
         default_factory=lambda: _env_int("CACHE_MISS_LOCK_TTL_SECONDS", 120)
     )
     cache_miss_wait_timeout_seconds: float = field(
-        default_factory=lambda: _env_float("CACHE_MISS_WAIT_TIMEOUT_SECONDS", 30.0)
+        default_factory=lambda: _env_float("CACHE_MISS_WAIT_TIMEOUT_SECONDS", 60.0)
     )
     # Deprecated cache setting retained for offline/legacy imports; runtime
     # endpoints never cache clinical or slide metadata.

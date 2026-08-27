@@ -18,6 +18,13 @@ def _jpeg_size(payload: bytes) -> tuple[int, int]:
     return image.size
 
 
+def test_thumbnail_candidates_follow_effective_serving_manifest():
+    assert "wsi_serving_manifest" in module.SERVABLE_SLIDES_SQL
+    assert "slide_path AS path" in module.SERVABLE_SLIDES_SQL
+    assert "serving_size AS size" in module.SERVABLE_SLIDES_SQL
+    assert "certification_status = 'valid'" in module.SERVABLE_SLIDES_SQL
+
+
 def _result_record(image_id: str, path: str, *, status: str = "success") -> dict:
     return {
         "image_id": image_id,
@@ -31,6 +38,31 @@ def _result_record(image_id: str, path: str, *, status: str = "success") -> dict
         "error_message": None if status == "success" else "render failed",
         "manifest_version": "v1",
     }
+
+
+def _inventory(
+    image_id: str,
+    path: str,
+    *,
+    size: int = 100,
+    last_modified: str = "2026-08-05T00:00:00Z",
+) -> module.InventoryRow:
+    return module.InventoryRow(
+        image_id=image_id,
+        path=path,
+        size=size,
+        last_modified=last_modified,
+    )
+
+
+def _tile_metadata(row: module.InventoryRow, *, policy_version: str | None = None) -> str:
+    return json.dumps(
+        {
+            "identity_version": module.IDENTITY_VERSION,
+            "source_fingerprint": module.source_fingerprint(row),
+            "decode_policy_version": policy_version or module.decode_policy_version(),
+        }
+    )
 
 
 def _run_fixture(tmp_path: Path, records: list[dict]) -> tuple[Path, Path]:
@@ -161,7 +193,7 @@ class TestBatchSafety:
         assert sum(1 for path in tmp_path.glob("task-*.jsonl") for _ in module.iter_candidate_rows(str(path))) == 11
 
     def test_result_processing_overwrites_retried_task(self, tmp_path):
-        rows = [module.InventoryRow("1492807", "s3://bucket/1492807.svs")]
+        rows = [_inventory("1492807", "s3://bucket/1492807.svs")]
         result_path = tmp_path / "task-0000.jsonl"
         artifact = {
             "image_id": "1492807",
@@ -293,7 +325,7 @@ class TestBatchSafety:
 
 class TestDeltaSelection:
     def test_skips_already_published_matching_rows(self):
-        inventory = [module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs")]
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
         registry = [
             module.RegistryRow(
                 image_id="1492807",
@@ -306,7 +338,8 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
             )
         ]
 
@@ -319,7 +352,8 @@ class TestDeltaSelection:
         assert rows == []
 
     def test_path_change_forces_regeneration(self):
-        inventory = [module.InventoryRow(image_id="1492807", path="s3://bucket/b.svs")]
+        inventory = [_inventory("1492807", "s3://bucket/b.svs")]
+        old_source = _inventory("1492807", "s3://bucket/a.svs")
         registry = [
             module.RegistryRow(
                 image_id="1492807",
@@ -332,7 +366,8 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=_tile_metadata(old_source),
+                source_fingerprint=module.source_fingerprint(old_source),
             )
         ]
 
@@ -346,8 +381,8 @@ class TestDeltaSelection:
 
     def test_retry_failures_only_limits_to_non_success_rows(self):
         inventory = [
-            module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs"),
-            module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs"),
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
         ]
         registry = [
             module.RegistryRow(
@@ -361,7 +396,8 @@ class TestDeltaSelection:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
             ),
             module.RegistryRow(
                 image_id="1492808",
@@ -386,7 +422,7 @@ class TestDeltaSelection:
         assert rows == [inventory[1]]
 
     def test_legacy_success_without_metadata_is_regenerated(self):
-        inventory = [module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs")]
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
         registry = [
             module.RegistryRow(
                 image_id="1492807",
@@ -414,7 +450,7 @@ class TestDeltaSelection:
         ) == inventory
 
     def test_default_mode_skips_existing_failed_rows(self):
-        inventory = [module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs")]
+        inventory = [_inventory("1492808", "s3://bucket/b.svs")]
         registry = [
             module.RegistryRow(
                 image_id="1492808",
@@ -438,12 +474,54 @@ class TestDeltaSelection:
 
         assert rows == []
 
+    def test_retry_mode_uses_failed_current_source_over_old_success(self):
+        current = _inventory("1492807", "s3://bucket/promoted.svs", size=200)
+        previous = _inventory("1492807", "s3://bucket/original.svs")
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=previous.path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-05T00:00:00+00:00",
+                error_message="",
+                manifest_version="v1",
+                tile_metadata_json=_tile_metadata(previous),
+                source_fingerprint=module.source_fingerprint(previous),
+            ),
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=current.path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=0,
+                height=0,
+                content_type="image/jpeg",
+                status="failed",
+                rendered_at="2026-08-06T00:00:00+00:00",
+                error_message="render failed",
+                manifest_version="v2",
+            ),
+        ]
+
+        assert module._select_candidate_rows(
+            [current], registry, retry_failures_only=True
+        ) == [current]
+
+    def test_incomplete_serving_identity_aborts_candidate_selection(self):
+        inventory = [module.InventoryRow("1492807", "s3://bucket/a.svs")]
+
+        with pytest.raises(ValueError, match="incomplete or invalid source identity"):
+            module._select_candidate_rows(inventory, [], retry_failures_only=False)
+
 
 class TestManifestBuild:
     def test_manifest_uses_only_successful_current_inventory_rows(self):
         inventory = [
-            module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs"),
-            module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs"),
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
         ]
         registry = [
             module.RegistryRow(
@@ -457,6 +535,8 @@ class TestManifestBuild:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
             ),
             module.RegistryRow(
                 image_id="1492808",
@@ -480,12 +560,38 @@ class TestManifestBuild:
 
         assert list(manifest["slides"]) == ["1492807"]
 
+    def test_manifest_rejects_stale_source_and_decode_policy(self):
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=inventory[0].path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=_tile_metadata(
+                    _inventory("1492807", "s3://bucket/a.svs", size=101),
+                    policy_version="geometry-v0",
+                ),
+                source_fingerprint=module.source_fingerprint(
+                    _inventory("1492807", "s3://bucket/a.svs", size=101)
+                ),
+            )
+        ]
+
+        assert module._successful_registry_for_inventory(inventory, registry) == []
+
 
 class TestRunIncrementalPipeline:
     def test_keeps_prior_good_entries_when_current_batch_has_failures(self):
         inventory = [
-            module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs"),
-            module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs"),
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
         ]
         first_registry = [
             module.RegistryRow(
@@ -499,7 +605,8 @@ class TestRunIncrementalPipeline:
                 rendered_at="2026-08-03T00:00:00+00:00",
                 error_message="",
                 manifest_version="20260803000000",
-                tile_metadata_json='{"width":1024,"height":768}',
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
             )
         ]
         second_registry = first_registry + [
@@ -549,8 +656,8 @@ class TestSummaryPayload:
         }
         failures = [{"image_id": "1492808", "error": "boom"}]
         candidates = [
-            module.InventoryRow(image_id="1492807", path="s3://bucket/a.svs"),
-            module.InventoryRow(image_id="1492808", path="s3://bucket/b.svs"),
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
         ]
 
         summary = module._summary_payload(
