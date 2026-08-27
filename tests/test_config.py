@@ -65,11 +65,11 @@ class TestS3EnvVars:
 class TestOtherSettings:
     def test_max_decode_pixels_default(self):
         s = make_settings()
-        assert s.max_decode_pixels == 4_194_304
+        assert s.max_decode_pixels == 16_777_216
 
     def test_thumbnail_max_decode_pixels_default(self):
         s = make_settings()
-        assert s.thumbnail_max_decode_pixels == 16_000_000
+        assert s.thumbnail_max_decode_pixels == 16_777_216
 
     def test_thumbnail_cache_ttl_default(self):
         s = make_settings()

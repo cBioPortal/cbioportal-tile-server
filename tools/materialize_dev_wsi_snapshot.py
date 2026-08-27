@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from app import meta_store
+from app.metadata_contract import validate_tile_metadata
 from tools.generate_slide_thumbnails import (
     RegistryRow,
     _build_manifest_from_registry,
@@ -344,6 +345,11 @@ def _complete_registry_rows(
     }
     complete: list[RegistryRow] = []
     for row in _registry_by_image_id(list(registry_rows)).values():
+        try:
+            metadata = json.loads(row.tile_metadata_json)
+            metadata_valid, _ = validate_tile_metadata(metadata, allow_legacy=True)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata_valid = False
         if (
             row.status == "success"
             and row.source_path
@@ -353,6 +359,7 @@ def _complete_registry_rows(
             and row.height > 0
             and row.content_type.strip()
             and row.tile_metadata_json.strip()
+            and metadata_valid
         ):
             complete.append(row)
     return complete
@@ -380,6 +387,27 @@ WITH source_rows AS (
   INNER JOIN (SELECT DISTINCT image_id, source_url FROM source_rows) current_source
     ON r.image_id = current_source.image_id AND r.source_path = current_source.source_url
   WHERE r.status = 'success'
+    AND (
+      (
+        TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.tile_metadata_schema_version') AS INT) = 2
+        AND GET_JSON_OBJECT(r.tile_metadata_json, '$.decode_policy_version') =
+          'geometry-v2;tile-max=16777216;thumbnail-max=16777216'
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.max_decode_pixels') AS BIGINT) = 16777216
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.thumbnail_max_decode_pixels') AS BIGINT) = 16777216
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.safe_min_level') AS INT) >= 0
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.dimensions.width') AS BIGINT) > 0
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.dimensions.height') AS BIGINT) > 0
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.levels') AS INT) > 0
+        AND GET_JSON_OBJECT(r.tile_metadata_json, '$.level_downsamples') IS NOT NULL
+      )
+      OR (
+        GET_JSON_OBJECT(r.tile_metadata_json, '$.tile_metadata_schema_version') IS NULL
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.dimensions.width') AS BIGINT) > 0
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.dimensions.height') AS BIGINT) > 0
+        AND TRY_CAST(GET_JSON_OBJECT(r.tile_metadata_json, '$.levels') AS INT) > 0
+        AND GET_JSON_OBJECT(r.tile_metadata_json, '$.level_dimensions') IS NOT NULL
+      )
+    )
 ), normalized_stains AS (
   SELECT
     source_rows.*,

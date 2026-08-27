@@ -100,7 +100,8 @@ optional Redis cache:
 | `THUMBNAIL_PREWARM_URI` | — | Optional stable thumbnail object used to prewarm each worker |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
-| `MAX_DECODE_PIXELS` | `4194304` | Maximum on-demand tile decode |
+| `MAX_DECODE_PIXELS` | `16777216` | Maximum on-demand tile decode |
+| `THUMBNAIL_MAX_DECODE_PIXELS` | `16777216` | Maximum thumbnail decode |
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |

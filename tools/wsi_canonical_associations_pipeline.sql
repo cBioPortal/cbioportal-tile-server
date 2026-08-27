@@ -108,6 +108,27 @@ thumbnail_registry AS (
             ON CAST(registry.image_id AS STRING) = inventory.image_id
            AND registry.source_path = inventory.path
         WHERE registry.status = 'success'
+          AND (
+              (
+                  TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.tile_metadata_schema_version') AS INT) = 2
+                  AND GET_JSON_OBJECT(registry.tile_metadata_json, '$.decode_policy_version') =
+                      'geometry-v2;tile-max=16777216;thumbnail-max=16777216'
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.max_decode_pixels') AS BIGINT) = 16777216
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.thumbnail_max_decode_pixels') AS BIGINT) = 16777216
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.safe_min_level') AS INT) >= 0
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.dimensions.width') AS BIGINT) > 0
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.dimensions.height') AS BIGINT) > 0
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.levels') AS INT) > 0
+                  AND GET_JSON_OBJECT(registry.tile_metadata_json, '$.level_downsamples') IS NOT NULL
+              )
+              OR (
+                  GET_JSON_OBJECT(registry.tile_metadata_json, '$.tile_metadata_schema_version') IS NULL
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.dimensions.width') AS BIGINT) > 0
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.dimensions.height') AS BIGINT) > 0
+                  AND TRY_CAST(GET_JSON_OBJECT(registry.tile_metadata_json, '$.levels') AS INT) > 0
+                  AND GET_JSON_OBJECT(registry.tile_metadata_json, '$.level_dimensions') IS NOT NULL
+              )
+          )
     ) ranked_thumbnails
     WHERE row_num = 1
 ),

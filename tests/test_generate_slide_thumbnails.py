@@ -58,9 +58,19 @@ def _inventory(
 def _tile_metadata(row: module.InventoryRow, *, policy_version: str | None = None) -> str:
     return json.dumps(
         {
+            "dimensions": {"width": 4096, "height": 4096},
+            "levels": 1,
+            "level_dimensions": [{"width": 4096, "height": 4096}],
+            "level_downsamples": [1.0],
+            "max_zoom": 4,
+            "tile_size": 256,
+            "safe_min_level": 1,
             "identity_version": module.IDENTITY_VERSION,
+            "tile_metadata_schema_version": module.TILE_METADATA_SCHEMA_VERSION,
             "source_fingerprint": module.source_fingerprint(row),
             "decode_policy_version": policy_version or module.decode_policy_version(),
+            "max_decode_pixels": module.settings.max_decode_pixels,
+            "thumbnail_max_decode_pixels": module.settings.thumbnail_max_decode_pixels,
         }
     )
 
@@ -97,6 +107,11 @@ def _run_fixture(tmp_path: Path, records: list[dict]) -> tuple[Path, Path]:
 class TestBuildThumbnailRecord:
     def test_disables_blockcache_for_offline_generation(self):
         slide = MagicMock()
+        slide.dimensions = (800, 600)
+        slide.level_count = 1
+        slide.level_dimensions = [(800, 600)]
+        slide.level_downsamples = [1.0]
+        slide.properties = {}
         slide.get_thumbnail.return_value = Image.new("RGB", (800, 600), (120, 120, 120))
         fileobj = MagicMock()
         original_blockcache = module.settings.blockcache_path
@@ -126,6 +141,11 @@ class TestBuildThumbnailRecord:
 
     def test_falls_back_to_unbounded_thumbnail_for_offline_generation(self):
         slide = MagicMock()
+        slide.dimensions = (800, 600)
+        slide.level_count = 1
+        slide.level_dimensions = [(800, 600)]
+        slide.level_downsamples = [1.0]
+        slide.properties = {}
         slide.get_thumbnail.return_value = Image.new("RGB", (800, 600), (120, 120, 120))
         fileobj = MagicMock()
 
@@ -202,6 +222,7 @@ class TestBatchSafety:
             "width": 1024,
             "height": 768,
             "content_type": "image/jpeg",
+            "tile_metadata_json": _tile_metadata(rows[0]),
         }
         with patch.object(module, "_render_candidate_artifact_subprocess", return_value=artifact):
             module.process_candidate_rows(
@@ -222,6 +243,47 @@ class TestBatchSafety:
             )
 
         assert len(result_path.read_text(encoding="utf-8").splitlines()) == 1
+
+    def test_existing_thumbnail_is_reused_for_metadata_only_upgrade(self, tmp_path):
+        row = _inventory("1492807", "s3://bucket/1492807.svs")
+        existing = module.RegistryRow(
+            image_id=row.image_id,
+            source_path=row.path,
+            artifact_uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+            content_type="image/jpeg",
+            status="success",
+            rendered_at="2026-08-03T00:00:00+00:00",
+            error_message="",
+            manifest_version="v1",
+        )
+        artifact = {
+            "image_id": row.image_id,
+            "source_path": row.path,
+            "artifact_uri": existing.artifact_uri,
+            "width": existing.width,
+            "height": existing.height,
+            "content_type": existing.content_type,
+            "tile_metadata_json": _tile_metadata(row),
+        }
+        with (
+            patch.object(module, "_artifact_exists", return_value=True),
+            patch.object(module, "_build_metadata_only_record", return_value=artifact) as upgrade,
+            patch.object(module, "_render_candidate_artifact_subprocess") as render,
+        ):
+            module.process_candidate_rows(
+                warehouse_id="warehouse",
+                root_uri="s3://thumbs",
+                master_size=1024,
+                rows=[row],
+                manifest_version="v2",
+                result_path=str(tmp_path / "result.jsonl"),
+                registry_rows=[existing],
+            )
+
+        upgrade.assert_called_once()
+        render.assert_not_called()
 
     def test_task_audit_rejects_partial_results(self, tmp_path):
         records = [_result_record("1492807", "s3://bucket/1492807.svs")]
