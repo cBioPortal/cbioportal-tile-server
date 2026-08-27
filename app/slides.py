@@ -13,6 +13,7 @@ this turns the p95 ~160 ms ECS latency into <1 ms NVMe reads.
 
 import logging
 import threading
+import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from tiffslide import TiffSlide
 
 from .config import settings
 from .blockcache import cache_lease_for_slide, touch_slide_cache
+from .metrics import SLIDE_OPEN_ERRORS, SLIDE_OPEN_SECONDS
 from .slide_store import SlideEntry as _Entry
 from .slide_store import close_entry as _close_entry
 from .slide_store import open_slide as _open_slide
@@ -128,33 +130,38 @@ class SlideCache:
                 _close_entry(evicted.entry)
 
             cache_lease = cache_lease_for_slide(slide_id)
+            started = time.perf_counter()
             try:
-                if cache_lease is not None:
-                    cache_lease.__enter__()
-                slide, fileobj = _open_slide(slide_id, log)
-            except BaseException as exc:
-                if cache_lease is not None:
-                    cache_lease.__exit__(type(exc), exc, exc.__traceback__)
+                try:
+                    if cache_lease is not None:
+                        cache_lease.__enter__()
+                    slide, fileobj = _open_slide(slide_id, log)
+                except BaseException as exc:
+                    SLIDE_OPEN_ERRORS.labels(error_type=type(exc).__name__).inc()
+                    if cache_lease is not None:
+                        cache_lease.__exit__(type(exc), exc, exc.__traceback__)
+                    with self._condition:
+                        state = self._opening.pop(slide_id, None)
+                        if state is not None:
+                            state.error = exc
+                            state.event.set()
+                        self._condition.notify_all()
+                    raise
+
                 with self._condition:
                     state = self._opening.pop(slide_id, None)
-                    if state is not None:
-                        state.error = exc
-                        state.event.set()
+                    cached = _CacheEntry(
+                        _Entry(slide=slide, fileobj=fileobj, cache_lease=cache_lease),
+                        active=True,
+                    )
+                    self._cache[slide_id] = cached
+                    touch_slide_cache(slide_id)
                     self._condition.notify_all()
-                raise
-
-            with self._condition:
-                state = self._opening.pop(slide_id, None)
-                cached = _CacheEntry(
-                    _Entry(slide=slide, fileobj=fileobj, cache_lease=cache_lease),
-                    active=True,
-                )
-                self._cache[slide_id] = cached
-                touch_slide_cache(slide_id)
-                self._condition.notify_all()
-                if state is not None:
-                    state.event.set()
-                return cached
+                    if state is not None:
+                        state.event.set()
+                    return cached
+            finally:
+                SLIDE_OPEN_SECONDS.observe(time.perf_counter() - started)
 
     def _release(self, slide_id: str, entry: _CacheEntry) -> None:
         with self._condition:

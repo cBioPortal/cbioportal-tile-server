@@ -15,6 +15,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlparse
 
+from botocore.exceptions import BotoCoreError
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,6 +34,7 @@ from .metrics import (
     DECODE_SOURCE_PIXELS,
     IMAGE_OPERATION_SECONDS,
     IMAGE_OPERATION_QUEUE_SECONDS,
+    IMAGE_OPERATION_QUEUE_TIMEOUTS,
     OVERSIZED_DECODE_REJECTIONS,
     THUMBNAIL_FETCH_ERRORS,
     THUMBNAIL_FETCH_QUEUE_SECONDS,
@@ -89,6 +91,10 @@ class _SingleFlight:
         finally:
             async with self._lock:
                 self._futures.pop(key, None)
+
+
+class ImageOperationQueueTimeout(Exception):
+    """Raised when an image request cannot start within its bounded queue wait."""
 
 
 _singleflight = _SingleFlight()
@@ -238,15 +244,23 @@ async def _run_image_operation(fn, *args, operation_kind: str = "image"):
         finally:
             IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
     queue_started = time.perf_counter()
-    async with _image_operation_semaphore:
-        IMAGE_OPERATION_QUEUE_SECONDS.labels(kind=operation_kind).observe(
-            time.perf_counter() - queue_started
+    try:
+        await asyncio.wait_for(
+            _image_operation_semaphore.acquire(),
+            timeout=max(0.1, settings.image_operation_queue_timeout_seconds),
         )
+    except asyncio.TimeoutError as exc:
+        IMAGE_OPERATION_QUEUE_TIMEOUTS.labels(kind=operation_kind).inc()
+        raise ImageOperationQueueTimeout from exc
+    IMAGE_OPERATION_QUEUE_SECONDS.labels(kind=operation_kind).observe(
+        time.perf_counter() - queue_started
+    )
+    try:
         async with track_image_operation():
-            try:
-                return await _in_thread(fn, *args)
-            finally:
-                IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
+            return await _in_thread(fn, *args)
+    finally:
+        _image_operation_semaphore.release()
+        IMAGE_OPERATION_SECONDS.labels(kind=operation_kind).observe(time.perf_counter() - started)
 
 
 async def _distributed_singleflight(
@@ -354,6 +368,13 @@ def _run_slide_operation(source: str, operation, *args):
         raise HTTPException(status_code=404, detail="source slide not found")
     except (HTTPException, OverviewTooLarge, ValueError):
         raise
+    except (BotoCoreError, ConnectionError, TimeoutError) as exc:
+        logger.warning("Slide source temporarily unavailable; error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            headers={"Retry-After": "1"},
+            detail="Slide source temporarily unavailable",
+        ) from exc
     except Exception as exc:
         logger.error("Slide operation failed; error_type=%s", type(exc).__name__)
         raise HTTPException(status_code=500, detail="Slide operation failed")
@@ -468,6 +489,8 @@ async def tile(
         raise HTTPException(status_code=429, headers={"Retry-After": str(exc.retry_after)}, detail="Rate limit exceeded")
     except DistributedMissTimeout:
         raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Tile extraction is still in progress")
+    except ImageOperationQueueTimeout:
+        raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Tile service is busy")
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except OverviewTooLarge as exc:
@@ -540,8 +563,17 @@ async def thumbnail(
         raise HTTPException(status_code=429, headers={"Retry-After": str(exc.retry_after)}, detail="Rate limit exceeded")
     except DistributedMissTimeout:
         raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Thumbnail extraction is still in progress")
+    except ImageOperationQueueTimeout:
+        raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Thumbnail service is busy")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="thumbnail not found")
+    except (BotoCoreError, ConnectionError, TimeoutError) as exc:
+        logger.warning("Thumbnail source temporarily unavailable; error_type=%s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            headers={"Retry-After": "1"},
+            detail="Thumbnail source temporarily unavailable",
+        ) from exc
     except Exception as exc:
         logger.error("Thumbnail fetch failed; error_type=%s", type(exc).__name__)
         raise HTTPException(status_code=502, detail="thumbnail unavailable")

@@ -143,6 +143,21 @@ class Settings:
     max_open_slides: int = field(default_factory=lambda: _env_int("MAX_OPEN_SLIDES", 64))
     n_workers: int = field(default_factory=lambda: _env_int("N_WORKERS", 4))
     max_image_operations: int = field(default_factory=lambda: _env_int("MAX_IMAGE_OPERATIONS", 2))
+    image_operation_queue_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("IMAGE_OPERATION_QUEUE_TIMEOUT_SECONDS", 2.0)
+    )
+    slide_s3_connect_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("SLIDE_S3_CONNECT_TIMEOUT_SECONDS", 1.0)
+    )
+    slide_s3_read_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("SLIDE_S3_READ_TIMEOUT_SECONDS", 10.0)
+    )
+    slide_s3_max_attempts: int = field(
+        default_factory=lambda: _env_int("SLIDE_S3_MAX_ATTEMPTS", 2)
+    )
+    slide_s3_max_connections: int = field(
+        default_factory=lambda: _env_int("SLIDE_S3_MAX_CONNECTIONS", 16)
+    )
     # Deprecated compatibility setting retained for offline callers.
     path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
     # RATE_LIMIT_PER_MINUTE is retained as a one-release compatibility alias.
