@@ -5,9 +5,12 @@ import json
 import time
 
 import pytest
+from fastapi import HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
 
 from app.auth import (
     InvalidWsiToken,
+    require_user,
     source_digest,
     validate_wsi_auth_configuration,
     validate_wsi_token,
@@ -16,27 +19,39 @@ from app.auth import (
 
 def make_token(secret: str, **claims) -> str:
     def encode(value):
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        return (
+            base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        )
 
     header = encode({"alg": "HS256", "typ": "JWT"})
     payload = encode(claims)
     signing_input = f"{header}.{payload}".encode()
-    signature = base64.urlsafe_b64encode(
-        hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
+    signature = (
+        base64.urlsafe_b64encode(
+            hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
     return f"{header}.{payload}.{signature}"
 
 
 def make_raw_token(secret: str, header, payload) -> str:
     def encode(value):
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        return (
+            base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+        )
 
     encoded_header = encode(header)
     encoded_payload = encode(payload)
     signing_input = f"{encoded_header}.{encoded_payload}".encode()
-    signature = base64.urlsafe_b64encode(
-        hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
+    signature = (
+        base64.urlsafe_b64encode(
+            hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
     return f"{encoded_header}.{encoded_payload}.{signature}"
 
 
@@ -62,9 +77,12 @@ def valid_claims(**overrides):
 
 def test_valid_wsi_token():
     secret = "s" * 32
-    assert validate_wsi_token(
-        make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
-    )["sub"] == "user@example.org"
+    assert (
+        validate_wsi_token(
+            make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
+        )["sub"]
+        == "user@example.org"
+    )
 
 
 @pytest.mark.parametrize(
@@ -82,11 +100,14 @@ def test_invalid_wsi_auth_configuration_is_rejected(secret, audience, max_ttl):
         validate_wsi_auth_configuration(secret, audience, max_ttl)
 
 
-@pytest.mark.parametrize("change", [
-    {"scope": "wsi:write"},
-    {"aud": "other-service"},
-    {"exp": int(time.time()) - 1},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scope": "wsi:write"},
+        {"aud": "other-service"},
+        {"exp": int(time.time()) - 1},
+    ],
+)
 def test_invalid_claims_are_rejected(change):
     secret = "s" * 32
     claims = valid_claims(**change)
@@ -114,13 +135,16 @@ def test_non_object_header_and_payload_are_rejected():
         )
 
 
-@pytest.mark.parametrize("change", [
-    {"study_id": ""},
-    {"image_id": ""},
-    {"tile_source_sha256": ""},
-    {"thumbnail_width": 0},
-    {"exp": int(time.time()) + 1000},
-])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"study_id": ""},
+        {"image_id": ""},
+        {"tile_source_sha256": ""},
+        {"thumbnail_width": 0},
+        {"exp": int(time.time()) + 1000},
+    ],
+)
 def test_source_bound_claims_and_max_ttl_are_required(change):
     secret = "s" * 32
     with pytest.raises(InvalidWsiToken):
@@ -169,3 +193,23 @@ def test_annotation_capability_requires_both_annotation_scopes():
             "cbioportal-wsi",
             required_scopes={"annotations:read", "annotations:write"},
         )
+
+
+@pytest.mark.asyncio
+async def test_annotation_auth_rejects_non_capability_tokens():
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/annotations",
+            "headers": [],
+        }
+    )
+    credentials = HTTPAuthorizationCredentials(
+        scheme="Bearer", credentials="generic-keycloak-token"
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await require_user(request, credentials)
+
+    assert error.value.status_code == 401

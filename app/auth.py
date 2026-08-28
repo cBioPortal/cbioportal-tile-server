@@ -4,18 +4,12 @@ import base64
 import hashlib
 import hmac
 import json
-import logging
 import time
-from typing import Any
 
-import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
 
 from .config import settings
-
-logger = logging.getLogger(__name__)
 
 
 class InvalidWsiToken(ValueError):
@@ -82,11 +76,18 @@ def validate_wsi_token(
     if "wsi:read" in required:
         if payload.get("wsi_auth_version") != 2:
             raise InvalidWsiToken("unsupported WSI authorization contract")
-        if not isinstance(payload.get("image_id"), str) or not payload["image_id"].strip():
+        if (
+            not isinstance(payload.get("image_id"), str)
+            or not payload["image_id"].strip()
+        ):
             raise InvalidWsiToken("invalid token image")
         for claim in ("tile_source_sha256", "thumbnail_source_sha256"):
             value = payload.get(claim)
-            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            if (
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
                 raise InvalidWsiToken("invalid token source binding")
         for claim in ("thumbnail_width", "thumbnail_height"):
             value = payload.get(claim)
@@ -102,40 +103,13 @@ def validate_wsi_token(
 
 
 _bearer = HTTPBearer(auto_error=False)
-_jwks_cache: dict[str, Any] = {}
-_jwks_fetched_at: float = 0.0
-_JWKS_TTL = 3600
-
-
-async def _get_jwks() -> dict[str, Any]:
-    global _jwks_cache, _jwks_fetched_at
-    if time.monotonic() - _jwks_fetched_at < _JWKS_TTL and _jwks_cache:
-        return _jwks_cache
-    if not settings.keycloak_jwks_url:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="KEYCLOAK_JWKS_URL is not configured",
-        )
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(settings.keycloak_jwks_url)
-            resp.raise_for_status()
-            _jwks_cache = resp.json()
-            _jwks_fetched_at = time.monotonic()
-            return _jwks_cache
-    except Exception as exc:
-        logger.error("Failed to fetch JWKS from %s: %s", settings.keycloak_jwks_url, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Unable to reach Keycloak JWKS endpoint",
-        )
 
 
 async def require_user(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
-) -> dict[str, Any]:
-    """Return the authenticated Keycloak subject and groups for annotations."""
+) -> dict:
+    """Return the subject and study scope from a cBioPortal capability."""
     if not settings.annotation_auth_enabled:
         return {"sub": "dev-user", "groups": []}
     if creds is None:
@@ -159,22 +133,9 @@ async def require_user(
             "groups": [],
             "study_id": capability["study_id"],
         }
-    except InvalidWsiToken:
-        pass
-    try:
-        payload = jwt.decode(
-            creds.credentials,
-            await _get_jwks(),
-            algorithms=["RS256"],
-            options={"verify_aud": False},
-        )
-    except JWTError as exc:
+    except InvalidWsiToken as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid token: {exc}",
+            detail="Invalid annotation capability",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-    sub: str = payload.get("sub", "")
-    if not sub:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing 'sub' claim")
-    return {"sub": sub, "groups": payload.get("groups", []), "study_id": None}
+        ) from exc
