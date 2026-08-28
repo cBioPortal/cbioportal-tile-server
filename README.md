@@ -115,8 +115,7 @@ optional Redis cache:
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 | `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
-| `KEYCLOAK_JWKS_URL` | — | Keycloak JWKS endpoint for annotation authentication |
-| `ANNOTATION_AUTH_ENABLED` | `true` | Enable Keycloak authentication for annotation requests |
+| `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
 | `ONCOKB_API_TOKEN` | — | Optional OncoKB token for annotation enrichment |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
 | `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |

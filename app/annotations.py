@@ -7,9 +7,8 @@ Routes:
   PUT    /annotations/{id}        update (optimistic concurrency via version)
   DELETE /annotations/{id}        delete (creator only)
 
-Auth: all routes require a valid Keycloak JWT via ``require_user()``.
-Study-level ACL: annotations inherit study access from cBioPortal —
-if a user can see the study they can read/write its annotations.
+Auth: all routes require a short-lived, study-scoped capability issued by
+cBioPortal via ``require_user()``.
 """
 
 import json
