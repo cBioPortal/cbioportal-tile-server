@@ -130,6 +130,25 @@ class BlockCacheManager:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def purge(self, cache_dir: str | Path) -> bool:
+        """Remove one unlocked cache directory under an exclusive lease."""
+        if self.root is None or fcntl is None:
+            return False
+        path = Path(cache_dir)
+        if path.parent != self.root:
+            raise ValueError("cache directory must be a direct child of the cache root")
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self._lock_path(path)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            existed = path.exists()
+            shutil.rmtree(path, ignore_errors=True)
+            return existed
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
 
 _manager: BlockCacheManager | None = None
 _manager_signature: tuple[str, int, int] | None = None
@@ -150,16 +169,36 @@ def get_blockcache_manager() -> BlockCacheManager:
         return _manager
 
 
-def cache_lease_for_slide(slide_id: str):
+def cache_directory_for_slide(slide_id: str) -> Path | None:
+    """Return a process-private cache directory for an S3 slide.
+
+    fsspec's block-cache metadata is mutable and is not a multi-process store.
+    Include the worker PID and configured block size so Gunicorn workers never
+    concurrently update the same metadata or reopen it with a different size.
+    """
     if not settings.blockcache_path or not slide_id.startswith("s3://"):
         return None
-    safe_id = slide_id.replace("/", "_").replace(":", "_").lstrip("_")
-    cache_dir = Path(settings.blockcache_path) / safe_id
+    digest = hashlib.sha256(slide_id.encode("utf-8")).hexdigest()
+    name = f"b{settings.blockcache_block_size}-p{os.getpid()}-{digest}"
+    return Path(settings.blockcache_path) / name
+
+
+def cache_lease_for_slide(slide_id: str):
+    cache_dir = cache_directory_for_slide(slide_id)
+    if cache_dir is None:
+        return None
     return get_blockcache_manager().lease(cache_dir)
 
 
 def touch_slide_cache(slide_id: str) -> None:
-    if not settings.blockcache_path or not slide_id.startswith("s3://"):
+    cache_dir = cache_directory_for_slide(slide_id)
+    if cache_dir is None:
         return
-    safe_id = slide_id.replace("/", "_").replace(":", "_").lstrip("_")
-    get_blockcache_manager().touch(Path(settings.blockcache_path) / safe_id)
+    get_blockcache_manager().touch(cache_dir)
+
+
+def purge_slide_cache(slide_id: str) -> bool:
+    cache_dir = cache_directory_for_slide(slide_id)
+    if cache_dir is None:
+        return False
+    return get_blockcache_manager().purge(cache_dir)

@@ -22,7 +22,7 @@ from typing import Callable, Iterator, TypeVar
 from tiffslide import TiffSlide
 
 from .config import settings
-from .blockcache import cache_lease_for_slide, touch_slide_cache
+from .blockcache import cache_lease_for_slide, purge_slide_cache, touch_slide_cache
 from .metrics import SLIDE_OPEN_ERRORS, SLIDE_OPEN_SECONDS
 from .slide_store import SlideEntry as _Entry
 from .slide_store import close_entry as _close_entry
@@ -81,6 +81,7 @@ class SlideCache:
         # Opening state coalesces cold opens without leaving waiters blocked
         # when the opener fails.
         self._opening: dict[str, _OpenState] = {}
+        self._repairing: set[str] = set()
 
     def _acquire(self, slide_id: str) -> _CacheEntry:
         while True:
@@ -88,6 +89,9 @@ class SlideCache:
             evicted: _CacheEntry | None = None
             is_owner = False
             with self._condition:
+                if slide_id in self._repairing:
+                    self._condition.wait()
+                    continue
                 cached = self._cache.get(slide_id)
                 if cached is not None:
                     if cached.active:
@@ -190,7 +194,7 @@ class SlideCache:
         self._release(slide_id, cached)
         return cached.entry.slide
 
-    def invalidate(self, slide_id: str) -> None:
+    def invalidate(self, slide_id: str) -> bool:
         entry = None
         with self._condition:
             cached = self._cache.get(slide_id)
@@ -199,6 +203,29 @@ class SlideCache:
                 self._condition.notify_all()
         if entry is not None:
             _close_entry(entry.entry)
+            return True
+        return False
+
+    def repair(self, slide_id: str) -> bool:
+        """Evict one idle handle and its worker-private block cache."""
+        with self._condition:
+            while slide_id in self._opening:
+                self._condition.wait()
+            cached = self._cache.get(slide_id)
+            if cached is not None and cached.active:
+                return False
+            self._repairing.add(slide_id)
+            entry = self._cache.pop(slide_id, None)
+            self._condition.notify_all()
+        try:
+            if entry is not None:
+                _close_entry(entry.entry)
+            purge_slide_cache(slide_id)
+            return True
+        finally:
+            with self._condition:
+                self._repairing.discard(slide_id)
+                self._condition.notify_all()
 
     def close_all(self) -> None:
         with self._condition:

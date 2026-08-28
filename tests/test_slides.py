@@ -17,6 +17,7 @@ def _settings(
     slide_s3_read_timeout_seconds=10.0,
     slide_s3_max_attempts=2,
     slide_s3_max_connections=16,
+    blockcache_block_size=1_048_576,
 ):
     m = MagicMock()
     m.aws_endpoint_url      = aws_endpoint_url
@@ -27,6 +28,7 @@ def _settings(
     m.slide_s3_read_timeout_seconds = slide_s3_read_timeout_seconds
     m.slide_s3_max_attempts = slide_s3_max_attempts
     m.slide_s3_max_connections = slide_s3_max_connections
+    m.blockcache_block_size = blockcache_block_size
     return m
 
 
@@ -121,3 +123,33 @@ class TestLocalSlidePaths:
         missing = Path("/tmp/definitely-missing-slide.svs")
         with pytest.raises(FileNotFoundError):
             open_slide(str(missing), logger=MagicMock())
+
+
+def test_blockcache_open_receives_configured_block_size(tmp_path):
+    slide_id = "s3://bucket/path/slide.svs"
+    settings = _settings(
+        blockcache_path=str(tmp_path),
+        blockcache_block_size=1_048_576,
+    )
+    slide = MagicMock()
+    slide.level_count = 2
+    fileobj = MagicMock()
+    filesystem = MagicMock()
+    filesystem.open.return_value = fileobj
+
+    with (
+        patch("app.slide_store.settings", settings),
+        patch("app.blockcache.settings", settings),
+        patch("app.slide_store.fsspec.filesystem", return_value=filesystem) as factory,
+        patch("app.slide_store.TiffSlide", return_value=slide),
+    ):
+        opened_slide, opened_fileobj = open_slide(slide_id, logger=MagicMock())
+
+    assert opened_slide is slide
+    assert opened_fileobj is fileobj
+    factory.assert_called_once()
+    filesystem.open.assert_called_once_with(
+        "bucket/path/slide.svs",
+        "rb",
+        block_size=1_048_576,
+    )

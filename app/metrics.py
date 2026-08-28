@@ -78,6 +78,16 @@ SLIDE_OPEN_ERRORS = Counter(
     "Slide-open failures by coarse exception type.",
     ("error_type",),
 )
+SLIDE_OPERATION_ERRORS = Counter(
+    "tile_server_slide_operation_errors_total",
+    "Slide operation failures by coarse exception type.",
+    ("error_type",),
+)
+SLIDE_CACHE_REPAIRS = Counter(
+    "tile_server_slide_cache_repairs_total",
+    "Slide cache repair attempts and outcomes.",
+    ("outcome", "error_type"),
+)
 THUMBNAIL_FETCH_SECONDS = Histogram(
     "tile_server_thumbnail_fetch_seconds",
     "Time spent fetching a thumbnail object from object storage.",
