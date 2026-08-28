@@ -100,6 +100,12 @@ class Settings:
     thumbnail_fetch_concurrency: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_FETCH_CONCURRENCY", 8)
     )
+    thumbnail_fetch_max_attempts: int = field(
+        default_factory=lambda: _env_int("THUMBNAIL_FETCH_MAX_ATTEMPTS", 2)
+    )
+    thumbnail_fetch_retry_delay_sec: float = field(
+        default_factory=lambda: _env_float("THUMBNAIL_FETCH_RETRY_DELAY_SEC", 0.1)
+    )
     thumbnail_s3_max_connections: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_S3_MAX_CONNECTIONS", 32)
     )

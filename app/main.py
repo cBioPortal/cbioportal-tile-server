@@ -38,6 +38,7 @@ from .metrics import (
     OVERSIZED_DECODE_REJECTIONS,
     THUMBNAIL_FETCH_ERRORS,
     THUMBNAIL_FETCH_QUEUE_SECONDS,
+    THUMBNAIL_FETCH_RETRIES,
     THUMBNAIL_FETCH_SECONDS,
     THUMBNAIL_RESIZE_SECONDS,
     metrics_payload,
@@ -390,11 +391,35 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
     started = time.perf_counter()
     queue_started = time.perf_counter()
     semaphore = _thumbnail_fetch_semaphore
+
+    async def read_with_retry() -> bytes:
+        attempts = max(1, settings.thumbnail_fetch_max_attempts)
+        retry_delay = max(0.0, settings.thumbnail_fetch_retry_delay_sec)
+        retried = False
+        for attempt in range(attempts):
+            try:
+                payload = await _in_thread(read_thumbnail_bytes, record)
+                if retried:
+                    THUMBNAIL_FETCH_RETRIES.labels(outcome="recovered").inc()
+                return payload
+            except FileNotFoundError:
+                raise
+            except Exception:
+                if attempt + 1 >= attempts:
+                    if retried:
+                        THUMBNAIL_FETCH_RETRIES.labels(outcome="exhausted").inc()
+                    raise
+                retried = True
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+        raise RuntimeError("thumbnail fetch retry loop did not return")
+
     if semaphore is None:
         try:
-            return await _in_thread(read_thumbnail_bytes, record)
-        except Exception:
-            THUMBNAIL_FETCH_ERRORS.inc()
+            return await read_with_retry()
+        except Exception as exc:
+            if not isinstance(exc, FileNotFoundError):
+                THUMBNAIL_FETCH_ERRORS.inc()
             raise
         finally:
             THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
@@ -402,9 +427,10 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
         THUMBNAIL_FETCH_QUEUE_SECONDS.observe(time.perf_counter() - queue_started)
         try:
             async with track_thumbnail_fetch():
-                return await _in_thread(read_thumbnail_bytes, record)
-        except Exception:
-            THUMBNAIL_FETCH_ERRORS.inc()
+                return await read_with_retry()
+        except Exception as exc:
+            if not isinstance(exc, FileNotFoundError):
+                THUMBNAIL_FETCH_ERRORS.inc()
             raise
         finally:
             THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
