@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 import app.main as main_module
 
@@ -221,6 +221,66 @@ class TestThumbnailFetchRetry:
             with pytest.raises(FileNotFoundError):
                 await main_module._run_thumbnail_fetch(record)
         assert read_calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "error",
+        [
+            PermissionError("access denied"),
+            ValueError("malformed thumbnail"),
+            ClientError(
+                {
+                    "Error": {"Code": "AccessDenied", "Message": "denied"},
+                    "ResponseMetadata": {"HTTPStatusCode": 403},
+                },
+                "GetObject",
+            ),
+        ],
+    )
+    async def test_does_not_retry_terminal_object_read_errors(
+        self, monkeypatch, error
+    ):
+        record = object()
+        monkeypatch.setattr(main_module, "_thumbnail_fetch_semaphore", None)
+        monkeypatch.setattr(main_module.settings, "thumbnail_fetch_max_attempts", 2)
+        read_calls = 0
+
+        async def fake_in_thread(fn, *args):
+            nonlocal read_calls
+            read_calls += 1
+            raise error
+
+        with patch.object(main_module, "_in_thread", fake_in_thread):
+            with pytest.raises(type(error)):
+                await main_module._run_thumbnail_fetch(record)
+        assert read_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_s3_server_error(self, monkeypatch):
+        record = object()
+        monkeypatch.setattr(main_module, "_thumbnail_fetch_semaphore", None)
+        monkeypatch.setattr(main_module.settings, "thumbnail_fetch_max_attempts", 2)
+        monkeypatch.setattr(main_module.settings, "thumbnail_fetch_retry_delay_sec", 0)
+        reads = [
+            ClientError(
+                {
+                    "Error": {"Code": "InternalError", "Message": "try again"},
+                    "ResponseMetadata": {"HTTPStatusCode": 500},
+                },
+                "GetObject",
+            ),
+            b"jpeg",
+        ]
+
+        async def fake_in_thread(fn, *args):
+            value = reads.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.object(main_module, "_in_thread", fake_in_thread):
+            assert await main_module._run_thumbnail_fetch(record) == b"jpeg"
+        assert reads == []
 
 
 class TestCorsPreflight:
