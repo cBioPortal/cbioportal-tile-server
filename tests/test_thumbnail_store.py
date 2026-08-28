@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from unittest.mock import MagicMock
 
 from PIL import Image
 
@@ -15,6 +16,32 @@ def _jpeg_bytes(size: tuple[int, int]) -> bytes:
 
 
 class TestThumbnailStore:
+    def test_s3_read_falls_back_to_fsspec_after_direct_client_failure(self, monkeypatch):
+        record = thumbnail_store.ThumbnailRecord(
+            image_id="2907269",
+            uri="s3://bucket/2907269.jpg",
+            width=128,
+            height=88,
+        )
+        client = MagicMock()
+        client.get_object.side_effect = RuntimeError("direct ECS read failed")
+        handle = MagicMock()
+        handle.__enter__.return_value = handle
+        handle.read.return_value = b"fallback-jpeg"
+        filesystem = MagicMock()
+        filesystem.open.return_value = handle
+
+        monkeypatch.setattr(thumbnail_store, "_runtime_s3", lambda: client)
+        monkeypatch.setattr(
+            thumbnail_store, "_filesystem_for_uri", lambda uri: filesystem
+        )
+
+        assert thumbnail_store.read_thumbnail_bytes(record) == b"fallback-jpeg"
+        client.get_object.assert_called_once_with(
+            Bucket="bucket", Key="2907269.jpg"
+        )
+        filesystem.open.assert_called_once_with("bucket/2907269.jpg", "rb")
+
     def test_payload_passthrough_for_display_sized_variant(self):
         thumb_bytes = _jpeg_bytes((128, 79))
         record = thumbnail_store.ThumbnailRecord(

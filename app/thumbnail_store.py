@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -18,6 +19,9 @@ from PIL import Image
 
 from .config import settings
 from .slide_store import s3_opts
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -253,12 +257,26 @@ def store_generated_thumbnail(image_id: str, payload: bytes) -> ThumbnailRecord 
 def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
     if record.uri.startswith("s3://"):
         bucket, key = _s3_location(record.uri)
-        response = _runtime_s3().get_object(Bucket=bucket, Key=key)
-        body = response["Body"]
         try:
-            return body.read()
-        finally:
-            body.close()
+            response = _runtime_s3().get_object(Bucket=bucket, Key=key)
+            body = response["Body"]
+            try:
+                return body.read()
+            finally:
+                body.close()
+        except Exception as exc:
+            # ECS accepts the s3fs/fsspec path used by the slide reader even
+            # when the pooled boto3 client cannot complete a direct object
+            # read from a worker.  Keep the exact published variant URI and
+            # fall back to that known-good transport before reporting the
+            # thumbnail as unavailable.
+            logger.warning(
+                "Direct thumbnail object read failed; retrying through fsspec; error_type=%s",
+                type(exc).__name__,
+            )
+            fs = _filesystem_for_uri(record.uri)
+            with fs.open(_filesystem_path(record.uri), "rb") as handle:
+                return handle.read()
     fs = _filesystem_for_uri(record.uri)
     with fs.open(_filesystem_path(record.uri), "rb") as handle:
         return handle.read()
