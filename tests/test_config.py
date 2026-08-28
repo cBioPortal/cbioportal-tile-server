@@ -76,6 +76,11 @@ class TestOtherSettings:
         s = make_settings()
         assert s.thumbnail_cache_ttl == 86_400
 
+    def test_thumbnail_fetch_retry_defaults(self):
+        s = make_settings()
+        assert s.thumbnail_fetch_max_attempts == 2
+        assert s.thumbnail_fetch_retry_delay_sec == 0.1
+
     def test_wsi_auth_max_ttl_reads_environment(self):
         s = make_settings(WSI_AUTH_MAX_TTL="600")
         assert s.wsi_auth_max_ttl == 600

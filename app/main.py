@@ -8,6 +8,7 @@ slide capability; this process validates the capability and serves pixels.
 from __future__ import annotations
 
 import asyncio
+import errno
 import hmac
 import json
 import logging
@@ -15,7 +16,12 @@ import time
 from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlparse
 
-from botocore.exceptions import BotoCoreError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    ConnectionError as BotoConnectionError,
+    HTTPClientError,
+)
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -38,6 +44,7 @@ from .metrics import (
     OVERSIZED_DECODE_REJECTIONS,
     THUMBNAIL_FETCH_ERRORS,
     THUMBNAIL_FETCH_QUEUE_SECONDS,
+    THUMBNAIL_FETCH_RETRIES,
     THUMBNAIL_FETCH_SECONDS,
     THUMBNAIL_RESIZE_SECONDS,
     metrics_payload,
@@ -108,6 +115,65 @@ class CacheMissRateLimitExceeded(Exception):
 
 class DistributedMissTimeout(Exception):
     pass
+
+
+_TRANSIENT_THUMBNAIL_S3_ERROR_CODES = frozenset(
+    {
+        "InternalError",
+        "InternalFailure",
+        "OperationAborted",
+        "RequestTimeout",
+        "RequestTimeoutException",
+        "ServiceUnavailable",
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+    }
+)
+_TRANSIENT_THUMBNAIL_ERRNOS = frozenset(
+    errno_value
+    for errno_value in (
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EBUSY", None),
+        getattr(errno, "ECONNABORTED", None),
+        getattr(errno, "ECONNREFUSED", None),
+        getattr(errno, "ECONNRESET", None),
+        getattr(errno, "EHOSTDOWN", None),
+        getattr(errno, "EHOSTUNREACH", None),
+        getattr(errno, "ENETDOWN", None),
+        getattr(errno, "ENETRESET", None),
+        getattr(errno, "ENETUNREACH", None),
+        getattr(errno, "EPIPE", None),
+        getattr(errno, "ETIMEDOUT", None),
+        getattr(errno, "EREMOTEIO", None),
+        getattr(errno, "EREMCHG", None),
+    )
+    if errno_value is not None
+)
+
+
+def _is_retryable_thumbnail_fetch_error(exc: Exception) -> bool:
+    """Return whether an object-store read can succeed on a later attempt."""
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(
+        exc,
+        (BotoConnectionError, HTTPClientError, ConnectionError, TimeoutError),
+    ):
+        return True
+    if isinstance(exc, ClientError):
+        response = getattr(exc, "response", {}) or {}
+        error = response.get("Error", {}) or {}
+        code = str(error.get("Code", ""))
+        if code in _TRANSIENT_THUMBNAIL_S3_ERROR_CODES:
+            return True
+        status = (response.get("ResponseMetadata", {}) or {}).get(
+            "HTTPStatusCode"
+        )
+        return isinstance(status, int) and (status in (408, 429) or status >= 500)
+    if isinstance(exc, OSError):
+        return exc.errno in _TRANSIENT_THUMBNAIL_ERRNOS
+    return False
 
 
 async def _run_with_miss_lock_lease(cache_key: str, token: str, producer):
@@ -390,9 +456,34 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
     started = time.perf_counter()
     queue_started = time.perf_counter()
     semaphore = _thumbnail_fetch_semaphore
+
+    async def read_with_retry() -> bytes:
+        attempts = max(1, settings.thumbnail_fetch_max_attempts)
+        retry_delay = max(0.0, settings.thumbnail_fetch_retry_delay_sec)
+        retried = False
+        for attempt in range(attempts):
+            try:
+                payload = await _in_thread(read_thumbnail_bytes, record)
+                if retried:
+                    THUMBNAIL_FETCH_RETRIES.labels(outcome="recovered").inc()
+                return payload
+            except Exception as exc:
+                retryable = _is_retryable_thumbnail_fetch_error(exc)
+                if (
+                    attempt + 1 >= attempts
+                    or not retryable
+                ):
+                    if retried and retryable:
+                        THUMBNAIL_FETCH_RETRIES.labels(outcome="exhausted").inc()
+                    raise
+                retried = True
+                if retry_delay:
+                    await asyncio.sleep(retry_delay)
+        raise RuntimeError("thumbnail fetch retry loop did not return")
+
     if semaphore is None:
         try:
-            return await _in_thread(read_thumbnail_bytes, record)
+            return await read_with_retry()
         except Exception:
             THUMBNAIL_FETCH_ERRORS.inc()
             raise
@@ -402,7 +493,7 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
         THUMBNAIL_FETCH_QUEUE_SECONDS.observe(time.perf_counter() - queue_started)
         try:
             async with track_thumbnail_fetch():
-                return await _in_thread(read_thumbnail_bytes, record)
+                return await read_with_retry()
         except Exception:
             THUMBNAIL_FETCH_ERRORS.inc()
             raise

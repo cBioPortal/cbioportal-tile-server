@@ -97,6 +97,11 @@ THUMBNAIL_FETCH_ERRORS = Counter(
     "tile_server_thumbnail_fetch_errors_total",
     "Thumbnail object-storage fetch failures.",
 )
+THUMBNAIL_FETCH_RETRIES = Counter(
+    "tile_server_thumbnail_fetch_retries_total",
+    "Thumbnail object-storage reads that required a retry.",
+    ("outcome",),
+)
 DISTRIBUTED_MISS_LOCKS = Counter(
     "tile_server_distributed_miss_locks_total",
     "Distributed cache-miss lock outcomes.",
