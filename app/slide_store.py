@@ -6,6 +6,7 @@ from typing import Any
 import fsspec
 from tiffslide import TiffSlide
 
+from .blockcache import cache_directory_for_slide
 from .config import settings
 
 
@@ -55,9 +56,9 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        if settings.blockcache_path:
-            safe_id = slide_id.replace("/", "_").replace(":", "_").lstrip("_")
-            cache_dir = os.path.join(settings.blockcache_path, safe_id)
+        cache_dir = cache_directory_for_slide(slide_id)
+        if cache_dir is not None:
+            cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)
 
             def _open_with_cache(path: str) -> tuple[TiffSlide, Any]:
@@ -66,10 +67,20 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
                     target_protocol="s3",
                     target_options=storage_options,
                     cache_storage=path,
+                )
+                # CachingFileSystem accepts block_size on open(); passing it
+                # to filesystem() is swallowed by **kwargs and leaves the
+                # fsspec default (currently 50 MiB) in effect.
+                fileobj = fs.open(
+                    f"{bucket}/{key}",
+                    "rb",
                     block_size=settings.blockcache_block_size,
                 )
-                fileobj = fs.open(f"{bucket}/{key}", "rb")
-                return TiffSlide(fileobj), fileobj
+                try:
+                    return TiffSlide(fileobj), fileobj
+                except BaseException:
+                    fileobj.close()
+                    raise
 
             slide, fileobj = _open_with_cache(cache_dir)
 

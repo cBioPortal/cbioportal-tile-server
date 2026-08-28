@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
+from fsspec.exceptions import BlocksizeMismatchError
+from tifffile import TiffFileError
 
 import app.main as main_module
 
@@ -185,6 +187,65 @@ class TestTransientSourceFailures:
         assert exc_info.value.status_code == 503
         assert exc_info.value.headers["Retry-After"] == "1"
 
+    def test_unclassified_source_oserror_maps_to_retryable_response(self):
+        slides = object.__new__(main_module.SlideCache)
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(
+                main_module.SlideCache,
+                "run",
+                side_effect=OSError(main_module.errno.ECONNRESET, "read reset"),
+            ),
+        ):
+            with pytest.raises(main_module.HTTPException) as exc_info:
+                main_module._run_slide_operation("s3://bucket/slide.svs", lambda _: None)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers["Retry-After"] == "1"
+
+    def test_unknown_cache_oserror_is_repaired_and_retried(self):
+        slides = object.__new__(main_module.SlideCache)
+        error = OSError("cache read failed")
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, b"jpeg"]) as run,
+            patch.object(main_module.SlideCache, "repair", return_value=True) as repair,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs", lambda _: None
+            ) == b"jpeg"
+
+        assert run.call_count == 2
+        repair.assert_called_once_with("s3://bucket/slide.svs")
+
+    @pytest.mark.parametrize("error", [BlocksizeMismatchError("wrong block size"), TiffFileError("bad cache")])
+    def test_cache_read_error_is_repaired_and_retried(self, error):
+        slides = object.__new__(main_module.SlideCache)
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, b"jpeg"]) as run,
+            patch.object(main_module.SlideCache, "repair", return_value=True) as repair,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs", lambda _: None
+            ) == b"jpeg"
+
+        assert run.call_count == 2
+        repair.assert_called_once_with("s3://bucket/slide.svs")
+
+    def test_cache_read_error_stays_500_after_repair_fails(self):
+        slides = object.__new__(main_module.SlideCache)
+        error = TiffFileError("bad cache")
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, error]),
+            patch.object(main_module.SlideCache, "repair", return_value=True),
+        ):
+            with pytest.raises(main_module.HTTPException) as exc_info:
+                main_module._run_slide_operation("s3://bucket/slide.svs", lambda _: None)
+
+        assert exc_info.value.status_code == 500
+
 
 class TestThumbnailFetchRetry:
     @pytest.mark.asyncio
@@ -194,6 +255,24 @@ class TestThumbnailFetchRetry:
         monkeypatch.setattr(main_module.settings, "thumbnail_fetch_max_attempts", 2)
         monkeypatch.setattr(main_module.settings, "thumbnail_fetch_retry_delay_sec", 0)
         reads = [EndpointConnectionError(endpoint_url="http://ecs:9020"), b"jpeg"]
+
+        async def fake_in_thread(fn, *args):
+            value = reads.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.object(main_module, "_in_thread", fake_in_thread):
+            assert await main_module._run_thumbnail_fetch(record) == b"jpeg"
+        assert reads == []
+
+    @pytest.mark.asyncio
+    async def test_retries_unclassified_transport_oserror(self, monkeypatch):
+        record = object()
+        monkeypatch.setattr(main_module, "_thumbnail_fetch_semaphore", None)
+        monkeypatch.setattr(main_module.settings, "thumbnail_fetch_max_attempts", 2)
+        monkeypatch.setattr(main_module.settings, "thumbnail_fetch_retry_delay_sec", 0)
+        reads = [OSError("incomplete ECS read"), b"jpeg"]
 
         async def fake_in_thread(fn, *args):
             value = reads.pop(0)

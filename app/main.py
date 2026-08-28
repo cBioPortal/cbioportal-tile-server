@@ -12,7 +12,9 @@ import errno
 import hmac
 import json
 import logging
+import random
 import time
+import traceback
 from contextlib import asynccontextmanager, suppress
 from urllib.parse import urlparse
 
@@ -22,8 +24,10 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
     HTTPClientError,
 )
+from fsspec.exceptions import BlocksizeMismatchError
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from tifffile import TiffFileError
 
 from . import cache as tile_cache
 from .auth import (
@@ -42,6 +46,8 @@ from .metrics import (
     IMAGE_OPERATION_QUEUE_SECONDS,
     IMAGE_OPERATION_QUEUE_TIMEOUTS,
     OVERSIZED_DECODE_REJECTIONS,
+    SLIDE_CACHE_REPAIRS,
+    SLIDE_OPERATION_ERRORS,
     THUMBNAIL_FETCH_ERRORS,
     THUMBNAIL_FETCH_QUEUE_SECONDS,
     THUMBNAIL_FETCH_RETRIES,
@@ -171,9 +177,75 @@ def _is_retryable_thumbnail_fetch_error(exc: Exception) -> bool:
             "HTTPStatusCode"
         )
         return isinstance(status, int) and (status in (408, 429) or status >= 500)
+    if isinstance(exc, BotoCoreError):
+        return True
     if isinstance(exc, OSError):
-        return exc.errno in _TRANSIENT_THUMBNAIL_ERRNOS
+        return exc.errno is None or exc.errno in _TRANSIENT_THUMBNAIL_ERRNOS
     return False
+
+
+def _is_retryable_slide_source_error(exc: Exception) -> bool:
+    """Return whether a slide source read may succeed on a later request."""
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(exc, ClientError):
+        response = getattr(exc, "response", {}) or {}
+        error = response.get("Error", {}) or {}
+        code = str(error.get("Code", ""))
+        if code in _TRANSIENT_THUMBNAIL_S3_ERROR_CODES:
+            return True
+        status = (response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode")
+        return isinstance(status, int) and (status in (408, 429) or status >= 500)
+    if isinstance(exc, (BotoCoreError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno is None or exc.errno in _TRANSIENT_THUMBNAIL_ERRNOS
+    return False
+
+
+def _is_cache_repairable_slide_error(exc: Exception) -> bool:
+    """Identify failures for which reopening after purging the local cache helps."""
+    if isinstance(exc, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(exc, OSError):
+        if isinstance(exc, (BotoCoreError, ConnectionError, TimeoutError)):
+            return False
+        return exc.errno not in _TRANSIENT_THUMBNAIL_ERRNOS
+    if isinstance(exc, (BlocksizeMismatchError, EOFError, TiffFileError)):
+        return True
+    return type(exc).__module__.startswith("imagecodecs")
+
+
+def _traceback_frames(exc: BaseException) -> str:
+    frames = traceback.extract_tb(exc.__traceback__)
+    return " <- ".join(
+        f"{frame.filename}:{frame.lineno}:{frame.name}" for frame in frames
+    )
+
+
+def _attempt_slide_cache_repair(source: str, exc: Exception) -> bool:
+    if not isinstance(_slides, SlideCache):
+        return False
+    try:
+        repaired = _slides.repair(source)
+    except Exception as repair_exc:  # noqa: BLE001 - preserve the original failure
+        logger.error(
+            "Slide cache repair failed; source_digest=%s error_type=%s repair_error_type=%s",
+            source_digest(source)[:16],
+            type(exc).__name__,
+            type(repair_exc).__name__,
+        )
+        return False
+    if repaired:
+        SLIDE_CACHE_REPAIRS.labels(
+            outcome="attempted", error_type=type(exc).__name__
+        ).inc()
+        logger.warning(
+            "Purged worker-local slide cache; source_digest=%s error_type=%s",
+            source_digest(source)[:16],
+            type(exc).__name__,
+        )
+    return repaired
 
 
 async def _run_with_miss_lock_lease(cache_key: str, token: str, producer):
@@ -426,24 +498,71 @@ def _source_from_request(request: Request, query_source: str | None) -> str:
 
 
 def _run_slide_operation(source: str, operation, *args):
-    try:
-        if not isinstance(_slides, SlideCache):
-            raise RuntimeError("slide cache is not initialized")
-        return _slides.run(source, operation, *args)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="source slide not found")
-    except (HTTPException, OverviewTooLarge, ValueError):
-        raise
-    except (BotoCoreError, ConnectionError, TimeoutError) as exc:
-        logger.warning("Slide source temporarily unavailable; error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            headers={"Retry-After": "1"},
-            detail="Slide source temporarily unavailable",
-        ) from exc
-    except Exception as exc:
-        logger.error("Slide operation failed; error_type=%s", type(exc).__name__)
-        raise HTTPException(status_code=500, detail="Slide operation failed")
+    repair_attempted = False
+    while True:
+        try:
+            if not isinstance(_slides, SlideCache):
+                raise RuntimeError("slide cache is not initialized")
+            result = _slides.run(source, operation, *args)
+            if repair_attempted:
+                SLIDE_CACHE_REPAIRS.labels(
+                    outcome="recovered", error_type="reopened"
+                ).inc()
+            return result
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="source slide not found")
+        except (HTTPException, OverviewTooLarge):
+            raise
+        except BlocksizeMismatchError as exc:
+            if not repair_attempted and _attempt_slide_cache_repair(source, exc):
+                repair_attempted = True
+                continue
+            if repair_attempted:
+                SLIDE_CACHE_REPAIRS.labels(
+                    outcome="failed", error_type=type(exc).__name__
+                ).inc()
+            SLIDE_OPERATION_ERRORS.labels(error_type=type(exc).__name__).inc()
+            logger.error(
+                "Slide operation failed; source_digest=%s error_type=%s stack=%s",
+                source_digest(source)[:16],
+                type(exc).__name__,
+                _traceback_frames(exc),
+            )
+            raise HTTPException(status_code=500, detail="Slide operation failed") from exc
+        except ValueError:
+            raise
+        except Exception as exc:
+            if (
+                not repair_attempted
+                and _is_cache_repairable_slide_error(exc)
+                and _attempt_slide_cache_repair(source, exc)
+            ):
+                repair_attempted = True
+                continue
+            if repair_attempted:
+                SLIDE_CACHE_REPAIRS.labels(
+                    outcome="failed", error_type=type(exc).__name__
+                ).inc()
+            if _is_retryable_slide_source_error(exc):
+                logger.warning(
+                    "Slide source temporarily unavailable; source_digest=%s error_type=%s stack=%s",
+                    source_digest(source)[:16],
+                    type(exc).__name__,
+                    _traceback_frames(exc),
+                )
+                raise HTTPException(
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                    detail="Slide source temporarily unavailable",
+                ) from exc
+            SLIDE_OPERATION_ERRORS.labels(error_type=type(exc).__name__).inc()
+            logger.error(
+                "Slide operation failed; source_digest=%s error_type=%s stack=%s",
+                source_digest(source)[:16],
+                type(exc).__name__,
+                _traceback_frames(exc),
+            )
+            raise HTTPException(status_code=500, detail="Slide operation failed") from exc
 
 
 async def _run_slide_image_operation(source: str, operation, *args, operation_kind: str = "image"):
@@ -478,7 +597,8 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
                     raise
                 retried = True
                 if retry_delay:
-                    await asyncio.sleep(retry_delay)
+                    delay = min(1.0, retry_delay * (2**attempt))
+                    await asyncio.sleep(delay * random.uniform(0.8, 1.2))
         raise RuntimeError("thumbnail fetch retry loop did not return")
 
     if semaphore is None:
@@ -658,15 +778,25 @@ async def thumbnail(
         raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Thumbnail service is busy")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="thumbnail not found")
-    except (BotoCoreError, ConnectionError, TimeoutError) as exc:
-        logger.warning("Thumbnail source temporarily unavailable; error_type=%s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            headers={"Retry-After": "1"},
-            detail="Thumbnail source temporarily unavailable",
-        ) from exc
     except Exception as exc:
-        logger.error("Thumbnail fetch failed; error_type=%s", type(exc).__name__)
+        if _is_retryable_thumbnail_fetch_error(exc):
+            logger.warning(
+                "Thumbnail source temporarily unavailable; source_digest=%s error_type=%s stack=%s",
+                source_digest(source)[:16],
+                type(exc).__name__,
+                _traceback_frames(exc),
+            )
+            raise HTTPException(
+                status_code=503,
+                headers={"Retry-After": "1"},
+                detail="Thumbnail source temporarily unavailable",
+            ) from exc
+        logger.error(
+            "Thumbnail fetch failed; source_digest=%s error_type=%s stack=%s",
+            source_digest(source)[:16],
+            type(exc).__name__,
+            _traceback_frames(exc),
+        )
         raise HTTPException(status_code=502, detail="thumbnail unavailable")
     headers = dict(THUMB_CACHE_HEADERS)
     headers.update({
