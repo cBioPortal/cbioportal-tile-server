@@ -116,7 +116,9 @@ class AnnotationUpdate(BaseModel):
     body: AnnotationBody | None = None
     target: AnnotationTarget | None = None
     visible_to: list[str] | None = None
-    version: int = Field(..., description="Must match current version (optimistic lock)")
+    version: int = Field(
+        ..., description="Must match current version (optimistic lock)"
+    )
 
 
 def _row_to_out(row: dict) -> AnnotationOut:
@@ -157,7 +159,9 @@ async def _init_sqlite(path: str) -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_ann_slide_study ON annotations(slide_id, study_id)"
         )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)")
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
+        )
         await db.commit()
 
 
@@ -183,7 +187,9 @@ async def _init_postgres(dsn: str) -> None:
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_ann_slide_study ON annotations(slide_id, study_id)"
         )
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
+        )
     finally:
         await conn.close()
 
@@ -241,7 +247,9 @@ async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[di
 
 async def _create_sqlite(data: AnnotationIn, user_sub: str) -> dict:
     ann_id = str(uuid.uuid4())
-    visible_to_json = json.dumps(data.visible_to) if data.visible_to is not None else None
+    visible_to_json = (
+        json.dumps(data.visible_to) if data.visible_to is not None else None
+    )
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
         db.row_factory = aiosqlite.Row
@@ -268,7 +276,9 @@ async def _create_sqlite(data: AnnotationIn, user_sub: str) -> dict:
 
 async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
     ann_id = str(uuid.uuid4())
-    visible_to_json = json.dumps(data.visible_to) if data.visible_to is not None else None
+    visible_to_json = (
+        json.dumps(data.visible_to) if data.visible_to is not None else None
+    )
     conn = await asyncpg.connect(_get_db_url())
     try:
         row = await conn.fetchrow(
@@ -323,22 +333,50 @@ async def _get_existing_postgres(annotation_id: str) -> dict | None:
         await conn.close()
 
 
-async def _update_sqlite(annotation_id: str, new_body: str, new_target: str, new_visible: str | None, new_version: int) -> None:
+async def _update_sqlite(
+    annotation_id: str,
+    new_body: str,
+    new_target: str,
+    new_visible: str | None,
+    expected_version: int,
+    new_version: int,
+) -> str | None:
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
-        await db.execute(
+        cursor = await db.execute(
             """
             UPDATE annotations
             SET body = ?, target = ?, visible_to = ?, version = ?,
                 updated_at = datetime('now')
-            WHERE id = ?
+            WHERE id = ? AND version = ?
             """,
-            (new_body, new_target, new_visible, new_version, annotation_id),
+            (
+                new_body,
+                new_target,
+                new_visible,
+                new_version,
+                annotation_id,
+                expected_version,
+            ),
         )
         await db.commit()
+        if cursor.rowcount != 1:
+            return None
+        cursor = await db.execute(
+            "SELECT updated_at FROM annotations WHERE id = ?", (annotation_id,)
+        )
+        row = await cursor.fetchone()
+    return row[0] if row else None
 
 
-async def _update_postgres(annotation_id: str, new_body: str, new_target: str, new_visible: str | None, new_version: int) -> str:
+async def _update_postgres(
+    annotation_id: str,
+    new_body: str,
+    new_target: str,
+    new_visible: str | None,
+    expected_version: int,
+    new_version: int,
+) -> str | None:
     conn = await asyncpg.connect(_get_db_url())
     try:
         row = await conn.fetchrow(
@@ -346,7 +384,7 @@ async def _update_postgres(annotation_id: str, new_body: str, new_target: str, n
             UPDATE annotations
             SET body = $1, target = $2, visible_to = $3, version = $4,
                 updated_at = timezone('utc', now())
-            WHERE id = $5
+            WHERE id = $5 AND version = $6
             RETURNING to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
             """,
             new_body,
@@ -354,8 +392,9 @@ async def _update_postgres(annotation_id: str, new_body: str, new_target: str, n
             new_visible,
             new_version,
             annotation_id,
+            expected_version,
         )
-        return row["to_char"]
+        return row["to_char"] if row else None
     finally:
         await conn.close()
 
@@ -382,7 +421,9 @@ async def list_annotations(
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:
     if user.get("study_id") and user["study_id"] != study_id:
-        raise HTTPException(status_code=403, detail="Token study scope does not match request")
+        raise HTTPException(
+            status_code=403, detail="Token study scope does not match request"
+        )
     user_sub: str = user["sub"]
     user_groups: set[str] = set(user["groups"])
     if _storage_kind() == "postgres":
@@ -398,7 +439,9 @@ async def create_annotation(
     user: dict = Depends(require_user),
 ) -> AnnotationOut:
     if user.get("study_id") and user["study_id"] != data.study_id:
-        raise HTTPException(status_code=403, detail="Token study scope does not match request")
+        raise HTTPException(
+            status_code=403, detail="Token study scope does not match request"
+        )
     if _storage_kind() == "postgres":
         row = await _create_postgres(data, user["sub"])
     else:
@@ -420,28 +463,57 @@ async def update_annotation(
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
     if user.get("study_id") and user["study_id"] != existing["study_id"]:
-        raise HTTPException(status_code=403, detail="Token study scope does not match annotation")
+        raise HTTPException(
+            status_code=403, detail="Token study scope does not match annotation"
+        )
     if existing["created_by"] != user["sub"]:
-        raise HTTPException(status_code=403, detail="Only the creator may update this annotation")
+        raise HTTPException(
+            status_code=403, detail="Only the creator may update this annotation"
+        )
     if existing["version"] != data.version:
         raise HTTPException(
             status_code=409,
             detail=f"Version conflict: expected {existing['version']}, got {data.version}",
         )
 
-    new_body = data.body.model_dump_json() if data.body is not None else existing["body"]
-    new_target = (
-        _sqlite_target_json(data.target.selector) if data.target is not None else existing["target"]
+    new_body = (
+        data.body.model_dump_json() if data.body is not None else existing["body"]
     )
-    new_visible = json.dumps(data.visible_to) if data.visible_to is not None else existing["visible_to"]
+    new_target = (
+        _sqlite_target_json(data.target.selector)
+        if data.target is not None
+        else existing["target"]
+    )
+    if "visible_to" in data.model_fields_set:
+        new_visible = (
+            json.dumps(data.visible_to) if data.visible_to is not None else None
+        )
+    else:
+        new_visible = existing["visible_to"]
     new_version = existing["version"] + 1
     if _storage_kind() == "postgres":
         updated_at = await _update_postgres(
-            annotation_id, new_body, new_target, new_visible, new_version
+            annotation_id,
+            new_body,
+            new_target,
+            new_visible,
+            existing["version"],
+            new_version,
         )
     else:
-        await _update_sqlite(annotation_id, new_body, new_target, new_visible, new_version)
-        updated_at = ""
+        updated_at = await _update_sqlite(
+            annotation_id,
+            new_body,
+            new_target,
+            new_visible,
+            existing["version"],
+            new_version,
+        )
+    if updated_at is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Annotation was modified concurrently",
+        )
 
     return AnnotationOut(
         id=existing["id"],
@@ -470,9 +542,13 @@ async def delete_annotation(
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
     if user.get("study_id") and user["study_id"] != existing["study_id"]:
-        raise HTTPException(status_code=403, detail="Token study scope does not match annotation")
+        raise HTTPException(
+            status_code=403, detail="Token study scope does not match annotation"
+        )
     if existing["created_by"] != user["sub"]:
-        raise HTTPException(status_code=403, detail="Only the creator may delete this annotation")
+        raise HTTPException(
+            status_code=403, detail="Only the creator may delete this annotation"
+        )
 
     if _storage_kind() == "postgres":
         await _delete_postgres(annotation_id)
