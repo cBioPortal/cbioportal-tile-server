@@ -72,20 +72,13 @@ def _metadata_source_fingerprint(metadata_json: str) -> str | None:
     return str(value) if value not in (None, "") else None
 
 
-def _metadata_policy_version(metadata_json: str) -> str | None:
+def _has_current_tile_metadata(metadata_json: str) -> bool:
     try:
-        value = json.loads(metadata_json).get("decode_policy_version")
+        metadata = json.loads(metadata_json)
     except (TypeError, json.JSONDecodeError):
-        return None
-    return str(value) if value not in (None, "") else None
-
-
-def _metadata_schema_version(metadata_json: str) -> int | None:
-    try:
-        value = json.loads(metadata_json).get("tile_metadata_schema_version")
-        return int(value) if value is not None else None
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
+        return False
+    valid, _ = validate_tile_metadata(metadata, allow_legacy=False)
+    return valid
 
 SERVABLE_SLIDES_SQL = """
 SELECT
@@ -846,21 +839,10 @@ def _select_candidate_rows(
         # A successful row written before tile_metadata_json was introduced
         # is not a complete source-bound record. Regenerate it so migration
         # does not make an otherwise servable slide unavailable.
-        metadata_missing = not (registry_row.tile_metadata_json or "").strip()
-        policy_stale = (
-            _metadata_policy_version(registry_row.tile_metadata_json or "")
-            != decode_policy_version()
-        )
-        schema_stale = (
-            _metadata_schema_version(registry_row.tile_metadata_json or "")
-            != TILE_METADATA_SCHEMA_VERSION
-        )
         current_fingerprint = _require_source_fingerprint(row)
         needs_regeneration = (
             registry_row.source_fingerprint != current_fingerprint
-            or metadata_missing
-            or policy_stale
-            or schema_stale
+            or not _has_current_tile_metadata(registry_row.tile_metadata_json or "")
         )
         if retry_failures_only:
             if registry_row.status != "success" or needs_regeneration:
@@ -1043,7 +1025,7 @@ def process_candidate_rows(
                 existing = registry_by_image_and_source.get((row.image_id, row.path))
                 if (
                     existing is not None
-                    and existing.source_fingerprint in (None, current_fingerprint)
+                    and existing.source_fingerprint == current_fingerprint
                     and _artifact_exists(existing.artifact_uri)
                 ):
                     artifact = _build_metadata_only_record(
@@ -1249,8 +1231,7 @@ def _successful_registry_for_inventory(
         if row is None or row.status != "success":
             continue
         current_fingerprint = _require_source_fingerprint(inventory_row)
-        schema = _metadata_schema_version(row.tile_metadata_json)
-        if row.source_fingerprint not in (None, current_fingerprint):
+        if row.source_fingerprint != current_fingerprint:
             continue
         if not (row.tile_metadata_json or "").strip():
             continue
@@ -1258,10 +1239,8 @@ def _successful_registry_for_inventory(
             metadata = json.loads(row.tile_metadata_json)
         except (TypeError, json.JSONDecodeError):
             continue
-        valid, _ = validate_tile_metadata(metadata, allow_legacy=True)
+        valid, _ = validate_tile_metadata(metadata, allow_legacy=False)
         if not valid:
-            continue
-        if schema == TILE_METADATA_SCHEMA_VERSION and _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
             continue
         complete.append(row)
     return complete
