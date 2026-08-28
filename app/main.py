@@ -417,9 +417,8 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
     if semaphore is None:
         try:
             return await read_with_retry()
-        except Exception as exc:
-            if not isinstance(exc, FileNotFoundError):
-                THUMBNAIL_FETCH_ERRORS.inc()
+        except Exception:
+            THUMBNAIL_FETCH_ERRORS.inc()
             raise
         finally:
             THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
@@ -428,9 +427,8 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
         try:
             async with track_thumbnail_fetch():
                 return await read_with_retry()
-        except Exception as exc:
-            if not isinstance(exc, FileNotFoundError):
-                THUMBNAIL_FETCH_ERRORS.inc()
+        except Exception:
+            THUMBNAIL_FETCH_ERRORS.inc()
             raise
         finally:
             THUMBNAIL_FETCH_SECONDS.observe(time.perf_counter() - started)
