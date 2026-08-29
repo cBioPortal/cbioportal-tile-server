@@ -199,6 +199,11 @@ class Settings:
     keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
     annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
     oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
+    agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
+    agent_model: str = field(default_factory=lambda: _env_str("OPENAI_MODEL", "gpt-5.6-terra"))
+    agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
+    agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
 
     cors_origins: list[str] = field(
         default_factory=lambda: _env_csv(
