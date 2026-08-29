@@ -60,6 +60,8 @@ from .metrics import (
 from .annotations import init_db as init_annotation_db
 from .annotations import close_db as close_annotation_db
 from .annotations import router as annotation_router
+from .agent import init_db as init_agent_db
+from .agent import router as agent_router
 from .oncokb import router as oncokb_router
 from .slides import SlideCache
 from .thumbnail_store import (
@@ -306,6 +308,8 @@ async def lifespan(app: FastAPI):
     )
     await init_annotation_db()
     logger.info("Annotation DB ready: %s", settings.annotation_db_path)
+    await init_agent_db()
+    logger.info("Agent audit DB ready: %s", settings.annotation_db_path)
     try:
         yield
     finally:
@@ -331,7 +335,7 @@ async def require_wsi_capability(request: Request, call_next):
     path = request.scope["path"]
     if path in ("/health", "/wsi/health", "/ready", "/metrics"):
         return await call_next(request)
-    if path.startswith("/annotations") or path.startswith("/api/oncokb"):
+    if path.startswith(("/annotations", "/api/oncokb", "/agent")):
         return await call_next(request)
     # Browser clients send an unauthenticated OPTIONS request before any
     # cross-origin request that includes the Authorization header.  CORS
@@ -379,6 +383,7 @@ THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authori
 PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
 app.include_router(annotation_router)
 app.include_router(oncokb_router)
+app.include_router(agent_router)
 
 
 async def _in_thread(fn, *args):
