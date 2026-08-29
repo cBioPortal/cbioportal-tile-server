@@ -60,6 +60,15 @@ services:
       KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
       ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
 
+      # ── Optional WSI research assistant (server-side only) ───────────────
+      # Keep the API credential in a secret-mounted file or secret manager;
+      # never expose it to the browser or commit it to this repository.
+      WSI_AGENT_ENABLED: ${WSI_AGENT_ENABLED:-false}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      OPENAI_API_KEY_FILE: ${OPENAI_API_KEY_FILE:-}
+      WSI_AGENT_TIMEOUT_SECONDS: ${WSI_AGENT_TIMEOUT_SECONDS:-60}
+      WSI_AGENT_RATE_LIMIT_PER_MINUTE: ${WSI_AGENT_RATE_LIMIT_PER_MINUTE:-10}
+
       # ── Capacity (tune to host RAM; each open SVS ≈ 50–200 MB) ───────────
       MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
       N_WORKERS: ${N_WORKERS:-2}

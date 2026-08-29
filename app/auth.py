@@ -105,37 +105,48 @@ def validate_wsi_token(
 _bearer = HTTPBearer(auto_error=False)
 
 
+def scoped_user_dependency(required_scopes: set[str]):
+    async def dependency(
+        creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    ) -> dict:
+        if not settings.annotation_auth_enabled:
+            return {"sub": "dev-user", "groups": [], "study_id": None}
+        if creds is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing Authorization header",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        try:
+            capability = validate_wsi_token(
+                creds.credentials,
+                settings.wsi_auth_secret,
+                settings.wsi_auth_audience,
+                required_scopes=required_scopes,
+            )
+            return {
+                "sub": capability["sub"],
+                "groups": [],
+                "study_id": capability["study_id"],
+                "scopes": set(str(capability.get("scope", "")).split()),
+            }
+        except InvalidWsiToken as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid annotation capability",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
+
+    return dependency
+
+
 async def require_user(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> dict:
     """Return the subject and study scope from a cBioPortal capability."""
-    if not settings.annotation_auth_enabled:
-        return {"sub": "dev-user", "groups": []}
-    if creds is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization header",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
     required_scopes = {"annotations:read"}
     if request.method in {"POST", "PUT", "DELETE"}:
         required_scopes.add("annotations:write")
-    try:
-        capability = validate_wsi_token(
-            creds.credentials,
-            settings.wsi_auth_secret,
-            settings.wsi_auth_audience,
-            required_scopes=required_scopes,
-        )
-        return {
-            "sub": capability["sub"],
-            "groups": [],
-            "study_id": capability["study_id"],
-        }
-    except InvalidWsiToken as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid annotation capability",
-            headers={"WWW-Authenticate": "Bearer"},
-        ) from exc
+    dependency = scoped_user_dependency(required_scopes)
+    return await dependency(creds)

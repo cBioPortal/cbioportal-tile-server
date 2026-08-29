@@ -38,6 +38,7 @@ dependencies = [
     # Annotation API storage
     "aiosqlite>=0.20.0",
     "asyncpg>=0.30.0",
+    "openai-agents>=0.1.0",
     # HTTP client for the OncoKB proxy
     "httpx>=0.27",
 ]
