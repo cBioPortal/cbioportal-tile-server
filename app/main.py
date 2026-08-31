@@ -65,7 +65,7 @@ from .thumbnail_store import (
     read_thumbnail_bytes,
     render_thumbnail_payload,
 )
-from .tiles import OverviewTooLarge, get_tile_bytes
+from .tiles import InvalidTileRequest, OverviewTooLarge, get_tile_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +205,19 @@ def _is_retryable_slide_source_error(exc: Exception) -> bool:
 
 def _is_cache_repairable_slide_error(exc: Exception) -> bool:
     """Identify failures for which reopening after purging the local cache helps."""
-    if isinstance(exc, (FileNotFoundError, PermissionError)):
+    if isinstance(
+        exc,
+        (
+            FileNotFoundError,
+            PermissionError,
+            ClientError,
+            BotoCoreError,
+            BotoConnectionError,
+            ConnectionError,
+            TimeoutError,
+            InvalidTileRequest,
+        ),
+    ):
         return False
     if isinstance(exc, OSError):
         if isinstance(exc, (BotoCoreError, ConnectionError, TimeoutError)):
@@ -213,7 +225,11 @@ def _is_cache_repairable_slide_error(exc: Exception) -> bool:
         return exc.errno not in _TRANSIENT_THUMBNAIL_ERRNOS
     if isinstance(exc, (BlocksizeMismatchError, EOFError, TiffFileError)):
         return True
-    return type(exc).__module__.startswith("imagecodecs")
+    # Decoder libraries do not expose one stable exception type across
+    # imagecodecs/tifffile versions.  Once transport and coordinate failures
+    # are excluded, a single worker-local cache purge is safe and repairs the
+    # common poisoned-block-cache case.
+    return True
 
 
 def _traceback_frames(exc: BaseException) -> str:
@@ -511,16 +527,22 @@ def _run_slide_operation(source: str, operation, *args):
             return result
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="source slide not found")
-        except (HTTPException, OverviewTooLarge):
+        except (HTTPException, OverviewTooLarge, InvalidTileRequest):
             raise
         except BlocksizeMismatchError as exc:
-            if not repair_attempted and _attempt_slide_cache_repair(source, exc):
+            if not repair_attempted:
                 repair_attempted = True
-                continue
+                if _attempt_slide_cache_repair(source, exc):
+                    continue
             if repair_attempted:
                 SLIDE_CACHE_REPAIRS.labels(
                     outcome="failed", error_type=type(exc).__name__
                 ).inc()
+                raise HTTPException(
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                    detail="Slide cache repair did not recover the source",
+                ) from exc
             SLIDE_OPERATION_ERRORS.labels(error_type=type(exc).__name__).inc()
             logger.error(
                 "Slide operation failed; source_digest=%s error_type=%s stack=%s",
@@ -529,20 +551,20 @@ def _run_slide_operation(source: str, operation, *args):
                 _traceback_frames(exc),
             )
             raise HTTPException(status_code=500, detail="Slide operation failed") from exc
-        except ValueError:
-            raise
         except Exception as exc:
-            if (
-                not repair_attempted
-                and _is_cache_repairable_slide_error(exc)
-                and _attempt_slide_cache_repair(source, exc)
-            ):
+            if not repair_attempted and _is_cache_repairable_slide_error(exc):
                 repair_attempted = True
-                continue
+                if _attempt_slide_cache_repair(source, exc):
+                    continue
             if repair_attempted:
                 SLIDE_CACHE_REPAIRS.labels(
                     outcome="failed", error_type=type(exc).__name__
                 ).inc()
+                raise HTTPException(
+                    status_code=503,
+                    headers={"Retry-After": "1"},
+                    detail="Slide cache repair did not recover the source",
+                ) from exc
             if _is_retryable_slide_source_error(exc):
                 logger.warning(
                     "Slide source temporarily unavailable; source_digest=%s error_type=%s stack=%s",

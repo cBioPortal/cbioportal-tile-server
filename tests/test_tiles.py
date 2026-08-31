@@ -7,6 +7,7 @@ import pytest
 from PIL import Image
 
 from app.tiles import (
+    InvalidTileRequest,
     NoSafeThumbnailOverview,
     OverviewTooLarge,
     TILE_SIZE,
@@ -16,6 +17,7 @@ from app.tiles import (
     get_thumbnail_bytes,
     get_thumbnail_bytes_with_plan,
     max_zoom,
+    _plan_decode,
     safe_min_level,
     safe_min_level_from_geometry,
 )
@@ -117,8 +119,25 @@ class TestTileHelpers:
 
     def test_tile_geometry_rejects_invalid_tile(self):
         slide = make_mock_slide(256, 256, levels=1)
-        with pytest.raises(ValueError):
+        with pytest.raises(InvalidTileRequest):
             _tile_geometry(slide, 0, 1, 0)
+
+    def test_best_level_accepts_small_pyramid_rounding_error(self):
+        slide = make_mock_slide(16_000, 16_000, levels=4)
+        slide.level_downsamples = [1.0, 4.0001, 16.001125, 64.004499]
+        slide.get_best_level_for_downsample = MagicMock(
+            side_effect=AssertionError("must use tolerant level selection")
+        )
+
+        plan = _plan_decode(slide, 0, 0, 0)
+
+        assert plan.best_level == 3
+        assert plan.requested_pixels == 62_500
+
+    def test_best_level_does_not_accept_materially_coarser_level(self):
+        from app.tiles import _best_level_for_downsample
+
+        assert _best_level_for_downsample([1.0, 4.0, 64.8], 64) == 1
 
     def test_resize_and_pad_keeps_full_tiles(self):
         region = Image.new("RGB", (TILE_SIZE, TILE_SIZE), (0, 0, 0))
