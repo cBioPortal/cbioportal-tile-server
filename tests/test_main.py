@@ -233,7 +233,7 @@ class TestTransientSourceFailures:
         assert run.call_count == 2
         repair.assert_called_once_with("s3://bucket/slide.svs")
 
-    def test_cache_read_error_stays_500_after_repair_fails(self):
+    def test_cache_read_error_becomes_retryable_after_repair_fails(self):
         slides = object.__new__(main_module.SlideCache)
         error = TiffFileError("bad cache")
         with (
@@ -244,7 +244,39 @@ class TestTransientSourceFailures:
             with pytest.raises(main_module.HTTPException) as exc_info:
                 main_module._run_slide_operation("s3://bucket/slide.svs", lambda _: None)
 
-        assert exc_info.value.status_code == 500
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers["Retry-After"] == "1"
+
+    def test_decoder_value_error_is_repaired_and_retried(self):
+        slides = object.__new__(main_module.SlideCache)
+        error = ValueError("decoder rejected cached bytes")
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, b"jpeg"]) as run,
+            patch.object(main_module.SlideCache, "repair", return_value=True) as repair,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs", lambda _: None
+            ) == b"jpeg"
+
+        assert run.call_count == 2
+        repair.assert_called_once_with("s3://bucket/slide.svs")
+
+    def test_cache_repair_failure_is_retryable(self):
+        slides = object.__new__(main_module.SlideCache)
+        error = ValueError("decoder rejected cached bytes")
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error]),
+            patch.object(main_module.SlideCache, "repair", return_value=False),
+        ):
+            with pytest.raises(main_module.HTTPException) as exc_info:
+                main_module._run_slide_operation(
+                    "s3://bucket/slide.svs", lambda _: None
+                )
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.headers["Retry-After"] == "1"
 
 
 class TestThumbnailFetchRetry:

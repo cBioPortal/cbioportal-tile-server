@@ -56,6 +56,10 @@ class OverviewTooLarge(RuntimeError):
         )
 
 
+class InvalidTileRequest(ValueError):
+    """Raised when a requested Z/X/Y coordinate is outside the slide."""
+
+
 class NoSafeThumbnailOverview(RuntimeError):
     """Raised when no thumbnail overview level fits the configured budget."""
 
@@ -116,14 +120,26 @@ def max_zoom(slide: TiffSlide) -> int:
     return max(0, math.ceil(math.log2(max(w, h) / TILE_SIZE)))
 
 
+PYRAMID_DOWNSAMPLE_TOLERANCE = 0.01
+
+
 def _best_level_for_downsample(level_downsamples: list[float], downsample: float) -> int:
-    """Match tiffslide's level selection without opening or decoding a slide."""
+    """Select the coarsest native level that is effectively at the target.
+
+    Whole-slide pyramids commonly contain small rounding differences from the
+    nominal powers of two (for example, 64.0045 instead of 64).  Treat those
+    values as equivalent so a tile does not decode from a level 16 times more
+    detailed than requested.
+    """
     if downsample <= 1.0:
         return 0
+    maximum_acceptable = downsample * (1.0 + PYRAMID_DOWNSAMPLE_TOLERANCE)
+    best_level = 0
     for level, level_downsample in enumerate(level_downsamples):
-        if level_downsample > downsample:
-            return max(0, level - 1)
-    return len(level_downsamples) - 1
+        if level_downsample > maximum_acceptable:
+            break
+        best_level = level
+    return best_level
 
 
 def safe_min_level_from_geometry(
@@ -238,7 +254,7 @@ def slide_metadata(slide: TiffSlide) -> dict:
 def _tile_geometry(slide: TiffSlide, z: int, x: int, y: int) -> tuple[int, int, int, int, int, int, int, int]:
     mz = max_zoom(slide)
     if z < 0 or z > mz:
-        raise ValueError(f"zoom {z} out of range [0, {mz}]")
+        raise InvalidTileRequest(f"zoom {z} out of range [0, {mz}]")
 
     target_ds = 2 ** (mz - z)
     slide_w, slide_h = slide.dimensions
@@ -246,7 +262,7 @@ def _tile_geometry(slide: TiffSlide, z: int, x: int, y: int) -> tuple[int, int, 
     y0 = y * TILE_SIZE * target_ds
 
     if x0 >= slide_w or y0 >= slide_h:
-        raise ValueError(f"tile ({x}, {y}, {z}) is outside slide bounds")
+        raise InvalidTileRequest(f"tile ({x}, {y}, {z}) is outside slide bounds")
 
     src_w = min(TILE_SIZE * target_ds, slide_w - x0)
     src_h = min(TILE_SIZE * target_ds, slide_h - y0)
@@ -269,7 +285,9 @@ def _resize_and_pad(region: Image.Image, out_w: int, out_h: int) -> Image.Image:
 def _plan_decode(slide: TiffSlide, z: int, x: int, y: int) -> DecodePlan:
     _, target_ds, x0, y0, src_w, src_h, out_w, out_h = _tile_geometry(slide, z, x, y)
 
-    best_level = slide.get_best_level_for_downsample(target_ds)
+    best_level = _best_level_for_downsample(
+        list(slide.level_downsamples), target_ds
+    )
     level_ds = slide.level_downsamples[best_level]
 
     read_w = math.ceil(src_w / level_ds)
