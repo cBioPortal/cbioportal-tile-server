@@ -53,7 +53,6 @@ def _env_json_file_map(name: str) -> dict[str, str]:
 
 @dataclass
 class Settings:
-    # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
     # Deprecated compatibility setting. Pixel routes always require a v2
@@ -63,13 +62,12 @@ class Settings:
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )
+    wsi_study_mapping_table: str = field(default_factory=lambda: _env_str("WSI_STUDY_MAPPING_TABLE"))
 
-    # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
     aws_access_key_id: str = field(default_factory=lambda: _env_str("AWS_ACCESS_KEY_ID", _aws_profile("aws_access_key_id")))
     aws_secret_access_key: str = field(default_factory=lambda: _env_str("AWS_SECRET_ACCESS_KEY", _aws_profile("aws_secret_access_key")))
 
-    # Tile settings
     tile_size: int = field(default_factory=lambda: _env_int("TILE_SIZE", 256))
     jpeg_quality: int = field(default_factory=lambda: _env_int("JPEG_QUALITY", 85))
     max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 16_777_216))
@@ -178,8 +176,13 @@ class Settings:
     databricks_warehouse_id: str = field(
         default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
     )
-
-    # Block cache
+    use_canonical_association_table: bool = field(
+        default_factory=lambda: _env_bool("USE_CANONICAL_ASSOCIATION_TABLE", True)
+    )
+    allow_legacy_association_fallback: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_LEGACY_ASSOCIATION_FALLBACK", False)
+    )
+    patient_cache_ttl: int = field(default_factory=lambda: _env_int("PATIENT_CACHE_TTL", 86_400))
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
     blockcache_block_size: int = field(default_factory=lambda: _env_int("BLOCKCACHE_BLOCK_SIZE", 8 * 1024 * 1024))
     blockcache_max_bytes: int = field(default_factory=lambda: _env_int("BLOCKCACHE_MAX_BYTES", 0))
@@ -191,7 +194,17 @@ class Settings:
     test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
     test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
 
-    # CORS
+    annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
+    annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
+    keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
+    annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
+    oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
+    agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
+    agent_model: str = field(default_factory=lambda: _env_str("OPENAI_MODEL", "gpt-5.6-terra"))
+    agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
+    agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
+
     cors_origins: list[str] = field(
         default_factory=lambda: _env_csv(
             "CORS_ORIGINS",

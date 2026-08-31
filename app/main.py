@@ -57,6 +57,11 @@ from .metrics import (
     track_image_operation,
     track_thumbnail_fetch,
 )
+from .annotations import init_db as init_annotation_db
+from .annotations import router as annotation_router
+from .agent import init_db as init_agent_db
+from .agent import router as agent_router
+from .oncokb import router as oncokb_router
 from .slides import SlideCache
 from .thumbnail_store import (
     ThumbnailRecord,
@@ -300,6 +305,10 @@ async def lifespan(app: FastAPI):
         settings.max_open_slides,
         settings.aws_endpoint_url or "AWS default",
     )
+    await init_annotation_db()
+    logger.info("Annotation DB ready: %s", settings.annotation_db_path)
+    await init_agent_db()
+    logger.info("Agent audit DB ready: %s", settings.annotation_db_path)
     try:
         yield
     finally:
@@ -321,7 +330,10 @@ app = FastAPI(
 
 @app.middleware("http")
 async def require_wsi_capability(request: Request, call_next):
-    if request.scope["path"] in ("/health", "/ready", "/metrics"):
+    path = request.scope["path"]
+    if path in ("/health", "/wsi/health", "/ready", "/metrics"):
+        return await call_next(request)
+    if path.startswith(("/annotations", "/api/oncokb", "/agent")):
         return await call_next(request)
     # Browser clients send an unauthenticated OPTIONS request before any
     # cross-origin request that includes the Authorization header.  CORS
@@ -358,16 +370,18 @@ async def wsi_namespace(request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
     allow_private_network=True,
     expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason", "Retry-After"],
 )
 
-
 TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Authorization"}
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
 PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
+app.include_router(annotation_router)
+app.include_router(oncokb_router)
+app.include_router(agent_router)
 
 
 async def _in_thread(fn, *args):

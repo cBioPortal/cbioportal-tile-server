@@ -156,3 +156,9 @@ outside the API process and on a schedule. It writes immutable artifacts and
 registry rows; a successful batch must be followed by the Databricks canonical
 refresh, study-file export, and cBioPortal core study import before a slide
 becomes servable.
+
+## Databricks bundles
+
+The root `databricks.yml` manages the nightly WSI summary pipeline. The
+`databricks/lakebase/` bundle provisions the separate Lakebase/Postgres
+annotation store and must remain isolated from the batch SQL job bundle.

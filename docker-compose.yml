@@ -51,6 +51,24 @@ services:
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
 
+      # ── OncoKB — register at oncokb.org/account/settings to get a token ──
+      ONCOKB_API_TOKEN: ${ONCOKB_API_TOKEN:-}
+
+      # ── Annotation API ────────────────────────────────────────────────────
+      ANNOTATION_DATABASE_URL: ${ANNOTATION_DATABASE_URL:-}
+      ANNOTATION_DB_PATH: /data/annotations.db
+      KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
+      ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
+
+      # ── Optional WSI research assistant (server-side only) ───────────────
+      # Keep the API credential in a secret-mounted file or secret manager;
+      # never expose it to the browser or commit it to this repository.
+      WSI_AGENT_ENABLED: ${WSI_AGENT_ENABLED:-false}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      OPENAI_API_KEY_FILE: ${OPENAI_API_KEY_FILE:-}
+      WSI_AGENT_TIMEOUT_SECONDS: ${WSI_AGENT_TIMEOUT_SECONDS:-60}
+      WSI_AGENT_RATE_LIMIT_PER_MINUTE: ${WSI_AGENT_RATE_LIMIT_PER_MINUTE:-10}
+
       # ── Capacity (tune to host RAM; each open SVS ≈ 50–200 MB) ───────────
       MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
       N_WORKERS: ${N_WORKERS:-2}
@@ -66,6 +84,7 @@ services:
       PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-/cache/prometheus}
     volumes:
       - slide_blocks:/cache/slide-blocks
+      - annotation_data:/data
       - ./tests/testdata:/app/testdata:ro
     depends_on:
       redis:
@@ -102,4 +121,5 @@ services:
 
 volumes:
   redis_data:
-  slide_blocks:  # default named volume for BlockCache (override with host mount for NVMe)
+  slide_blocks:      # default named volume for BlockCache (override with host mount for NVMe)
+  annotation_data:   # persistent SQLite annotation database

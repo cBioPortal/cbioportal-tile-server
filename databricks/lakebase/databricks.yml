@@ -1,0 +1,29 @@
+bundle:
+  name: cbioportal-annotations-lakebase
+
+include:
+  - resources/*.yml
+
+variables:
+  project_id:
+    description: Lakebase project ID for cBioPortal annotations.
+    default: cbioportal-annotations-dev
+  project_display_name:
+    description: Human-readable Lakebase project name.
+    default: cBioPortal Annotations Dev
+  branch_id:
+    description: Lakebase branch to deploy for this environment.
+    default: dev
+  endpoint_id:
+    description: Read-write endpoint name for the deployed branch.
+    default: primary
+  service_principal_name:
+    description: Databricks service principal that should manage the project.
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://msk-mode-dev.cloud.databricks.com
+      root_path: ~/.bundle/${bundle.name}/${bundle.target}

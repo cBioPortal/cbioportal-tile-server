@@ -113,6 +113,15 @@ optional Redis cache:
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
+| `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
+| `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
+| `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
+| `ONCOKB_API_TOKEN` | — | Optional OncoKB token for annotation enrichment |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
+| `OPENAI_MODEL` | `gpt-5.6-terra` | Model used by the research assistant |
+| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
+| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
 | `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
 | `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
@@ -157,6 +166,14 @@ docker compose up --build
 
 The compose file is a local rehearsal. Configure the same secret, audience,
 and compatible TTL in cBioPortal and this service.
+
+The optional WSI research assistant is disabled by default. Enable it only in
+an environment with an approved secret manager or a read-only mounted key
+file, set `OPENAI_API_KEY_FILE` to the path visible inside the container, and
+set `WSI_AGENT_ENABLED=true`. The browser receives only the short-lived WSI
+capability; the OpenAI credential stays in the tile-server process. Assistant
+annotation and viewer changes are persisted as pending proposals and require
+explicit approval in the viewer before application.
 
 ## Offline preparation
 
@@ -301,3 +318,9 @@ The repository must provide the `DOCKER_HUB_USERNAME` and
 digest printed by the workflow (`@sha256:...`), not a mutable tag.  The
 workflow does not publish from pull requests or expose registry credentials to
 fork builds.
+
+## Databricks bundles
+
+- Root [databricks.yml](databricks.yml) manages the nightly WSI summary pipeline job.
+- [databricks/lakebase/README.md](databricks/lakebase/README.md) documents the
+  separate Lakebase bundle used to provision annotation storage.
