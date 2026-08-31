@@ -82,10 +82,6 @@ services:
       BLOCKCACHE_MAX_BYTES: ${BLOCKCACHE_MAX_BYTES:-19327352832} # 18 GiB of 20 GiB volume
       BLOCKCACHE_PRUNE_INTERVAL_SECONDS: ${BLOCKCACHE_PRUNE_INTERVAL_SECONDS:-60}
       PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-/cache/prometheus}
-      # ── Annotation API ────────────────────────────────────────────────────
-      ANNOTATION_DB_PATH: /data/annotations.db
-      KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
-      ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
     volumes:
       - slide_blocks:/cache/slide-blocks
       - annotation_data:/data
