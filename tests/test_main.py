@@ -239,6 +239,7 @@ class TestTransientSourceFailures:
         with (
             patch.object(main_module, "_slides", slides),
             patch.object(main_module.SlideCache, "run", side_effect=[error, error]),
+            patch.object(main_module.SlideCache, "run_uncached", side_effect=error),
             patch.object(main_module.SlideCache, "repair", return_value=True),
         ):
             with pytest.raises(main_module.HTTPException) as exc_info:
@@ -268,6 +269,7 @@ class TestTransientSourceFailures:
         with (
             patch.object(main_module, "_slides", slides),
             patch.object(main_module.SlideCache, "run", side_effect=[error]),
+            patch.object(main_module.SlideCache, "run_uncached", side_effect=error),
             patch.object(main_module.SlideCache, "repair", return_value=False),
         ):
             with pytest.raises(main_module.HTTPException) as exc_info:
@@ -277,6 +279,40 @@ class TestTransientSourceFailures:
 
         assert exc_info.value.status_code == 503
         assert exc_info.value.headers["Retry-After"] == "1"
+
+    def test_second_cached_failure_uses_direct_reader(self):
+        slides = object.__new__(main_module.SlideCache)
+        error = ValueError("decoder rejected cached bytes")
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, error]),
+            patch.object(main_module.SlideCache, "run_uncached", return_value=b"jpeg") as direct,
+            patch.object(main_module.SlideCache, "repair", return_value=True),
+        ):
+            result = main_module._run_slide_operation(
+                "s3://bucket/slide.svs",
+                lambda _: None,
+                source_fingerprint="a" * 64,
+            )
+
+        assert result == b"jpeg"
+        direct.assert_called_once()
+
+    def test_fingerprint_is_passed_to_slide_cache_namespace(self):
+        slides = object.__new__(main_module.SlideCache)
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", return_value=b"jpeg") as run,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs",
+                lambda _: None,
+                source_fingerprint="a" * 64,
+            ) == b"jpeg"
+
+        assert run.call_args.kwargs["cache_identity"] == main_module.source_cache_identity(
+            "s3://bucket/slide.svs", "a" * 64
+        )
 
 
 class TestThumbnailFetchRetry:

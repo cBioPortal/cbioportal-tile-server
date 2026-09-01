@@ -16,6 +16,37 @@ def _jpeg_bytes(size: tuple[int, int]) -> bytes:
 
 
 class TestThumbnailStore:
+    def test_prewarm_reads_a_range_after_head(self, monkeypatch):
+        client = MagicMock()
+        body = MagicMock()
+        client.get_object.return_value = {"Body": body}
+        previous_client = thumbnail_store._runtime_s3_client
+        monkeypatch.setattr(thumbnail_store, "_runtime_s3_client", None)
+        monkeypatch.setattr(
+            thumbnail_store, "_new_runtime_s3_client", lambda: client
+        )
+        monkeypatch.setattr(
+            thumbnail_store.settings,
+            "thumbnail_prewarm_uri",
+            "s3://bucket/variants/nav-128x96/slide.jpg",
+        )
+
+        try:
+            thumbnail_store.initialize_runtime_store()
+        finally:
+            thumbnail_store._runtime_s3_client = previous_client
+
+        client.head_object.assert_called_once_with(
+            Bucket="bucket", Key="variants/nav-128x96/slide.jpg"
+        )
+        client.get_object.assert_called_once_with(
+            Bucket="bucket",
+            Key="variants/nav-128x96/slide.jpg",
+            Range="bytes=0-4095",
+        )
+        body.read.assert_called_once_with()
+        body.close.assert_called_once_with()
+
     def test_s3_read_falls_back_to_fsspec_after_direct_client_failure(self, monkeypatch):
         record = thumbnail_store.ThumbnailRecord(
             image_id="2907269",

@@ -46,7 +46,12 @@ def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     return bucket, key, s3_opts()
 
 
-def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
+def open_slide(
+    slide_id: str,
+    logger: Any,
+    cache_identity: str | None = None,
+    use_block_cache: bool = True,
+) -> tuple[TiffSlide, Any]:
     """
     Open a TiffSlide and return (slide, fileobj).
 
@@ -56,7 +61,7 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        cache_dir = cache_directory_for_slide(slide_id)
+        cache_dir = cache_directory_for_slide(slide_id, cache_identity) if use_block_cache else None
         if cache_dir is not None:
             cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)

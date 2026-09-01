@@ -169,7 +169,7 @@ def get_blockcache_manager() -> BlockCacheManager:
         return _manager
 
 
-def cache_directory_for_slide(slide_id: str) -> Path | None:
+def cache_directory_for_slide(slide_id: str, cache_identity: str | None = None) -> Path | None:
     """Return a process-private cache directory for an S3 slide.
 
     fsspec's block-cache metadata is mutable and is not a multi-process store.
@@ -178,27 +178,28 @@ def cache_directory_for_slide(slide_id: str) -> Path | None:
     """
     if not settings.blockcache_path or not slide_id.startswith("s3://"):
         return None
-    digest = hashlib.sha256(slide_id.encode("utf-8")).hexdigest()
+    namespace = cache_identity or slide_id
+    digest = hashlib.sha256(namespace.encode("utf-8")).hexdigest()
     name = f"b{settings.blockcache_block_size}-p{os.getpid()}-{digest}"
     return Path(settings.blockcache_path) / name
 
 
-def cache_lease_for_slide(slide_id: str):
-    cache_dir = cache_directory_for_slide(slide_id)
+def cache_lease_for_slide(slide_id: str, cache_identity: str | None = None):
+    cache_dir = cache_directory_for_slide(slide_id, cache_identity)
     if cache_dir is None:
         return None
     return get_blockcache_manager().lease(cache_dir)
 
 
-def touch_slide_cache(slide_id: str) -> None:
-    cache_dir = cache_directory_for_slide(slide_id)
+def touch_slide_cache(slide_id: str, cache_identity: str | None = None) -> None:
+    cache_dir = cache_directory_for_slide(slide_id, cache_identity)
     if cache_dir is None:
         return
     get_blockcache_manager().touch(cache_dir)
 
 
-def purge_slide_cache(slide_id: str) -> bool:
-    cache_dir = cache_directory_for_slide(slide_id)
+def purge_slide_cache(slide_id: str, cache_identity: str | None = None) -> bool:
+    cache_dir = cache_directory_for_slide(slide_id, cache_identity)
     if cache_dir is None:
         return False
     return get_blockcache_manager().purge(cache_dir)

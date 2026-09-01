@@ -55,6 +55,9 @@ def _env_json_file_map(name: str) -> dict[str, str]:
 class Settings:
     # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
+    wsi_auth_previous_secret: str = field(
+        default_factory=lambda: _env_str("WSI_AUTH_PREVIOUS_SECRET")
+    )
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
     # Deprecated compatibility setting. Pixel routes always require a v2
     # capability; this value is intentionally ignored by app.main.
@@ -120,6 +123,9 @@ class Settings:
     )
     thumbnail_prewarm_uri: str = field(
         default_factory=lambda: _env_str("THUMBNAIL_PREWARM_URI")
+    )
+    thumbnail_prewarm_required: bool = field(
+        default_factory=lambda: _env_bool("THUMBNAIL_PREWARM_REQUIRED", False)
     )
 
     # Redis tile cache

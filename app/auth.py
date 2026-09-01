@@ -16,6 +16,22 @@ def source_digest(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def source_cache_identity(source: str, source_fingerprint: str | None = None) -> str:
+    """Return a stable cache namespace for one published source version.
+
+    The URL is still the authorization binding.  The optional serving-manifest
+    fingerprint additionally distinguishes replacements of the object at the
+    same URL, which prevents Redis and local block-cache entries from serving
+    bytes certified for an older source version.
+    """
+    fingerprint = (source_fingerprint or "").strip()
+    if not fingerprint:
+        return source_digest(source)
+    return hashlib.sha256(
+        f"{source_digest(source)}\0{fingerprint}".encode("utf-8")
+    ).hexdigest()
+
+
 def _b64decode(value: str) -> bytes:
     try:
         return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
@@ -74,6 +90,14 @@ def validate_wsi_token(
         value = payload.get(claim)
         if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
             raise InvalidWsiToken("invalid token source binding")
+    for claim in ("tile_source_fingerprint", "thumbnail_source_fingerprint"):
+        value = payload.get(claim)
+        if value is not None and (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise InvalidWsiToken("invalid token source fingerprint")
     for claim in ("thumbnail_width", "thumbnail_height"):
         value = payload.get(claim)
         if type(value) is not int or value <= 0 or value > 8192:
