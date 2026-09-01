@@ -257,6 +257,7 @@ class TestBatchSafety:
             rendered_at="2026-08-03T00:00:00+00:00",
             error_message="",
             manifest_version="v1",
+            source_fingerprint=module.source_fingerprint(row),
         )
         artifact = {
             "image_id": row.image_id,
@@ -284,6 +285,47 @@ class TestBatchSafety:
 
         upgrade.assert_called_once()
         render.assert_not_called()
+
+    def test_null_fingerprint_forces_rerender(self, tmp_path):
+        row = _inventory("1492807", "s3://bucket/1492807.svs")
+        existing = module.RegistryRow(
+            image_id=row.image_id,
+            source_path=row.path,
+            artifact_uri="s3://thumbs/1492807.jpg",
+            width=1024,
+            height=768,
+            content_type="image/jpeg",
+            status="success",
+            rendered_at="2026-08-03T00:00:00+00:00",
+            error_message="",
+            manifest_version="v1",
+        )
+        artifact = {
+            "image_id": row.image_id,
+            "source_path": row.path,
+            "artifact_uri": existing.artifact_uri,
+            "width": existing.width,
+            "height": existing.height,
+            "content_type": existing.content_type,
+            "tile_metadata_json": _tile_metadata(row),
+        }
+        with (
+            patch.object(module, "_artifact_exists", return_value=True),
+            patch.object(module, "_build_metadata_only_record") as upgrade,
+            patch.object(module, "_render_candidate_artifact_subprocess", return_value=artifact) as render,
+        ):
+            module.process_candidate_rows(
+                warehouse_id="warehouse",
+                root_uri="s3://thumbs",
+                master_size=1024,
+                rows=[row],
+                manifest_version="v2",
+                result_path=str(tmp_path / "result.jsonl"),
+                registry_rows=[existing],
+            )
+
+        upgrade.assert_not_called()
+        render.assert_called_once()
 
     def test_task_audit_rejects_partial_results(self, tmp_path):
         records = [_result_record("1492807", "s3://bucket/1492807.svs")]
@@ -511,6 +553,60 @@ class TestDeltaSelection:
             retry_failures_only=True,
         ) == inventory
 
+    def test_legacy_metadata_is_regenerated(self):
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
+        metadata = json.loads(_tile_metadata(inventory[0]))
+        metadata.pop("tile_metadata_schema_version")
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path="s3://bucket/a.svs",
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=json.dumps(metadata),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
+            )
+        ]
+
+        assert module._select_candidate_rows(
+            inventory,
+            registry,
+            retry_failures_only=False,
+        ) == inventory
+
+    def test_malformed_current_metadata_is_regenerated(self):
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
+        metadata = json.loads(_tile_metadata(inventory[0]))
+        metadata["level_dimensions"] = []
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path="s3://bucket/a.svs",
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=json.dumps(metadata),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
+            )
+        ]
+
+        assert module._select_candidate_rows(
+            inventory,
+            registry,
+            retry_failures_only=False,
+        ) == inventory
+
     def test_default_mode_skips_existing_failed_rows(self):
         inventory = [_inventory("1492808", "s3://bucket/b.svs")]
         registry = [
@@ -621,6 +717,41 @@ class TestManifestBuild:
         )
 
         assert list(manifest["slides"]) == ["1492807"]
+
+    def test_manifest_rejects_null_fingerprint_rows(self):
+        inventory = [_inventory("1492807", "s3://bucket/a.svs")]
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=inventory[0].path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=json.dumps(
+                    {
+                        "dimensions": {"width": 4096, "height": 4096},
+                        "levels": 1,
+                        "level_dimensions": [{"width": 4096, "height": 4096}],
+                        "level_downsamples": [1.0],
+                        "max_zoom": 4,
+                        "tile_size": 256,
+                        "safe_min_level": 1,
+                        "tile_metadata_schema_version": module.TILE_METADATA_SCHEMA_VERSION,
+                        "decode_policy_version": module.decode_policy_version(),
+                        "max_decode_pixels": module.settings.max_decode_pixels,
+                        "thumbnail_max_decode_pixels": module.settings.thumbnail_max_decode_pixels,
+                    }
+                ),
+                source_fingerprint=None,
+            )
+        ]
+
+        assert module._successful_registry_for_inventory(inventory, registry) == []
 
     def test_manifest_rejects_stale_source_and_decode_policy(self):
         inventory = [_inventory("1492807", "s3://bucket/a.svs")]
