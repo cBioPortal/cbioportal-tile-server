@@ -16,6 +16,7 @@ import random
 import time
 import traceback
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from urllib.parse import urlparse
 
 from botocore.exceptions import (
@@ -24,14 +25,15 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
     HTTPClientError,
 )
-from fsspec.exceptions import BlocksizeMismatchError
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fsspec.exceptions import BlocksizeMismatchError
 from tifffile import TiffFileError
 
 from . import cache as tile_cache
 from .auth import (
     InvalidWsiToken,
+    source_cache_identity,
     source_digest,
     validate_wsi_auth_configuration,
     validate_wsi_token,
@@ -239,11 +241,16 @@ def _traceback_frames(exc: BaseException) -> str:
     )
 
 
-def _attempt_slide_cache_repair(source: str, exc: Exception) -> bool:
+def _attempt_slide_cache_repair(
+    source: str, exc: Exception, cache_identity: str | None = None
+) -> bool:
     if not isinstance(_slides, SlideCache):
         return False
     try:
-        repaired = _slides.repair(source)
+        if cache_identity:
+            repaired = _slides.repair(source, cache_identity)
+        else:
+            repaired = _slides.repair(source)
     except Exception as repair_exc:  # noqa: BLE001 - preserve the original failure
         logger.error(
             "Slide cache repair failed; source_digest=%s error_type=%s repair_error_type=%s",
@@ -297,7 +304,16 @@ async def lifespan(app: FastAPI):
     try:
         await _in_thread(initialize_runtime_store)
     except Exception as exc:
-        logger.warning("Thumbnail S3 client prewarm failed; using lazy initialization: %s", type(exc).__name__)
+        if settings.thumbnail_prewarm_required:
+            logger.error(
+                "Required thumbnail object-store prewarm failed; refusing readiness: error_type=%s",
+                type(exc).__name__,
+            )
+            raise
+        logger.warning(
+            "Thumbnail S3 client prewarm failed; using lazy initialization: %s",
+            type(exc).__name__,
+        )
     blockcache_manager = get_blockcache_manager()
     blockcache_task = None
     if blockcache_manager.enabled:
@@ -356,7 +372,22 @@ async def require_wsi_capability(request: Request, call_next):
             settings.wsi_auth_max_ttl,
         )
     except InvalidWsiToken:
-        return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        if not settings.wsi_auth_previous_secret:
+            return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+        try:
+            claims = validate_wsi_token(
+                authorization[7:].strip(),
+                settings.wsi_auth_previous_secret,
+                settings.wsi_auth_audience,
+                settings.wsi_auth_max_ttl,
+            )
+        except InvalidWsiToken:
+            # Preserve the same response for an invalid token regardless of
+            # which configured key was attempted.
+            return Response(
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
     if claims.get("wsi_auth_version") != 2:
         return Response(status_code=403, content="slide-scoped capability is required")
     request.state.wsi_claims = claims
@@ -513,14 +544,29 @@ def _source_from_request(request: Request, query_source: str | None) -> str:
     return header_source or query_source
 
 
-def _run_slide_operation(source: str, operation, *args):
+def _run_slide_operation(
+    source: str,
+    operation,
+    *args,
+    source_fingerprint: str | None = None,
+):
+    cache_identity = source_cache_identity(source, source_fingerprint)
+    cache_namespace = cache_identity if source_fingerprint else None
     repair_attempted = False
+    direct_attempted = False
     while True:
         try:
             if not isinstance(_slides, SlideCache):
                 raise RuntimeError("slide cache is not initialized")
-            result = _slides.run(source, operation, *args)
-            if repair_attempted:
+            if direct_attempted:
+                result = _slides.run_uncached(source, operation, *args)
+            elif source_fingerprint:
+                result = _slides.run(
+                    source, operation, *args, cache_identity=cache_identity
+                )
+            else:
+                result = _slides.run(source, operation, *args)
+            if repair_attempted or direct_attempted:
                 SLIDE_CACHE_REPAIRS.labels(
                     outcome="recovered", error_type="reopened"
                 ).inc()
@@ -529,33 +575,26 @@ def _run_slide_operation(source: str, operation, *args):
             raise HTTPException(status_code=404, detail="source slide not found")
         except (HTTPException, OverviewTooLarge, InvalidTileRequest):
             raise
-        except BlocksizeMismatchError as exc:
-            if not repair_attempted:
-                repair_attempted = True
-                if _attempt_slide_cache_repair(source, exc):
-                    continue
-            if repair_attempted:
-                SLIDE_CACHE_REPAIRS.labels(
-                    outcome="failed", error_type=type(exc).__name__
-                ).inc()
-                raise HTTPException(
-                    status_code=503,
-                    headers={"Retry-After": "1"},
-                    detail="Slide cache repair did not recover the source",
-                ) from exc
-            SLIDE_OPERATION_ERRORS.labels(error_type=type(exc).__name__).inc()
-            logger.error(
-                "Slide operation failed; source_digest=%s error_type=%s stack=%s",
-                source_digest(source)[:16],
-                type(exc).__name__,
-                _traceback_frames(exc),
-            )
-            raise HTTPException(status_code=500, detail="Slide operation failed") from exc
         except Exception as exc:
             if not repair_attempted and _is_cache_repairable_slide_error(exc):
                 repair_attempted = True
-                if _attempt_slide_cache_repair(source, exc):
+                if _attempt_slide_cache_repair(source, exc, cache_namespace):
                     continue
+            if (
+                repair_attempted
+                and not direct_attempted
+                and _is_cache_repairable_slide_error(exc)
+            ):
+                direct_attempted = True
+                SLIDE_CACHE_REPAIRS.labels(
+                    outcome="direct-fallback", error_type=type(exc).__name__
+                ).inc()
+                logger.warning(
+                    "Retrying slide operation with direct object-store reader; source_digest=%s error_type=%s",
+                    source_digest(source)[:16],
+                    type(exc).__name__,
+                )
+                continue
             if repair_attempted:
                 SLIDE_CACHE_REPAIRS.labels(
                     outcome="failed", error_type=type(exc).__name__
@@ -587,9 +626,22 @@ def _run_slide_operation(source: str, operation, *args):
             raise HTTPException(status_code=500, detail="Slide operation failed") from exc
 
 
-async def _run_slide_image_operation(source: str, operation, *args, operation_kind: str = "image"):
+async def _run_slide_image_operation(
+    source: str,
+    operation,
+    *args,
+    operation_kind: str = "image",
+    source_fingerprint: str | None = None,
+):
     return await _run_image_operation(
-        _run_slide_operation, source, operation, *args, operation_kind=operation_kind
+        partial(
+            _run_slide_operation,
+            source,
+            operation,
+            *args,
+            source_fingerprint=source_fingerprint,
+        ),
+        operation_kind=operation_kind,
     )
 
 
@@ -695,14 +747,21 @@ async def tile(
 ):
     source = _source_from_request(request, source)
     source, claims = _authorize_source(request, source, "tile")
-    cache_key = source_digest(source)
+    source_fingerprint = claims.get("tile_source_fingerprint")
+    cache_key = source_cache_identity(source, source_fingerprint)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=TILE_CACHE_HEADERS)
 
     async def _build_tile():
         image_bytes = await _run_slide_image_operation(
-            source, get_tile_bytes, z, x, y, operation_kind="tile"
+            source,
+            get_tile_bytes,
+            z,
+            x,
+            y,
+            operation_kind="tile",
+            source_fingerprint=source_fingerprint,
         )
         await tile_cache.set_tile(cache_key, z, x, y, image_bytes)
         return image_bytes
@@ -749,14 +808,15 @@ async def thumbnail(
     source, claims = _authorize_source(request, source, "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
-    cache_key = source_digest(source)
+    source_fingerprint = claims.get("thumbnail_source_fingerprint")
+    cache_key = source_cache_identity(source, source_fingerprint)
     cached = await tile_cache.get_thumbnail(cache_key, width, height)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
         record = ThumbnailRecord(
-            image_id=source_digest(source),
+            image_id=cache_key,
             uri=source,
             width=claims["thumbnail_width"],
             height=claims["thumbnail_height"],

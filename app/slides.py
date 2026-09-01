@@ -83,25 +83,30 @@ class SlideCache:
         self._opening: dict[str, _OpenState] = {}
         self._repairing: set[str] = set()
 
-    def _acquire(self, slide_id: str) -> _CacheEntry:
+    @staticmethod
+    def _cache_key(slide_id: str, cache_identity: str | None) -> str:
+        return cache_identity or slide_id
+
+    def _acquire(self, slide_id: str, cache_identity: str | None = None) -> _CacheEntry:
+        cache_key = self._cache_key(slide_id, cache_identity)
         while True:
             opener: _OpenState | None = None
             evicted: _CacheEntry | None = None
             is_owner = False
             with self._condition:
-                if slide_id in self._repairing:
+                if cache_key in self._repairing:
                     self._condition.wait()
                     continue
-                cached = self._cache.get(slide_id)
+                cached = self._cache.get(cache_key)
                 if cached is not None:
                     if cached.active:
                         self._condition.wait()
                         continue
                     cached.active = True
-                    self._cache.move_to_end(slide_id)
+                    self._cache.move_to_end(cache_key)
                     return cached
 
-                opener = self._opening.get(slide_id)
+                opener = self._opening.get(cache_key)
                 if opener is not None:
                     # Wait outside the condition so the opener can publish its
                     # result and wake all waiters.
@@ -121,7 +126,7 @@ class SlideCache:
                         _, evicted = self._cache.popitem(last=False)
 
                     opener = _OpenState(event=threading.Event())
-                    self._opening[slide_id] = opener
+                    self._opening[cache_key] = opener
                     is_owner = True
 
             if opener is not None and not is_owner:
@@ -133,19 +138,24 @@ class SlideCache:
             if evicted is not None:
                 _close_entry(evicted.entry)
 
-            cache_lease = cache_lease_for_slide(slide_id)
+            cache_lease = cache_lease_for_slide(slide_id, cache_identity)
             started = time.perf_counter()
             try:
                 try:
                     if cache_lease is not None:
                         cache_lease.__enter__()
-                    slide, fileobj = _open_slide(slide_id, log)
+                    if cache_identity:
+                        slide, fileobj = _open_slide(
+                            slide_id, log, cache_identity=cache_identity
+                        )
+                    else:
+                        slide, fileobj = _open_slide(slide_id, log)
                 except BaseException as exc:
                     SLIDE_OPEN_ERRORS.labels(error_type=type(exc).__name__).inc()
                     if cache_lease is not None:
                         cache_lease.__exit__(type(exc), exc, exc.__traceback__)
                     with self._condition:
-                        state = self._opening.pop(slide_id, None)
+                        state = self._opening.pop(cache_key, None)
                         if state is not None:
                             state.error = exc
                             state.event.set()
@@ -153,13 +163,13 @@ class SlideCache:
                     raise
 
                 with self._condition:
-                    state = self._opening.pop(slide_id, None)
+                    state = self._opening.pop(cache_key, None)
                     cached = _CacheEntry(
                         _Entry(slide=slide, fileobj=fileobj, cache_lease=cache_lease),
                         active=True,
                     )
-                    self._cache[slide_id] = cached
-                    touch_slide_cache(slide_id)
+                    self._cache[cache_key] = cached
+                    touch_slide_cache(slide_id, cache_identity)
                     self._condition.notify_all()
                     if state is not None:
                         state.event.set()
@@ -167,65 +177,82 @@ class SlideCache:
             finally:
                 SLIDE_OPEN_SECONDS.observe(time.perf_counter() - started)
 
-    def _release(self, slide_id: str, entry: _CacheEntry) -> None:
+    def _release(self, slide_id: str, entry: _CacheEntry, cache_identity: str | None = None) -> None:
+        cache_key = self._cache_key(slide_id, cache_identity)
         with self._condition:
-            current = self._cache.get(slide_id)
+            current = self._cache.get(cache_key)
             if current is entry:
                 entry.active = False
-                self._cache.move_to_end(slide_id)
-                touch_slide_cache(slide_id)
+                self._cache.move_to_end(cache_key)
+                touch_slide_cache(slide_id, cache_identity)
             self._condition.notify_all()
 
     @contextmanager
-    def lease(self, slide_id: str) -> Iterator[TiffSlide]:
-        cached = self._acquire(slide_id)
+    def lease(self, slide_id: str, cache_identity: str | None = None) -> Iterator[TiffSlide]:
+        cached = self._acquire(slide_id, cache_identity)
         try:
             yield cached.entry.slide
         finally:
-            self._release(slide_id, cached)
+            self._release(slide_id, cached, cache_identity)
 
-    def run(self, slide_id: str, operation: Callable[..., T], *args) -> T:
-        with self.lease(slide_id) as slide:
+    def run(
+        self,
+        slide_id: str,
+        operation: Callable[..., T],
+        *args,
+        cache_identity: str | None = None,
+    ) -> T:
+        with self.lease(slide_id, cache_identity) as slide:
             return operation(slide, *args)
 
-    def get(self, slide_id: str) -> TiffSlide:
+    def get(self, slide_id: str, cache_identity: str | None = None) -> TiffSlide:
         """Compatibility helper; callers performing work should use ``run``."""
-        cached = self._acquire(slide_id)
-        self._release(slide_id, cached)
+        cached = self._acquire(slide_id, cache_identity)
+        self._release(slide_id, cached, cache_identity)
         return cached.entry.slide
 
-    def invalidate(self, slide_id: str) -> bool:
+    def invalidate(self, slide_id: str, cache_identity: str | None = None) -> bool:
+        cache_key = self._cache_key(slide_id, cache_identity)
         entry = None
         with self._condition:
-            cached = self._cache.get(slide_id)
+            cached = self._cache.get(cache_key)
             if cached is not None and not cached.active:
-                entry = self._cache.pop(slide_id)
+                entry = self._cache.pop(cache_key)
                 self._condition.notify_all()
         if entry is not None:
             _close_entry(entry.entry)
             return True
         return False
 
-    def repair(self, slide_id: str) -> bool:
+    def repair(self, slide_id: str, cache_identity: str | None = None) -> bool:
         """Evict one idle handle and its worker-private block cache."""
+        cache_key = self._cache_key(slide_id, cache_identity)
         with self._condition:
-            while slide_id in self._opening:
+            while cache_key in self._opening:
                 self._condition.wait()
-            cached = self._cache.get(slide_id)
+            cached = self._cache.get(cache_key)
             if cached is not None and cached.active:
                 return False
-            self._repairing.add(slide_id)
-            entry = self._cache.pop(slide_id, None)
+            self._repairing.add(cache_key)
+            entry = self._cache.pop(cache_key, None)
             self._condition.notify_all()
         try:
             if entry is not None:
                 _close_entry(entry.entry)
-            purge_slide_cache(slide_id)
+            purge_slide_cache(slide_id, cache_identity)
             return True
         finally:
             with self._condition:
-                self._repairing.discard(slide_id)
+                self._repairing.discard(cache_key)
                 self._condition.notify_all()
+
+    def run_uncached(self, slide_id: str, operation: Callable[..., T], *args) -> T:
+        """Run one operation with a fresh direct object-store reader."""
+        slide, fileobj = _open_slide(slide_id, log, use_block_cache=False)
+        try:
+            return operation(slide, *args)
+        finally:
+            _close_entry(_Entry(slide=slide, fileobj=fileobj))
 
     def close_all(self) -> None:
         with self._condition:

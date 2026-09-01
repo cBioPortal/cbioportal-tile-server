@@ -164,6 +164,12 @@ def initialize_runtime_store() -> None:
     if prewarm_uri:
         bucket, key = _s3_location(prewarm_uri)
         client.head_object(Bucket=bucket, Key=key)
+        response = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-4095")
+        body = response["Body"]
+        try:
+            body.read()
+        finally:
+            body.close()
 
 
 def close_runtime_store() -> None:

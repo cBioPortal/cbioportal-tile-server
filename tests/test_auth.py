@@ -8,6 +8,7 @@ import pytest
 
 from app.auth import (
     InvalidWsiToken,
+    source_cache_identity,
     source_digest,
     validate_wsi_auth_configuration,
     validate_wsi_token,
@@ -65,6 +66,32 @@ def test_valid_wsi_token():
     assert validate_wsi_token(
         make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
     )["sub"] == "user@example.org"
+
+
+def test_source_cache_identity_changes_when_manifest_fingerprint_changes():
+    source = "s3://slides/slide-a.svs"
+    assert source_cache_identity(source) == source_digest(source)
+    assert source_cache_identity(source, "a" * 64) != source_cache_identity(source, "b" * 64)
+    assert source_cache_identity(source, "a" * 64) == source_cache_identity(source, "a" * 64)
+
+
+def test_source_fingerprint_is_optional_for_legacy_v2_tokens():
+    secret = "s" * 32
+    claims = validate_wsi_token(
+        make_token(secret, **valid_claims()), secret, "cbioportal-wsi"
+    )
+    assert "tile_source_fingerprint" not in claims
+
+
+@pytest.mark.parametrize("claim", ["tile_source_fingerprint", "thumbnail_source_fingerprint"])
+def test_malformed_source_fingerprint_is_rejected(claim):
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken):
+        validate_wsi_token(
+            make_token(secret, **valid_claims(**{claim: "not-a-fingerprint"})),
+            secret,
+            "cbioportal-wsi",
+        )
 
 
 @pytest.mark.parametrize(

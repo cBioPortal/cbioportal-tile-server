@@ -88,6 +88,7 @@ optional Redis cache:
 | `AWS_ACCESS_KEY_ID` | — | Object-store access key |
 | `AWS_SECRET_ACCESS_KEY` | — | Object-store secret key |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with cBioPortal |
+| `WSI_AUTH_PREVIOUS_SECRET` | — | Optional prior secret during a bounded signing-key rotation |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
@@ -100,6 +101,7 @@ optional Redis cache:
 | `THUMBNAIL_S3_READ_TIMEOUT_SEC` | `5` | S3 object-read timeout |
 | `THUMBNAIL_S3_MAX_ATTEMPTS` | `2` | S3 client retry limit |
 | `THUMBNAIL_PREWARM_URI` | — | Optional stable thumbnail object used to prewarm each worker |
+| `THUMBNAIL_PREWARM_REQUIRED` | `false` | Refuse startup when the prewarm object cannot be read |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `16777216` | Maximum on-demand tile decode |
