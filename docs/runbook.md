@@ -35,8 +35,8 @@ WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
 WSI_AUTH_AUDIENCE=cbioportal-wsi
 WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
-WSI_ALLOWED_SOURCE_PREFIXES=s3://mskmind-bkt/reef-slides/,s3://pathology/CRC_21-167/slides/,s3://pathology/CRC_21-167/crc_slides/,s3://pathology/CART_19-373/,s3://pathology/BR_20-226/slides/
-WSI_ALLOWED_THUMBNAIL_PREFIXES=s3://mskmind-bkt/wsi-thumbnails/
+WSI_ALLOWED_SOURCE_PREFIXES=<approved source URI prefixes>
+WSI_ALLOWED_THUMBNAIL_PREFIXES=<approved thumbnail URI prefixes>
 REDIS_URL=<password-protected Redis URL>
 ```
 

@@ -21,10 +21,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PRIVATE_DIR="${PRIVATE_DIR:-$REPO_ROOT/../private/automation_tool_datasets}"
 BASE_URL="${BASE_URL:-https://slides.cbioportal.org}"
-# Publication is fail-closed: the batch exporter must have the same URI
-# allowlists as the online tile service.
-export WSI_ALLOWED_SOURCE_PREFIXES="${WSI_ALLOWED_SOURCE_PREFIXES:-s3://mskmind-bkt/reef-slides/,s3://pathology/CRC_21-167/slides/,s3://pathology/CRC_21-167/crc_slides/,s3://pathology/CART_19-373/,s3://pathology/BR_20-226/slides/}"
-export WSI_ALLOWED_THUMBNAIL_PREFIXES="${WSI_ALLOWED_THUMBNAIL_PREFIXES:-s3://mskmind-bkt/wsi-thumbnails/}"
+# Publication is fail-closed: the batch exporter must use the same URI
+# allowlists as the online tile service. Keep the values deployment-specific;
+# this generic script must not silently publish against an institution's
+# object-store namespace.
+: "${WSI_ALLOWED_SOURCE_PREFIXES:?WSI_ALLOWED_SOURCE_PREFIXES must be set}"
+: "${WSI_ALLOWED_THUMBNAIL_PREFIXES:?WSI_ALLOWED_THUMBNAIL_PREFIXES must be set}"
+export WSI_ALLOWED_SOURCE_PREFIXES WSI_ALLOWED_THUMBNAIL_PREFIXES
 DRY_RUN=""
 LOG_FILE="$REPO_ROOT/docs/migration_$(date +%Y%m%d_%H%M%S).log"
 

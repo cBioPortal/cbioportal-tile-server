@@ -11,6 +11,21 @@ from urllib.parse import unquote, urlsplit
 _ABSOLUTE_DATE = re.compile(
     r"(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)"
 )
+_MONTH_FIRST_DATE = re.compile(
+    r"(?<!\d)(?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])[-_/](?:19|20)\d{2}(?!\d)"
+)
+_DAY_FIRST_DATE = re.compile(
+    r"(?<!\d)(?:0?[1-9]|[12]\d|3[01])[-_/](?:0?[1-9]|1[0-2])[-_/](?:19|20)\d{2}(?!\d)"
+)
+_NAMED_MONTH_DATE = re.compile(
+    r"(?i)(?<![a-z0-9])(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|"
+    r"may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+    r"nov(?:ember)?|dec(?:ember)?)\s+(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?"
+    r"(?:,)?\s+(?:19|20)\d{2}|(?:0?[1-9]|[12]\d|3[01])[-/\s]+"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)[-/\s]+(?:19|20)\d{2})(?![a-z0-9])"
+)
 _COMPACT_DATE = re.compile(r"(?<!\d)(?:19|20)\d{6}(?!\d)")
 _LABELLED_MRN = re.compile(r"(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}")
 _URI_EXTENSION = {
@@ -77,6 +92,18 @@ def _text(value: object) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _contains_absolute_date(value: str) -> bool:
+    return any(
+        pattern.search(value)
+        for pattern in (
+            _ABSOLUTE_DATE,
+            _MONTH_FIRST_DATE,
+            _DAY_FIRST_DATE,
+            _NAMED_MONTH_DATE,
+        )
+    )
+
+
 def _assert_safe_text(field: str, value: object) -> None:
     text = _text(value)
     normalized_field = re.sub(r"[^a-z0-9]+", "_", field.lower()).strip("_")
@@ -91,7 +118,7 @@ def _assert_safe_text(field: str, value: object) -> None:
         return
     if _LABELLED_MRN.search(text):
         raise DeidViolation(f"labelled MRN in {field}")
-    if _ABSOLUTE_DATE.search(text) or _COMPACT_DATE.search(text):
+    if _contains_absolute_date(text) or _COMPACT_DATE.search(text):
         raise DeidViolation(f"absolute date in {field}")
 
 
@@ -172,8 +199,8 @@ def validate_artifact_uri(
     # user-controlled query or path traversal.
     lowered = (value + " " + decoded_path).lower()
     if (
-        _ABSOLUTE_DATE.search(value)
-        or _ABSOLUTE_DATE.search(decoded_path)
+        _contains_absolute_date(value)
+        or _contains_absolute_date(decoded_path)
         or _COMPACT_DATE.search(value)
         or _COMPACT_DATE.search(decoded_path)
         or _LABELLED_MRN.search(value)

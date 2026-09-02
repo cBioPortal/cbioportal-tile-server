@@ -3,6 +3,15 @@ import pytest
 from app.deid import DeidViolation, validate_artifact_uri, validate_timeline_public_row, validate_wsi_public_row
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["2021-03-14", "03/14/2021", "14/03/2021", "March 14, 2021", "14 March 2021"],
+)
+def test_public_wsi_row_rejects_common_absolute_date_formats(value):
+    with pytest.raises(DeidViolation):
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "PATH_DX_TITLE": value})
+
+
 def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
