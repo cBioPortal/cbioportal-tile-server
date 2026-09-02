@@ -8,6 +8,7 @@ from tools.materialize_dev_wsi_snapshot import (
     _literal,
     _load_registry,
     _namespace,
+    _read_registry_records,
     _source_rows,
     _validate_registry_artifacts,
     _validate_manifest_uri,
@@ -54,6 +55,7 @@ def test_dev_materializer_keeps_canonical_and_raw_stain_fields():
     assert "REGEXP_REPLACE(LOWER(COALESCE(stain_name_clean" in source
     assert "stain_name_key = 'sslhe'" in source
     assert "stain_name_key LIKE '%fish%'" in source
+    assert "hydrate_rows" in source
 
 
 def test_dev_materializer_does_not_publish_thumbnail_variants():
@@ -182,3 +184,13 @@ def test_manifest_rows_require_current_complete_successes():
     complete = _complete_registry_rows(source_rows, registry_rows)
 
     assert [row.image_id for row in complete] == ["1"]
+
+
+def test_registry_reader_rejects_duplicate_image_ids(tmp_path):
+    path = tmp_path / "registry.jsonl"
+    path.write_text(
+        '{"image_id":"slide-1"}\n{"image_id":"slide-1"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate image_id slide-1"):
+        _read_registry_records(path)

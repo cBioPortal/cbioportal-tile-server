@@ -66,6 +66,15 @@ class Settings:
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )
+    # URI prefixes are an additional publication/privacy boundary. Keep these
+    # empty for generic local development; production deployments must set
+    # both allowlists explicitly before serving tiles.
+    wsi_allowed_source_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_PREFIXES", "")
+    )
+    wsi_allowed_thumbnail_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_THUMBNAIL_PREFIXES", "")
+    )
 
     # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))

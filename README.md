@@ -39,14 +39,19 @@ handlers. The production sequence is:
    manifest-versioned prefix and publishes their serving pointers. The first
    run adds the serving-pointer columns to the existing registry; reruns are
    idempotent.
-4. The Databricks canonical-association job joins the source path to the
-   latest successful registry row and computes `can_serve_tiles`. The
-   canonical job must run only after the thumbnail batch has completed for the
-   input inventory (use a job dependency or completion watermark).
+4. The PDM Databricks WSI bundle publishes the serving manifest, then computes
+   canonical associations and `can_serve_tiles`. The bundle must run only
+   after the thumbnail batch has completed for the input inventory (use a job
+   dependency or completion watermark).
 5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
-   dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`.
-6. cBioPortal core imports that complete snapshot and is the sole ClickHouse
-   writer.
+   dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`, and writes
+   the standard pathology timeline pair with procedure offsets and provenance.
+   Every canonical slide with an available timeline date is represented;
+   explicitly classified non-H&E/IHC slides use the `Other` timeline subtype
+   and an all-slides linkout. Rows without a usable timeline date remain in
+   the WSI hierarchy but cannot be placed on the timeline.
+6. cBioPortal core imports the WSI snapshot and timeline files through the
+   standard study importer and is the sole ClickHouse writer.
 
 The frontend is read-only: it requests the backend access bundle and then
 requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes
@@ -61,7 +66,7 @@ remediation.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Public liveness probe |
-| GET | `/ready` | Public readiness probe (auth configuration only) |
+| GET | `/ready` | Public readiness probe (auth and artifact-policy configuration) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
 | GET | `/tiles/zxy/{z}/{x}/{y}?source=...` | Source-bound JPEG tile |
 | GET | `/thumbnails?source=...&width=...&height=...` | Source-bound thumbnail resize |
@@ -92,6 +97,8 @@ optional Redis cache:
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
+| `WSI_ALLOWED_SOURCE_PREFIXES` | empty | Comma-separated approved source URI prefixes; required for publication |
+| `WSI_ALLOWED_THUMBNAIL_PREFIXES` | empty | Comma-separated approved thumbnail URI prefixes; required for publication |
 | `REDIS_URL` | `redis://redis:6379` | Optional tile/thumbnail cache |
 | `THUMBNAIL_FETCH_CONCURRENCY` | `8` | Per-worker concurrent thumbnail object fetches |
 | `THUMBNAIL_FETCH_MAX_ATTEMPTS` | `2` | Total object-store read attempts per thumbnail request |
@@ -162,7 +169,7 @@ and compatible TTL in cBioPortal and this service.
 
 ## Offline preparation
 
-The backend data pipeline publishes one WSI release containing hierarchy rows
+The backend data pipeline publishes one WSI snapshot containing hierarchy rows
 plus the pixel contract fields (`source_url`, `tile_metadata_json`,
 `thumbnail_url`, dimensions, and content type). The thumbnail generator uses
 the same intrinsic tile metadata when creating the registry artifact. The
@@ -184,8 +191,9 @@ registry rows; writing only a JPEG or only a manifest is insufficient. Legacy
 successful rows with missing `tile_metadata_json` must be backfilled or
 regenerated before export.
 
-The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
-`data_wsi.txt` pair. Export it from the canonical association table with:
+The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt`/
+`data_wsi.txt` pair plus the generated pathology timeline pair. Export them
+from the canonical association table with:
 
 ```bash
 python3 tools/export_materialized_hierarchy_snapshot.py \
@@ -193,15 +201,45 @@ python3 tools/export_materialized_hierarchy_snapshot.py \
   --study-id study_id
 ```
 
+If an association snapshot was exported before the thumbnail registry finished,
+hydrate it before importing. This joins only complete, source-matched registry
+records; slides without a successful artifact remain explicitly non-servable:
+
+```bash
+python3 tools/hydrate_wsi_asset_metadata.py \
+  --meta-wsi /path/to/study/meta_wsi.txt \
+  --registry-jsonl /path/to/thumbnail-results.jsonl \
+  --output-data-wsi /path/to/study/data_wsi.txt \
+  --report-json /path/to/study/wsi-hydration-report.json
+```
+
+The output replacement is atomic. The command reports hydrated, unchanged,
+incomplete, and source-mismatch rows; only complete successful registry rows
+become servable. `materialize_dev_wsi_snapshot.py` performs this same join
+automatically before loading its isolated dev namespace, so the explicit
+command is only needed when repairing an already-exported study directory. Add
+`--fail-on-incomplete` in CI when a release must contain a complete pixel
+bundle for every association; omit it for a study that intentionally retains
+unavailable source rows as non-servable provenance.
+
 Load the exported files through the standard cBioPortal importer. The core
-importer validates and resolves the complete snapshot, writes the normalized
-ClickHouse hierarchy, and publishes its release manifest last:
+importer validates and resolves the complete snapshot, then writes the
+normalized ClickHouse hierarchy and the sample- and patient-level WSI count
+attributes used by the Study View Clinical Data tab:
 
 ```bash
 metaImport.py -s /path/to/study
-# or, for a complete replacement snapshot:
-metaImport.py -d /path/to/wsi-update
 ```
+
+The count attributes are derived from matched WSI placements during the same
+import, so a separate clinical count file is optional. If one is generated for
+an existing workflow, `tools/generate_wsi_sample_count_clinical_file.py` writes
+its metadata beside the count data without modifying the source `meta_wsi.txt`.
+
+WSI is not supported by incremental (`metaImport.py -d`) imports. Build the
+inactive blue/green database from a fresh schema and import each WSI snapshot
+once; discard and rebuild the inactive database after a failed or repeated
+import.
 
 The tile server is deliberately not a ClickHouse writer. It receives source
 URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
@@ -228,9 +266,10 @@ Binary metadata precedence is explicit: valid manual labels win, FISH names
 remain non-binary unless manually adjudicated, recognized H&E/IHC groups win
 over contradictory names, and name inference is limited to blank groups. The
 reviewed exact `SSL H&E` pattern is promoted to H&E; other SSL patterns remain
-in the review queue. Run `tools/stain_metadata_audit.sql` against the source
-tables to inspect coverage, conflicts, and the ranked non-binary queue before
-publishing a release.
+in the review queue. Run the `stain_metadata_audit.sql` query in the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
+against the source tables to inspect coverage, conflicts, and the ranked
+non-binary queue before publishing a release.
 
 For development or rehearsal, use the Databricks `dev` profile and its
 warehouse, and point the WSI tables at an isolated `cdsi_dev.wsi_test`
@@ -257,9 +296,9 @@ publishes the supplied manifest below the separate `wsi-thumbnails-dev/`
 prefix. The materializer rejects registry rows whose artifact URI is not
 exactly below the dev artifact root, retains failed registry rows for
 diagnostics, and publishes only complete successful rows in the manifest. The
-production Databricks SQL templates remain available through
-`tools/run_wsi_pipelines.py` for a workspace with the production source
-catalogs; leaving the variables unset preserves production defaults.
+production Databricks SQL templates and bundle commands are maintained in the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary).
+The tile server no longer ships or schedules a competing production pipeline.
 
 Beta does not require these dev tables. To prepare a beta study, run the
 exporter against the production canonical association table using a read-only

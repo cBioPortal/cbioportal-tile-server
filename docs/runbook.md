@@ -35,12 +35,16 @@ WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
 WSI_AUTH_AUDIENCE=cbioportal-wsi
 WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
+WSI_ALLOWED_SOURCE_PREFIXES=<approved source URI prefixes>
+WSI_ALLOWED_THUMBNAIL_PREFIXES=<approved thumbnail URI prefixes>
 REDIS_URL=<password-protected Redis URL>
 ```
 
 The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
 server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
 legacy configuration key but authentication is mandatory for pixel routes.
+The URI prefix allowlists are a de-identification boundary; leave them empty
+only for an isolated non-publishing unit test.
 
 ## Endpoints and smoke checks
 
@@ -115,10 +119,11 @@ job must:
 3. upsert `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
    artifact URI, intrinsic `tile_metadata_json`, dimensions, and content type.
 
-The production canonical-association and summary refresh is owned by
-`../pdm_databricks_pipelines`; the Databricks bundle in this repository is
-paused. Do not publish a thumbnail batch until it has completed for the input
-serving manifest. The PDM serving manifest matches source URI and the
+The production canonical-association and summary refresh is owned by the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
+(`wsi_summary_job`). Run that bundle after the thumbnail batch has completed
+for the input inventory; when the batch is manifest-driven, run the PDM
+bootstrap job first. The PDM serving manifest matches source URI and the
 `source_fingerprint` embedded in `tile_metadata_json`; an in-place ECS rewrite
 therefore forces thumbnail regeneration even when the URL is unchanged. Rows
 marked successful without `tile_metadata_json` or its source fingerprint must
@@ -129,6 +134,16 @@ tile-server `app/thumbnail_worker.py` CLI can be used for development,
 rehearsal, or controlled remediation, but it writes only an object-store
 artifact and does not populate the registry. It must not be used as the
 production source of truth.
+
+## Study snapshot publication
+
+When refreshing all private study directories, run
+`tools/migrate_all_studies.sh` with the same URI-prefix environment variables
+used by the exporter. The script takes an external per-study lock, copies the
+study into a sibling candidate directory, performs cleanup/export/resource
+generation there, and only then swaps the complete candidate directory into
+place. A failed validation or export removes the candidate and leaves the
+previous study snapshot untouched.
 
 ## Response and cache policy
 
@@ -145,8 +160,9 @@ IDs. Keep operation type, dimensions, status, timing, and exception class.
 
 The local cBioPortal compose rehearsal should pass the same
 `WSI_AUTH_SECRET`/audience to the backend and tile server. For mounted local
-slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`; production should
-remain `s3` only. Generate a v2 access bundle through the backend before
+slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and include
+`file:///app/testdata/` in both URI prefix allowlists; production should remain
+`s3` only. Generate a v2 access bundle through the backend before
 testing a pixel request.
 
 ## Thumbnail batch operations

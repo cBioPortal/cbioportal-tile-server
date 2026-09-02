@@ -55,6 +55,9 @@ def association_match_rank(match_level: str | None) -> int:
 
 
 def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
+    # Procedure timing remains an upstream association tie-breaker for
+    # timeline-file generation; it is intentionally not part of the WSI
+    # study-file or hierarchy contracts.
     raw_part_number = row.get("part_number")
     part_number = (
         int(raw_part_number)
@@ -68,6 +71,11 @@ def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
         )
         part_number = part_number if part_number is not None else legacy_part_number
         block_number = block_number or legacy_block_number
+    procedure_days = row.get("timeline_start_days")
+    if procedure_days is None:
+        procedure_days = row.get("procedure_date_days")
+    if procedure_days is None:
+        procedure_days = row.get("slide_timepoint_days")
     return (
         association_path_rank(row.get("slide_path")),
         association_match_rank(row.get("match_level")),
@@ -79,10 +87,7 @@ def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
         str(row.get("stain_name") or "~~~~~~~~"),
         0 if row.get("part_description") else 1,
         str(row.get("part_description") or "~~~~~~~~"),
-        0
-        if row.get("procedure_date_days", row.get("slide_timepoint_days"))
-        is not None
-        else 1,
+        0 if procedure_days is not None else 1,
         str(row.get("image_id") or ""),
     )
 

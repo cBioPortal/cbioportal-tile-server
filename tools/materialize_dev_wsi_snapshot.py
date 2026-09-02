@@ -29,6 +29,7 @@ from tools.generate_slide_thumbnails import (
     _registry_by_image_id,
     _publish_manifest,
 )
+from tools.hydrate_wsi_asset_metadata import hydrate_rows
 from tools.wsi_study_format import read_wsi_study
 
 
@@ -59,8 +60,11 @@ SOURCE_COLUMNS = (
     "file_size_bytes",
     "barcode",
     "slide_type",
-    "procedure_date_days",
-    "timepoint_source",
+    # Retained only in the dev canonical table so the timeline exporter can
+    # materialize diagnosis-relative START_DATE. These are not WSI study-file
+    # columns and are never sent to cBioPortal's WSI importer.
+    "timeline_start_days",
+    "timeline_date_status",
     "can_serve_tiles",
     "source_url",
     "tile_metadata_json",
@@ -75,7 +79,7 @@ SOURCE_TYPES = {
     "is_ihc": "bool",
     "can_serve_tiles": "bool",
     "file_size_bytes": "int",
-    "procedure_date_days": "int",
+    "timeline_start_days": "int",
     "thumbnail_width": "int",
     "thumbnail_height": "int",
 }
@@ -138,8 +142,8 @@ def _source_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
             "file_size_bytes": row.get("file_size_bytes"),
             "barcode": row.get("barcode"),
             "slide_type": row.get("slide_type"),
-            "procedure_date_days": row.get("procedure_date_days"),
-            "timepoint_source": row.get("timepoint_source"),
+            "timeline_start_days": row.get("timeline_start_days", row.get("procedure_date_days")),
+            "timeline_date_status": row.get("timeline_date_status", "AVAILABLE" if row.get("procedure_date_days") is not None else None),
             "can_serve_tiles": row.get("can_serve_tiles"),
             "source_url": row.get("slide_path"),
             "tile_metadata_json": row.get("tile_metadata_json"),
@@ -165,6 +169,7 @@ def _values(rows: Iterable[dict[str, Any]], columns: Iterable[str]) -> list[str]
 
 def _read_registry_records(registry_path: Path) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    seen_image_ids: set[str] = set()
     for line_number, line in enumerate(
         registry_path.read_text(encoding="utf-8").splitlines(), 1
     ):
@@ -173,6 +178,12 @@ def _read_registry_records(registry_path: Path) -> list[dict[str, Any]]:
         record = json.loads(line)
         if not isinstance(record, dict):
             raise ValueError(f"registry record on line {line_number} must be an object")
+        image_id = str(record.get("image_id") or "").strip()
+        if not image_id:
+            raise ValueError(f"registry record on line {line_number} is missing image_id")
+        if image_id in seen_image_ids:
+            raise ValueError(f"registry contains duplicate image_id {image_id}")
+        seen_image_ids.add(image_id)
         records.append(record)
     return records
 
@@ -266,8 +277,8 @@ part_key STRING, part_number STRING, part_designator STRING, part_type STRING,
 part_description STRING, subspecialty STRING, path_dx_title STRING, block_key STRING,
 block_number STRING, block_label STRING, match_level STRING, specimen_key STRING,
 stain_name STRING, stain_group STRING, is_hne BOOLEAN, is_ihc BOOLEAN, magnification STRING,
-file_size_bytes BIGINT, barcode STRING, slide_type STRING, procedure_date_days INT,
-timepoint_source STRING, can_serve_tiles BOOLEAN, source_url STRING, tile_metadata_json STRING,
+file_size_bytes BIGINT, barcode STRING, slide_type STRING, timeline_start_days INT,
+timeline_date_status STRING, can_serve_tiles BOOLEAN, source_url STRING, tile_metadata_json STRING,
 thumbnail_url STRING, thumbnail_width INT, thumbnail_height INT, thumbnail_content_type STRING
 ) USING DELTA""",
         warehouse_id,
@@ -468,7 +479,7 @@ WITH source_rows AS (
     ) AS metadata_is_ihc
   FROM canonical_stains
 )
-SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
+SELECT 'canonical_slide_associations_v5' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
   NULLIF(s.reference_sample_id, '') AS reference_sample_id,
   s.part_key, s.part_number, s.part_designator, s.part_type, s.part_description,
@@ -482,7 +493,7 @@ SELECT 'canonical_slide_associations_v4' AS association_version, CURRENT_TIMESTA
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> ''
     AND r.width > 0 AND r.height > 0 AND r.content_type IS NOT NULL
     AND TRIM(r.content_type) <> '' THEN TRUE ELSE FALSE END AS can_serve_tiles,
-  s.barcode, s.slide_type, s.specimen_key, s.procedure_date_days, s.timepoint_source,
+  s.barcode, s.slide_type, s.specimen_key, s.timeline_start_days, s.timeline_date_status,
   s.source_url AS slide_path,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.tile_metadata_json END AS tile_metadata_json,
@@ -535,8 +546,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
 
     study_id, parsed_rows = read_wsi_study(args.meta_wsi)
-    source_rows = list(_source_rows(parsed_rows))
     registry_records = _read_registry_records(args.registry_jsonl)
+    parsed_rows, hydration_stats = hydrate_rows(parsed_rows, {
+        str(record["image_id"]): record for record in registry_records
+    })
+    source_rows = list(_source_rows(parsed_rows))
+    print(
+        "hydrated WSI asset fields: "
+        + json.dumps(hydration_stats, sort_keys=True)
+    )
     _validate_registry_artifacts(registry_records, args.artifact_root_uri)
     tables = _create_tables(args.warehouse_id, args.namespace)
     _load_source(args.warehouse_id, tables["source"], source_rows, args.batch_size)

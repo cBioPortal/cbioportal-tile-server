@@ -8,6 +8,26 @@ from .config import settings
 from .identity import TILE_METADATA_SCHEMA_VERSION, decode_policy_version
 
 
+ALLOWED_TILE_METADATA_KEYS = {
+    "dimensions",
+    "levels",
+    "level_dimensions",
+    "level_downsamples",
+    "max_zoom",
+    "tile_size",
+    "mpp",
+    "objective_power",
+    "vendor",
+    "identity_version",
+    "safe_min_level",
+    "tile_metadata_schema_version",
+    "decode_policy_version",
+    "max_decode_pixels",
+    "thumbnail_max_decode_pixels",
+    "source_fingerprint",
+}
+
+
 def validate_tile_metadata(
     metadata: Any,
     *,
@@ -20,6 +40,8 @@ def validate_tile_metadata(
     """
     if not isinstance(metadata, dict):
         return False, "metadata_not_object"
+    if set(metadata) - ALLOWED_TILE_METADATA_KEYS:
+        return False, "unknown_metadata_field"
 
     schema = metadata.get("tile_metadata_schema_version")
     if schema is None:
