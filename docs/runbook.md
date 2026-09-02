@@ -119,10 +119,11 @@ job must:
 3. upsert `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
    artifact URI, intrinsic `tile_metadata_json`, dimensions, and content type.
 
-The production canonical-association and summary refresh is owned by
-`../pdm_databricks_pipelines`; the Databricks bundle in this repository is
-paused. Do not publish a thumbnail batch until it has completed for the input
-serving manifest. The PDM serving manifest matches source URI and the
+The production canonical-association and summary refresh is owned by the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
+(`wsi_summary_job`). Run that bundle after the thumbnail batch has completed
+for the input inventory; when the batch is manifest-driven, run the PDM
+bootstrap job first. The PDM serving manifest matches source URI and the
 `source_fingerprint` embedded in `tile_metadata_json`; an in-place ECS rewrite
 therefore forces thumbnail regeneration even when the URL is unchanged. Rows
 marked successful without `tile_metadata_json` or its source fingerprint must

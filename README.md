@@ -39,10 +39,10 @@ handlers. The production sequence is:
    manifest-versioned prefix and publishes their serving pointers. The first
    run adds the serving-pointer columns to the existing registry; reruns are
    idempotent.
-4. The Databricks canonical-association job joins the source path to the
-   latest successful registry row and computes `can_serve_tiles`. The
-   canonical job must run only after the thumbnail batch has completed for the
-   input inventory (use a job dependency or completion watermark).
+4. The PDM Databricks WSI bundle publishes the serving manifest, then computes
+   canonical associations and `can_serve_tiles`. The bundle must run only
+   after the thumbnail batch has completed for the input inventory (use a job
+   dependency or completion watermark).
 5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
    dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`, and writes
    the standard pathology timeline pair with procedure offsets and provenance.
@@ -266,9 +266,10 @@ Binary metadata precedence is explicit: valid manual labels win, FISH names
 remain non-binary unless manually adjudicated, recognized H&E/IHC groups win
 over contradictory names, and name inference is limited to blank groups. The
 reviewed exact `SSL H&E` pattern is promoted to H&E; other SSL patterns remain
-in the review queue. Run `tools/stain_metadata_audit.sql` against the source
-tables to inspect coverage, conflicts, and the ranked non-binary queue before
-publishing a release.
+in the review queue. Run the `stain_metadata_audit.sql` query in the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
+against the source tables to inspect coverage, conflicts, and the ranked
+non-binary queue before publishing a release.
 
 For development or rehearsal, use the Databricks `dev` profile and its
 warehouse, and point the WSI tables at an isolated `cdsi_dev.wsi_test`
@@ -295,9 +296,9 @@ publishes the supplied manifest below the separate `wsi-thumbnails-dev/`
 prefix. The materializer rejects registry rows whose artifact URI is not
 exactly below the dev artifact root, retains failed registry rows for
 diagnostics, and publishes only complete successful rows in the manifest. The
-production Databricks SQL templates remain available through
-`tools/run_wsi_pipelines.py` for a workspace with the production source
-catalogs; leaving the variables unset preserves production defaults.
+production Databricks SQL templates and bundle commands are maintained in the
+[`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary).
+The tile server no longer ships or schedules a competing production pipeline.
 
 Beta does not require these dev tables. To prepare a beta study, run the
 exporter against the production canonical association table using a read-only
