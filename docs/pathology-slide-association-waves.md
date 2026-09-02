@@ -40,8 +40,9 @@ source slides, writes master JPEGs to the S3/Dell ECS-compatible store, and
 populates `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
 artifact URI, `tile_metadata_json`, dimensions, content type, and a
 fingerprint embedded in the metadata JSON. The production canonical SQL is
-owned by `../pdm_databricks_pipelines` and joins the registry only when the
-source URI and fingerprint match the current preferred inventory. A rewritten
+owned by the [`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
+and consumes the manifest's serving pointer only when the source URI and
+fingerprint match the current preferred inventory. A rewritten
 object with the same ECS URL is consequently uncertified until it has been
 re-audited and its thumbnail regenerated.
 

@@ -171,7 +171,8 @@ def get_sample_slide_summary(
     Return pre-computed slide availability stats for the given sample IDs.
 
     Reads from the ``sample_wsi_summary`` Delta table, which is populated
-    nightly by the Databricks Asset Bundle job (``wsi-summary-pipeline``).
+    nightly by the Databricks Asset Bundle job (``wsi_summary_job``) in the
+    ``pdm_databricks_pipelines`` repository.
 
     Each result dict has:
       sample_id, patient_id, servable_slide_count,
