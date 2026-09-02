@@ -4,6 +4,7 @@ from pathlib import Path
 from tools.generate_pathology_timeline_files import (
     build_pathology_timeline_rows,
     main,
+    write_pathology_timeline_files,
 )
 
 
@@ -127,6 +128,55 @@ def test_resolved_flags_override_stale_stain_text_for_timeline_subtype():
         "study_2",
     )
     assert rows[0][5] == "IHC"
+
+
+def test_build_pathology_timeline_rows_uses_canonical_procedure_offset():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "PART",
+                "image_id": "img-1",
+                "part_number": "1",
+                "part_description": "Colon",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "slide_path": "s3://bucket/slide-1.svs",
+                "procedure_date_days": -17,
+                "timepoint_source": "Procedure date",
+            }
+        ],
+        "study_1",
+    )
+
+    assert rows[0][1] == "-17"
+    assert rows[0][11] == "Procedure date"
+
+
+def test_write_pathology_timeline_files_returns_written_pair(tmp_path: Path):
+    meta_path, data_path, row_count = write_pathology_timeline_files(
+        tmp_path,
+        "study_1",
+        [
+            {
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "PART",
+                "image_id": "img-1",
+                "part_number": "1",
+                "part_description": "Colon",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "slide_path": "s3://bucket/slide-1.svs",
+                "procedure_date_days": 0,
+            }
+        ],
+    )
+
+    assert row_count == 1
+    assert meta_path.is_file()
+    assert data_path.is_file()
 
 
 def test_build_pathology_timeline_rows_deduplicates_same_image_across_match_buckets():
@@ -275,6 +325,48 @@ def test_build_pathology_timeline_rows_skips_unknown_stain_types():
     assert rows == []
 
 
+def test_build_pathology_timeline_rows_keeps_explicitly_classified_other_slides():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "BLOCK",
+                "image_id": "img-1",
+                "block_id": "part/1-A1",
+                "block_label": "A1",
+                "part_description": "Colon",
+                "stain_name": "Unstained recut",
+                "stain_group": "Other",
+                "is_hne": False,
+                "is_ihc": False,
+                "slide_path": "s3://bucket/slide-1.svs",
+                "slide_timepoint_days": 8,
+                "slide_timepoint_source": "Procedure date relative to tumor sequencing",
+            },
+        ],
+        "study_1",
+    )
+
+    assert rows == [
+        [
+            "P-1",
+            "8",
+            "",
+            "PATHOLOGY SLIDES",
+            "S-1",
+            "Other",
+            "BLOCK",
+            "Part 1 / Block A1",
+            "1",
+            "0",
+            "1",
+            "Procedure date relative to tumor sequencing",
+            "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=all&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
+        ]
+    ]
+
+
 def test_build_pathology_timeline_rows_sanitizes_multiline_specimen_labels():
     rows = build_pathology_timeline_rows(
         [
@@ -313,6 +405,50 @@ def test_build_pathology_timeline_rows_sanitizes_multiline_specimen_labels():
             "",
         ]
     ]
+
+
+def test_build_pathology_timeline_rows_uses_diagnosis_relative_canonical_fields():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "BLOCK",
+                "image_id": "img-1",
+                "part_number": "1",
+                "block_number": "2",
+                "part_description": "Colon",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "is_hne": True,
+                "is_ihc": False,
+                "timeline_start_days": 0,
+                "timeline_date_status": "AVAILABLE",
+                "can_serve_tiles": True,
+            },
+            {
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "BLOCK",
+                "image_id": "img-2",
+                "part_number": "1",
+                "block_number": "2",
+                "part_description": "Colon",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "is_hne": True,
+                "is_ihc": False,
+                "timeline_start_days": None,
+                "timeline_date_status": "MISSING_DIAGNOSIS_DATE",
+                "can_serve_tiles": True,
+            },
+        ],
+        "study_1",
+    )
+
+    assert len(rows) == 1
+    assert rows[0][1] == "0"
+    assert rows[0][11] == "Procedure date relative to first ICD-O diagnosis"
 
 
 def test_main_writes_pathology_timeline_files(monkeypatch, tmp_path: Path):

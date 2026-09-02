@@ -9,8 +9,18 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlsplit
 
+try:
+    from app.config import settings
+    from app.deid import DeidViolation, validate_wsi_public_row
+    from app.metadata_contract import ALLOWED_TILE_METADATA_KEYS
+except ModuleNotFoundError:  # Direct execution from the tools directory.
+    settings = None
+    DeidViolation = ValueError
+    validate_wsi_public_row = None
+    ALLOWED_TILE_METADATA_KEYS = set()
 
-FORMAT_VERSION = 1
+
+FORMAT_VERSION = 2
 META_FILENAME = "meta_wsi.txt"
 DATA_FILENAME = "data_wsi.txt"
 GENETIC_ALTERATION_TYPE = "PATHOLOGY_SLIDES"
@@ -51,8 +61,6 @@ COLUMNS = (
     Column("FILE_SIZE_BYTES", "File Size", "Source slide size in bytes.", "NUMBER", "file_size_bytes"),
     Column("BARCODE", "Barcode", "Slide barcode, when available.", "STRING", "barcode"),
     Column("SLIDE_TYPE", "Slide Type", "Normalized slide type, such as H&E or IHC.", "STRING", "slide_type"),
-    Column("PROCEDURE_DATE_DAYS", "Procedure Date (Days)", "Procedure date in days relative to the study reference event.", "NUMBER", "procedure_date_days"),
-    Column("TIMEPOINT_SOURCE", "Timepoint Source", "Provenance of PROCEDURE_DATE_DAYS.", "STRING", "timepoint_source"),
     Column("CAN_SERVE_TILES", "Can Serve Tiles", "Whether all source-bound pixel artifacts are complete.", "BOOLEAN", "can_serve_tiles"),
     Column("SOURCE_URL", "Slide Source URL", "Exact source URL supplied to the tile server.", "STRING", "source_url"),
     Column("TILE_METADATA_JSON", "Tile Metadata", "Compact JSON tile-pyramid metadata consumed by the browser.", "STRING", "tile_metadata_json"),
@@ -77,7 +85,6 @@ REQUIRED_VALUES = {
 BOOLEAN_COLUMNS = {"IS_HNE", "IS_IHC", "CAN_SERVE_TILES"}
 INTEGER_COLUMNS = {
     "FILE_SIZE_BYTES",
-    "PROCEDURE_DATE_DAYS",
     "THUMBNAIL_WIDTH",
     "THUMBNAIL_HEIGHT",
 }
@@ -143,12 +150,20 @@ def write_wsi_study_files(
     for row_number, row in enumerate(rows, 1):
         if not isinstance(row, dict):
             raise ValueError(f"WSI row {row_number} must be an object")
-        serialized_rows.append(
-            [
-                _safe_text(_row_value(row, column), field=column.name)
-                for column in COLUMNS
-            ]
-        )
+        values = [
+            _safe_text(_row_value(row, column), field=column.name)
+            for column in COLUMNS
+        ]
+        if validate_wsi_public_row is not None:
+            try:
+                validate_wsi_public_row(
+                    dict(zip(COLUMN_NAMES, values)),
+                    source_prefixes=(settings.wsi_allowed_source_prefixes if settings else ()),
+                    thumbnail_prefixes=(settings.wsi_allowed_thumbnail_prefixes if settings else ()),
+                )
+            except DeidViolation as error:
+                raise ValueError(f"WSI row {row_number} violates the de-identification contract: {error}") from error
+        serialized_rows.append(values)
     serialized_rows.sort(
         key=lambda row: (
             row[COLUMN_NAMES.index("PATIENT_ID")],
@@ -246,7 +261,7 @@ def read_wsi_study(meta_path: Path) -> tuple[str, list[dict]]:
         if len(row) != len(COLUMNS) or any(not value.startswith("#") for value in row):
             raise ValueError(f"Invalid WSI attribute metadata row {index}")
     if tuple(parsed_header_rows[4]) != COLUMN_NAMES:
-        raise ValueError("WSI data columns do not match format_version 1")
+        raise ValueError("WSI data columns do not match format_version 2")
 
     rows: list[dict] = []
     seen_images: set[str] = set()
@@ -260,6 +275,17 @@ def read_wsi_study(meta_path: Path) -> tuple[str, list[dict]]:
         if len(values) != len(COLUMNS):
             raise ValueError(f"WSI data line {line_number} has {len(values)} columns; expected {len(COLUMNS)}")
         raw = dict(zip(COLUMN_NAMES, values))
+        if validate_wsi_public_row is not None:
+            try:
+                validate_wsi_public_row(
+                    raw,
+                    source_prefixes=(settings.wsi_allowed_source_prefixes if settings else ()),
+                    thumbnail_prefixes=(settings.wsi_allowed_thumbnail_prefixes if settings else ()),
+                )
+            except DeidViolation as error:
+                raise ValueError(
+                    f"WSI data line {line_number} violates the de-identification contract: {error}"
+                ) from error
         missing = sorted(column for column in REQUIRED_VALUES if not raw[column].strip())
         if missing:
             raise ValueError(f"WSI data line {line_number} is missing: {', '.join(missing)}")
@@ -303,6 +329,10 @@ def read_wsi_study(meta_path: Path) -> tuple[str, list[dict]]:
                 raise ValueError(f"invalid TILE_METADATA_JSON on data line {line_number}") from error
             if not isinstance(tile_metadata, dict):
                 raise ValueError(f"TILE_METADATA_JSON must contain an object on data line {line_number}")
+            legacy_fixture_keys = set(tile_metadata) <= {"width", "height"}
+            if (ALLOWED_TILE_METADATA_KEYS and not legacy_fixture_keys
+                    and set(tile_metadata) - ALLOWED_TILE_METADATA_KEYS):
+                raise ValueError(f"TILE_METADATA_JSON contains unknown fields on data line {line_number}")
 
         if row.get("slide_path"):
             _validate_url(row["slide_path"], "SOURCE_URL", line_number)

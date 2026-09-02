@@ -35,12 +35,16 @@ WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
 WSI_AUTH_AUDIENCE=cbioportal-wsi
 WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
+WSI_ALLOWED_SOURCE_PREFIXES=s3://mskmind-bkt/reef-slides/,s3://pathology/CRC_21-167/slides/,s3://pathology/CRC_21-167/crc_slides/,s3://pathology/CART_19-373/,s3://pathology/BR_20-226/slides/
+WSI_ALLOWED_THUMBNAIL_PREFIXES=s3://mskmind-bkt/wsi-thumbnails/
 REDIS_URL=<password-protected Redis URL>
 ```
 
 The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
 server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
 legacy configuration key but authentication is mandatory for pixel routes.
+The URI prefix allowlists are a de-identification boundary; leave them empty
+only for an isolated non-publishing unit test.
 
 ## Endpoints and smoke checks
 
@@ -130,6 +134,16 @@ rehearsal, or controlled remediation, but it writes only an object-store
 artifact and does not populate the registry. It must not be used as the
 production source of truth.
 
+## Study snapshot publication
+
+When refreshing all private study directories, run
+`tools/migrate_all_studies.sh` with the same URI-prefix environment variables
+used by the exporter. The script takes an external per-study lock, copies the
+study into a sibling candidate directory, performs cleanup/export/resource
+generation there, and only then swaps the complete candidate directory into
+place. A failed validation or export removes the candidate and leaves the
+previous study snapshot untouched.
+
 ## Response and cache policy
 
 - Tiles: `private, max-age=3600`, vary on `Authorization`.
@@ -145,8 +159,9 @@ IDs. Keep operation type, dimensions, status, timing, and exception class.
 
 The local cBioPortal compose rehearsal should pass the same
 `WSI_AUTH_SECRET`/audience to the backend and tile server. For mounted local
-slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`; production should
-remain `s3` only. Generate a v2 access bundle through the backend before
+slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and include
+`file:///app/testdata/` in both URI prefix allowlists; production should remain
+`s3` only. Generate a v2 access bundle through the backend before
 testing a pixel request.
 
 ## Thumbnail batch operations

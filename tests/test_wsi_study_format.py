@@ -45,7 +45,7 @@ def test_writer_uses_cbioportal_attribute_rows_and_versioned_meta_file(tmp_path)
         "genetic_alteration_type: PATHOLOGY_SLIDES",
         "datatype: WSI",
         "data_filename: data_wsi.txt",
-        "format_version: 1",
+        "format_version: 2",
     ]
     lines = data_path.read_text().splitlines()
     assert all(cell.startswith("#") for line in lines[:4] for cell in line.split("\t"))
@@ -97,8 +97,17 @@ def test_reader_rejects_a_header_that_does_not_match_the_format_version(tmp_path
     contents = data_path.read_text().replace("PATIENT_ID", "PATIENT", 1)
     data_path.write_text(contents)
 
-    with pytest.raises(ValueError, match="columns do not match format_version 1"):
+    with pytest.raises(ValueError, match="columns do not match format_version 2"):
         read_wsi_study(tmp_path / "meta_wsi.txt")
+
+
+def test_reader_rejects_legacy_format_version(tmp_path):
+    _, data_path = write_wsi_study_files(tmp_path, "study", [canonical_row()])
+    meta_path = tmp_path / "meta_wsi.txt"
+    meta_path.write_text(meta_path.read_text().replace("format_version: 2", "format_version: 1"))
+
+    with pytest.raises(ValueError, match="unsupported WSI format_version"):
+        read_wsi_study(meta_path)
 
 
 def test_reader_rejects_incomplete_servable_artifacts(tmp_path):
@@ -112,15 +121,13 @@ def test_reader_rejects_incomplete_servable_artifacts(tmp_path):
         read_wsi_study(tmp_path / "meta_wsi.txt")
 
 
-def test_reader_rejects_non_absolute_source_urls(tmp_path):
-    write_wsi_study_files(
-        tmp_path,
-        "study",
-        [canonical_row(slide_path="slides/SLIDE-1.svs")],
-    )
-
-    with pytest.raises(ValueError, match="SOURCE_URL must be an absolute URL"):
-        read_wsi_study(tmp_path / "meta_wsi.txt")
+def test_writer_rejects_non_absolute_source_urls(tmp_path):
+    with pytest.raises(ValueError, match="de-identification contract: unsafe source URI"):
+        write_wsi_study_files(
+            tmp_path,
+            "study",
+            [canonical_row(slide_path="slides/SLIDE-1.svs")],
+        )
 
 
 def test_writer_rejects_tabs_and_newlines_in_values(tmp_path):
@@ -129,4 +136,13 @@ def test_writer_rejects_tabs_and_newlines_in_values(tmp_path):
             tmp_path,
             "study",
             [canonical_row(part_description="invalid\tdescription")],
+        )
+
+
+def test_writer_rejects_thumbnail_mime_extension_mismatch(tmp_path):
+    with pytest.raises(ValueError, match="thumbnail content type does not match URI"):
+        write_wsi_study_files(
+            tmp_path,
+            "study",
+            [canonical_row(thumbnail_content_type="image/png")],
         )

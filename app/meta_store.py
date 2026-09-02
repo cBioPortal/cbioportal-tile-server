@@ -17,48 +17,7 @@ from .constants import (
 EXTERNAL_LINK_TIMEOUT_SEC = 120
 
 PATIENT_SQL = f"""
-WITH sample_sequencing AS (
-    SELECT
-        sample_id,
-        MAX(sequencing_date) AS sequencing_date
-    FROM (
-        SELECT
-            SAMPLE_ID AS sample_id,
-            TRY_CAST(DATE_SEQUENCING_REPORT AS DATE) AS sequencing_date
-        FROM cdsi_eng_phi.cdm_eng_pathology_report_segmentation.table_pathology_impact_sample_summary_dop_anno_epic_idb_combined
-        WHERE SAMPLE_ID IS NOT NULL
-          AND DATE_SEQUENCING_REPORT IS NOT NULL
-
-        UNION ALL
-
-        SELECT
-            SAMPLE_ID AS sample_id,
-            CAST(
-                SUBSTR(DTE_TUMOR_SEQUENCING, 13, 4) || '-' ||
-                CASE SUBSTR(DTE_TUMOR_SEQUENCING, 9, 3)
-                    WHEN 'Jan' THEN '01'
-                    WHEN 'Feb' THEN '02'
-                    WHEN 'Mar' THEN '03'
-                    WHEN 'Apr' THEN '04'
-                    WHEN 'May' THEN '05'
-                    WHEN 'Jun' THEN '06'
-                    WHEN 'Jul' THEN '07'
-                    WHEN 'Aug' THEN '08'
-                    WHEN 'Sep' THEN '09'
-                    WHEN 'Oct' THEN '10'
-                    WHEN 'Nov' THEN '11'
-                    WHEN 'Dec' THEN '12'
-                END || '-' ||
-                SUBSTR(DTE_TUMOR_SEQUENCING, 6, 2) AS DATE
-            ) AS sequencing_date
-        FROM cdsi_prod.cdm_idbw_impact_pipeline_prod.ddp_pathology_reports
-        WHERE SAMPLE_ID IS NOT NULL
-          AND DTE_TUMOR_SEQUENCING IS NOT NULL
-    ) x
-    WHERE sequencing_date IS NOT NULL
-    GROUP BY sample_id
-),
-inventory_paths AS (
+WITH inventory_paths AS (
     SELECT image_id, path
     FROM (
         SELECT
@@ -90,16 +49,9 @@ SELECT
     d.ONCOGENIC_MUTATIONS, d.`#ONCOGENIC_MUTATIONS` AS NUM_ONCOGENIC_MUTATIONS,
     d.CVR_TMB_SCORE, d.MSI_TYPE, d.magnification,
     d.file_size_bytes,
-    DATEDIFF(TRY_CAST(d.dop AS DATE), ss.sequencing_date) AS slide_timepoint_days,
-    CASE
-        WHEN TRY_CAST(d.dop AS DATE) IS NOT NULL AND ss.sequencing_date IS NOT NULL
-            THEN 'Procedure date'
-        ELSE NULL
-    END AS slide_timepoint_source,
     inventory_paths.path AS slide_path
 FROM {_TABLE} d
 LEFT JOIN inventory_paths ON CAST(d.image_id AS STRING) = inventory_paths.image_id
-LEFT JOIN sample_sequencing ss ON d.sample_id = ss.sample_id
 WHERE d.PATIENT_ID = :patient_id
 ORDER BY d.sample_id, d.block_id, d.image_id
 """
@@ -155,7 +107,45 @@ LIMIT 8
 """
 
 PATIENT_ASSOCIATION_SQL = f"""
-SELECT *
+SELECT
+    patient_id,
+    sample_id,
+    reference_sample_id,
+    match_level,
+    image_id,
+    part_key,
+    part_number,
+    part_designator,
+    part_type,
+    part_description,
+    subspecialty,
+    path_dx_title,
+    block_key,
+    block_number,
+    block_label,
+    stain_name,
+    stain_group,
+    is_hne,
+    is_ihc,
+    magnification,
+    file_size_bytes,
+    barcode,
+    slide_type,
+    specimen_key,
+    procedure_date_days,
+    timepoint_source,
+    -- The canonical table currently stores procedure-relative timing.  Keep
+    -- the legacy aliases in the transport contract for callers that still
+    -- consume the timeline fields.
+    procedure_date_days AS timeline_start_days,
+    if(procedure_date_days IS NULL, 'MISSING_PROCEDURE_DATE', 'AVAILABLE') AS timeline_date_status,
+    can_serve_tiles,
+    slide_path,
+    CAST(NULL AS STRING) AS tile_metadata_json,
+    CAST(NULL AS STRING) AS thumbnail_url,
+    CAST(NULL AS BIGINT) AS thumbnail_width,
+    CAST(NULL AS BIGINT) AS thumbnail_height,
+    CAST(NULL AS STRING) AS thumbnail_content_type
 FROM {_CANONICAL_ASSOCIATIONS}
 WHERE patient_id = :patient_id
 ORDER BY image_id

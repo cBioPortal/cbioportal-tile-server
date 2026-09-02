@@ -40,6 +40,7 @@ from .auth import (
 )
 from .blockcache import get_blockcache_manager
 from .config import settings
+from .deid import DeidViolation, validate_artifact_uri
 from .metrics import (
     CACHE_MISS_LEADERS,
     COALESCED_CACHE_MISS_REQUESTS,
@@ -503,7 +504,10 @@ async def _distributed_singleflight(
 def _allowed_source(source: str) -> str:
     if not isinstance(source, str) or not source.strip():
         raise HTTPException(status_code=400, detail="source URL is required")
-    parsed = urlparse(source)
+    try:
+        parsed = urlparse(source)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="malformed source URL")
     allowed = {item.strip().lower() for item in settings.wsi_allowed_source_schemes if item.strip()}
     if parsed.scheme.lower() not in allowed:
         raise HTTPException(status_code=400, detail="unsupported source URL")
@@ -533,6 +537,19 @@ def _authorize_source(request: Request, source: str, operation: str) -> tuple[st
     claim_name = "tile_source_sha256" if operation == "tile" else "thumbnail_source_sha256"
     if not hmac.compare_digest(source_digest(source), claims[claim_name]):
         raise HTTPException(status_code=403, detail="source is outside capability")
+    try:
+        validate_artifact_uri(
+            source,
+            image_id=str(claims.get("image_id") or ""),
+            kind="source" if operation == "tile" else "thumbnail",
+            prefixes=(
+                settings.wsi_allowed_source_prefixes
+                if operation == "tile"
+                else settings.wsi_allowed_thumbnail_prefixes
+            ),
+        )
+    except DeidViolation:
+        raise HTTPException(status_code=403, detail="source is outside de-id policy")
     return source, claims
 
 
@@ -708,10 +725,12 @@ def _readiness_status() -> tuple[int, dict]:
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
         )
+        if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
+            raise InvalidWsiToken("WSI artifact allowlists are not configured")
         return 200, payload
     except InvalidWsiToken:
         payload["status"] = "unavailable"
-        payload["reason"] = "WSI authentication is not configured"
+        payload["reason"] = "WSI authentication or artifact policy is not configured"
         return 503, payload
 
 

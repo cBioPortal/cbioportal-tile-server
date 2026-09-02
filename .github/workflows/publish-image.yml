@@ -34,6 +34,8 @@ jobs:
             --env REDIS_URL= \
             --env N_WORKERS=1 \
             --env CORS_ORIGINS=https://triage-beta.cbioportal.aws.mskcc.org \
+            --env WSI_ALLOWED_SOURCE_PREFIXES=s3://example.invalid/reef-slides/ \
+            --env WSI_ALLOWED_THUMBNAIL_PREFIXES=s3://example.invalid/wsi-thumbnails/ \
             --publish 18080:8080 tile-server:ci)"
           cleanup() {
             docker logs "$container_id" || true

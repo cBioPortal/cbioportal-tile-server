@@ -30,6 +30,7 @@ from app.associations import (  # noqa: E402
     canonicalize_association_rows,
     derive_block_fields as _derive_block_fields,
 )
+from app.deid import DeidViolation, validate_timeline_public_row  # noqa: E402
 
 _TIMELINE_META_FILENAME = "meta_clinical_timeline_pathology_slides.txt"
 _TIMELINE_DATA_FILENAME = "data_clinical_timeline_pathology_slides.txt"
@@ -48,6 +49,8 @@ SELECT
     part_description,
     stain_name,
     stain_group,
+    is_hne,
+    is_ihc,
     slide_path,
     can_serve_tiles,
     specimen_key,
@@ -190,10 +193,18 @@ def _infer_slide_type(
     is_hne: bool | None = None,
     is_ihc: bool | None = None,
 ) -> str | None:
+    # The canonical association pipeline resolves these flags for every real
+    # slide.  Preserve a third category when both are explicitly false so a
+    # valid slide (for example an unstained recut) is not silently dropped
+    # from the clinical timeline.  Rows without resolved flags retain the
+    # legacy text-based behavior, which keeps synthetic/legacy records such as
+    # "SLIDES SUBMITTED" out of the pathology-slide timeline.
     if is_ihc is True:
         return "IHC"
     if is_hne is True:
         return "H&E"
+    if is_hne is False and is_ihc is False:
+        return "Other"
     group = (stain_group or "").lower()
     name = re.sub(r"\s+", " ", (stain_name or "").lower()).strip()
     if group == "ihc":
@@ -250,7 +261,9 @@ def _build_linkout(
     params = {
         "studyId": study_id,
         "caseId": patient_id,
-        "stainFilter": "hne" if subtype == "H&E" else "ihc",
+        "stainFilter": (
+            "hne" if subtype == "H&E" else "ihc" if subtype == "IHC" else "all"
+        ),
         "matchLevel": match_level,
         "specimenKey": specimen_key,
     }
@@ -299,10 +312,17 @@ def build_pathology_timeline_rows(
         if not patient_id or not image_id:
             continue
 
-        slide_timepoint_days = row.get(
-            "procedure_date_days", row.get("slide_timepoint_days")
-        )
+        slide_timepoint_days = row.get("timeline_start_days")
         if slide_timepoint_days is None:
+            # Keep older development fixtures readable while production uses
+            # the diagnosis-relative canonical field.
+            slide_timepoint_days = row.get("procedure_date_days")
+        if slide_timepoint_days is None:
+            slide_timepoint_days = row.get("slide_timepoint_days")
+        if slide_timepoint_days is None:
+            continue
+        timeline_status = str(row.get("timeline_date_status") or "").strip().upper()
+        if timeline_status and timeline_status != "AVAILABLE":
             continue
         try:
             start_date = int(slide_timepoint_days)
@@ -371,10 +391,15 @@ def build_pathology_timeline_rows(
             )
             grouped_rows[group_key] = grouped
 
+        timepoint_source = (
+            "Procedure date relative to first ICD-O diagnosis"
+            if timeline_status == "AVAILABLE"
+            else row.get("timepoint_source") or row.get("slide_timepoint_source")
+        )
         grouped.add_image(
             image_id=image_id,
             can_serve_tiles=can_serve_tiles,
-            timepoint_source=row.get("timepoint_source", row.get("slide_timepoint_source")),
+            timepoint_source=timepoint_source,
         )
 
     ordered_groups = sorted(
@@ -436,6 +461,18 @@ def _write_timeline_meta(study_dir: Path, study_id: str) -> None:
 
 
 def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
+    columns = [
+        "PATIENT_ID", "START_DATE", "STOP_DATE", "EVENT_TYPE", "SAMPLE_ID",
+        "SUBTYPE", "MATCH_LEVEL", "SPECIMEN", "IMAGE_COUNT",
+        "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE", "LINKOUT",
+    ]
+    for row_number, row in enumerate(rows, start=1):
+        try:
+            validate_timeline_public_row(dict(zip(columns, row)))
+        except DeidViolation as error:
+            raise ValueError(
+                f"timeline row {row_number} violates the de-identification contract: {error}"
+            ) from error
     with (study_dir / _TIMELINE_DATA_FILENAME).open(
         "w", encoding="utf-8", newline=""
     ) as handle:
@@ -460,6 +497,20 @@ def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
+def write_pathology_timeline_files(
+    study_dir: Path, study_id: str, association_rows: list[dict]
+) -> tuple[Path, Path, int]:
+    """Write the canonical pathology timeline pair from association rows."""
+    timeline_rows = build_pathology_timeline_rows(association_rows, study_id)
+    _write_timeline_meta(study_dir, study_id)
+    _write_timeline_data(study_dir, timeline_rows)
+    return (
+        study_dir / _TIMELINE_META_FILENAME,
+        study_dir / _TIMELINE_DATA_FILENAME,
+        len(timeline_rows),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     study_dir = args.study_dir.expanduser().resolve()
@@ -472,16 +523,15 @@ def main(argv: list[str] | None = None) -> int:
     association_rows = _fetch_canonical_associations(
         patient_ids, args.warehouse_id
     )
-    timeline_rows = build_pathology_timeline_rows(association_rows, study_id)
-
-    _write_timeline_meta(study_dir, study_id)
-    _write_timeline_data(study_dir, timeline_rows)
+    meta_path, data_path, row_count = write_pathology_timeline_files(
+        study_dir, study_id, association_rows
+    )
 
     print(f"Study dir: {study_dir}")
     print(f"Study id: {study_id}")
-    print(f"Pathology timeline rows: {len(timeline_rows)}")
-    print(f"Written: {_TIMELINE_META_FILENAME}")
-    print(f"Written: {_TIMELINE_DATA_FILENAME}")
+    print(f"Pathology timeline rows: {row_count}")
+    print(f"Written: {meta_path.name}")
+    print(f"Written: {data_path.name}")
     return 0
 
 

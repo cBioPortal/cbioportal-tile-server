@@ -65,8 +65,8 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
         "is_ihc",
         "can_serve_tiles",
         "specimen_key",
-        "procedure_date_days",
-        "timepoint_source",
+        "timeline_start_days",
+        "timeline_date_status",
         "slide_path",
         "metadata_is_hne",
         "metadata_is_ihc",
@@ -83,6 +83,9 @@ def test_canonical_pipeline_emits_the_normalized_loader_contract():
     assert "REGEXP_REPLACE" in sql
     assert "association.stain_name_canonical AS stain_name" in sql
     assert "association.stain_group_canonical AS stain_group" in sql
+    assert "DATE_AT_FIRST_ICDO_DX" in sql
+    assert "timeline_start_days" in sql
+    assert "timeline_date_status" in sql
 
 
 def test_canonical_pipeline_normalizes_common_stain_aliases():

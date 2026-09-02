@@ -1,8 +1,9 @@
 -- WSI Canonical Association Pipeline
 --
 -- The output of this job is the normalized input contract consumed by the
--- cBioPortal core WSI importer. It contains pathology-only structure,
--- slide facts, and placement facts; portal clinical data stays in cBioPortal.
+-- cBioPortal core WSI importer. PHI dates/MRNs are used only inside transient
+-- CTEs to derive an integer diagnosis-relative timeline offset; they are never
+-- projected into the canonical serving table or study files.
 
 CREATE OR REPLACE TABLE cdsi_prod.pathology_data_mining.canonical_slide_associations AS
 WITH sample_sequencing AS (
@@ -163,6 +164,23 @@ patient_map AS (
     SELECT DISTINCT patient_id, mrn
     FROM sample_patient_pairs
     WHERE mrn IS NOT NULL
+),
+diagnosis_dates AS (
+    SELECT
+        CAST(MRN AS STRING) AS mrn,
+        MIN(TRY_CAST(DATE_AT_FIRST_ICDO_DX AS DATE)) AS diagnosis_date
+    FROM cdsi_eng_phi.cdm_eng_diagnosis.table_dx_impact_summary
+    WHERE MRN IS NOT NULL
+      AND DATE_AT_FIRST_ICDO_DX IS NOT NULL
+    GROUP BY CAST(MRN AS STRING)
+),
+patient_diagnosis AS (
+    SELECT
+        mapping.patient_id,
+        MIN(diagnosis.diagnosis_date) AS diagnosis_date
+    FROM patient_map mapping
+    INNER JOIN diagnosis_dates diagnosis ON diagnosis.mrn = mapping.mrn
+    GROUP BY mapping.patient_id
 ),
 procedure_dates AS (
     SELECT surgical.ACCESSION_NUMBER AS accession_number, MAX(surgical.PROCEDURE_DATE) AS procedure_date
@@ -545,7 +563,7 @@ resolved_associations AS (
         ON prediction.slide_id = CAST(association.image_id AS STRING)
 )
 SELECT
-    'canonical_slide_associations_v4' AS association_version,
+    'canonical_slide_associations_v5' AS association_version,
     CURRENT_TIMESTAMP() AS updated_at,
     association.match_level,
     association.patient_id,
@@ -597,12 +615,14 @@ SELECT
         ELSE association.slide_type
     END AS slide_type,
     CONCAT(LOWER(association.match_level), '::', association.part_key, '::', association.block_key) AS specimen_key,
-    DATEDIFF(association.procedure_date, reference.sequencing_date) AS procedure_date_days,
+    DATEDIFF(association.procedure_date, diagnosis.diagnosis_date) AS timeline_start_days,
     CASE
-        WHEN association.procedure_date IS NOT NULL AND reference.sequencing_date IS NOT NULL
-            THEN 'Procedure date relative to tumor sequencing'
-        ELSE NULL
-    END AS timepoint_source,
+        WHEN association.procedure_date IS NOT NULL AND diagnosis.diagnosis_date IS NOT NULL
+            THEN 'AVAILABLE'
+        WHEN association.procedure_date IS NULL
+            THEN 'MISSING_PROCEDURE_DATE'
+        ELSE 'MISSING_DIAGNOSIS_DATE'
+    END AS timeline_date_status,
     association.slide_path,
     CASE
         WHEN association.slide_path LIKE 's3://%'
@@ -625,5 +645,6 @@ SELECT
     thumbnail_registry.content_type AS thumbnail_content_type
 FROM resolved_associations association
 LEFT JOIN patient_reference reference ON reference.patient_id = association.patient_id
+LEFT JOIN patient_diagnosis diagnosis ON diagnosis.patient_id = association.patient_id
 LEFT JOIN thumbnail_registry
     ON thumbnail_registry.image_id = CAST(association.image_id AS STRING);

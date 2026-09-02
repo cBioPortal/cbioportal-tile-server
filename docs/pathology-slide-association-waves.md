@@ -1,26 +1,26 @@
-# Normalized WSI release flow
+# Normalized WSI snapshot flow
 
 The upstream pathology association dataset remains the source for pathology
 structure and slide facts. The Databricks/export pipeline emits the canonical
 study files; cBioPortal core resolves stable study, patient, and sample
-identifiers, validates all references, and writes one append-only release to
+identifiers, validates all references, and writes one complete snapshot to
 the normalized ClickHouse tables:
 
-- `wsi_release`
-- `wsi_release_patient`
+- `wsi_patient`
 - `wsi_part`
 - `wsi_block`
 - `wsi_slide`
 - `wsi_slide_placement`
 
-The release row is the visibility boundary. A retry receives a new release
-ID, and it is inserted only after all normalized rows have been inserted. Patient,
-sample, and slide IDs are scoped to the study; duplicate slide IDs carry a
-study-qualified source path. Unknown or mismatched study/patient/sample references, duplicate
-placements, and orphan slide associations are rejected before release.
+Blue/green database promotion is the visibility boundary. Build the inactive
+database from a fresh schema and import each snapshot once; discard and rebuild
+after a failed or repeated import. Patient, sample, and slide IDs are scoped to
+the study; duplicate slide IDs carry a study-qualified source path. Unknown or
+mismatched study/patient/sample references, duplicate placements, and orphan
+slide associations are rejected before import.
 
 cBioPortal assembles `GET /api/wsi/v2/hierarchy/{studyId}/{patientId}` from the
-active normalized release. The response contains only the nested WSI
+normalized snapshot. The response contains only the nested WSI
 structure and slide placement facts. Unmatched pathology is represented by a
 null `sampleId` and an explicit sample group; there is no `UNMATCHED` sample
 record and no flat `slide_associations` payload.
@@ -57,4 +57,4 @@ metaImport.py -s /path/to/study
 
 The tile server does not write ClickHouse. Focused API checks are available
 with `uv run pytest`; the complete tile-server suite should pass after the
-core import has published a release.
+core import has loaded the snapshot.

@@ -1,6 +1,6 @@
 import pytest
 
-from tools.generate_wsi_sample_count_clinical_file import _load_counts
+from tools.generate_wsi_sample_count_clinical_file import _load_counts, main
 from tools.wsi_study_format import write_wsi_study_files
 
 
@@ -50,3 +50,27 @@ def test_counts_reject_a_mismatched_study_identifier(tmp_path):
 
     with pytest.raises(ValueError, match="does not match"):
         _load_counts(meta_path, "study-b")
+
+
+def test_generation_keeps_wsi_metadata_and_writes_count_metadata(tmp_path, monkeypatch):
+    meta_path, _ = write_wsi_study_files(
+        tmp_path,
+        "study",
+        [row("SLIDE-1", "S-1", "BLOCK")],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "generate_wsi_sample_count_clinical_file.py",
+            "--study-id",
+            "study",
+            "--wsi-meta",
+            str(meta_path),
+            "--study-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert main() == 0
+    assert "datatype: WSI" in meta_path.read_text(encoding="utf-8")
+    assert (tmp_path / "meta_clinical_sample_wsi_counts.txt").is_file()
