@@ -64,6 +64,12 @@ def test_dev_materializer_does_not_publish_thumbnail_variants():
     assert "variant-root-uri" not in source
 
 
+def test_dev_summary_counts_non_servable_rows_by_serving_contract():
+    source = module.Path(module.__file__).read_text(encoding="utf-8")
+    assert "NOT can_serve_tiles AND is_hne" in source
+    assert "NOT can_serve_tiles AND is_ihc" in source
+
+
 def test_sql_literals_escape_text_and_preserve_booleans():
     assert _literal("O'Brien") == "'O''Brien'"
     assert _literal(True, "bool") == "TRUE"

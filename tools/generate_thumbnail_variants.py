@@ -17,7 +17,12 @@ from PIL import Image
 
 from app.config import settings
 from app.constants import INVENTORY_TABLE, THUMBNAIL_REGISTRY_TABLE
-from app.meta_store import run_query_external, run_statement
+from app.meta_store import (
+    THUMBNAIL_REGISTRY_COLUMNS,
+    require_table_columns,
+    run_query_external,
+    run_statement,
+)
 from app.slide_store import s3_opts
 from tools.generate_slide_thumbnails import _sql_string
 
@@ -40,17 +45,6 @@ def _table_name(value: str, label: str) -> str:
     if not _TABLE_NAME.fullmatch(value):
         raise ValueError(f"{label} must be a three-part table name")
     return value
-
-
-def _serving_columns_migration_sql(registry_table: str) -> str:
-    return f"""
-ALTER TABLE {registry_table}
-ADD COLUMNS (
-    serving_artifact_uri STRING,
-    serving_width INT,
-    serving_height INT
-)
-"""
 
 
 def _registry_query(
@@ -170,6 +164,28 @@ def _write(uri: str, payload: bytes) -> None:
 def _render(row: dict[str, Any], root_uri: str, force: bool) -> dict[str, Any]:
     image_id = str(row["image_id"])
     manifest_version = str(row.get("manifest_version") or "legacy")
+    # A master refresh does not invalidate an existing navigation derivative.
+    # Reusing the verified pointer avoids rewriting hundreds of thousands of
+    # identical objects whenever the registry manifest version changes.  Keep
+    # the original manifest version so the MERGE targets the existing row.
+    existing_uri = str(row.get("serving_artifact_uri") or "").strip()
+    if not force and existing_uri:
+        fs = _filesystem(existing_uri)
+        existing_path = _path(existing_uri)
+        if fs.exists(existing_path):
+            width = int(row.get("serving_width") or 0)
+            height = int(row.get("serving_height") or 0)
+            if width <= 0 or height <= 0:
+                width, height = _dimensions(existing_uri)
+            return {
+                "image_id": image_id,
+                "source_path": str(row.get("source_path") or ""),
+                "manifest_version": manifest_version,
+                "serving_artifact_uri": existing_uri,
+                "serving_width": width,
+                "serving_height": height,
+                "skipped": True,
+            }
     variant_uri = _join_uri(root_uri, image_id, manifest_version)
     if not force:
         fs = _filesystem(variant_uri)
@@ -244,13 +260,9 @@ def _ensure_serving_columns(
     warehouse_id: str,
     registry_table: str = THUMBNAIL_REGISTRY_TABLE,
 ) -> None:
-    """Add the serving-pointer columns once, while keeping reruns idempotent."""
+    """Require the complete PDM-owned registry contract before writing rows."""
     registry_table = _table_name(registry_table, "registry table")
-    try:
-        run_statement(_serving_columns_migration_sql(registry_table), warehouse_id)
-    except Exception as exc:
-        if "already exists" not in str(exc).lower():
-            raise
+    require_table_columns(registry_table, warehouse_id, THUMBNAIL_REGISTRY_COLUMNS)
 
 
 def _registry_batch_query(

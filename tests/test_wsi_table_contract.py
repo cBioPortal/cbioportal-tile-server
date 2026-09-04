@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from app import meta_store
+from tools.generate_pathology_timeline_files import _ASSOCIATION_QUERY
 from app.constants import (
     CANONICAL_ASSOCIATION_TABLE,
     SERVING_MANIFEST_TABLE,
@@ -46,3 +47,34 @@ def test_tile_server_has_no_production_databricks_bundle():
         "stain_metadata_audit.sql",
     ):
         assert not (ROOT / "tools" / filename).exists()
+
+
+def test_association_transport_matches_pdm_canonical_contract():
+    query = meta_store.PATIENT_ASSOCIATION_SQL.lower()
+    for column in (
+        "timeline_start_days",
+        "timeline_date_status",
+        "can_serve_tiles",
+        "slide_path",
+        "tile_metadata_json",
+        "thumbnail_url",
+        "thumbnail_width",
+        "thumbnail_height",
+        "thumbnail_content_type",
+    ):
+        assert column in query
+    for retired in ("procedure_date_days", "timepoint_source"):
+        assert retired not in query
+
+
+def test_timeline_query_uses_only_relative_timing_fields():
+    query = _ASSOCIATION_QUERY.lower()
+    assert "timeline_start_days" in query
+    assert "timeline_date_status" in query
+    assert "procedure_date_days" not in query
+    assert "timepoint_source" not in query
+
+
+def test_association_preference_does_not_read_retired_procedure_offsets():
+    source = (ROOT / "app" / "associations.py").read_text(encoding="utf-8")
+    assert 'row.get("procedure_date_days")' not in source

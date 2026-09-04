@@ -16,6 +16,25 @@ from .constants import (
 
 EXTERNAL_LINK_TIMEOUT_SEC = 120
 
+THUMBNAIL_REGISTRY_COLUMNS = frozenset(
+    {
+        "image_id",
+        "source_path",
+        "artifact_uri",
+        "width",
+        "height",
+        "content_type",
+        "tile_metadata_json",
+        "status",
+        "rendered_at",
+        "error_message",
+        "manifest_version",
+        "serving_artifact_uri",
+        "serving_width",
+        "serving_height",
+    }
+)
+
 PATIENT_SQL = f"""
 WITH inventory_paths AS (
     SELECT image_id, path
@@ -132,20 +151,15 @@ SELECT
     barcode,
     slide_type,
     specimen_key,
-    procedure_date_days,
-    timepoint_source,
-    -- The canonical table currently stores procedure-relative timing.  Keep
-    -- the legacy aliases in the transport contract for callers that still
-    -- consume the timeline fields.
-    procedure_date_days AS timeline_start_days,
-    if(procedure_date_days IS NULL, 'MISSING_PROCEDURE_DATE', 'AVAILABLE') AS timeline_date_status,
+    timeline_start_days,
+    timeline_date_status,
     can_serve_tiles,
     slide_path,
-    CAST(NULL AS STRING) AS tile_metadata_json,
-    CAST(NULL AS STRING) AS thumbnail_url,
-    CAST(NULL AS BIGINT) AS thumbnail_width,
-    CAST(NULL AS BIGINT) AS thumbnail_height,
-    CAST(NULL AS STRING) AS thumbnail_content_type
+    tile_metadata_json,
+    thumbnail_url,
+    thumbnail_width,
+    thumbnail_height,
+    thumbnail_content_type
 FROM {_CANONICAL_ASSOCIATIONS}
 WHERE patient_id = :patient_id
 ORDER BY image_id
@@ -249,6 +263,22 @@ def run_query_external(sql: str, warehouse_id: str, params: list | None = None) 
             payload = json.loads(response.read().decode("utf-8"))
         rows.extend(dict(zip(columns, row)) for row in payload)
     return rows
+
+
+def require_table_columns(
+    table_name: str, warehouse_id: str, required_columns: set[str] | frozenset[str]
+) -> None:
+    """Fail closed when a PDM-owned table is missing its published contract."""
+    rows = run_query_external(f"DESCRIBE TABLE {table_name}", warehouse_id)
+    available = {
+        str(row.get("col_name") or row.get("name") or "").strip().lower()
+        for row in rows
+    }
+    missing = sorted(set(required_columns) - available)
+    if missing:
+        raise RuntimeError(
+            f"{table_name} is missing required WSI contract columns: {', '.join(missing)}"
+        )
 
 
 def run_statement(sql: str, warehouse_id: str, params: list | None = None) -> None:

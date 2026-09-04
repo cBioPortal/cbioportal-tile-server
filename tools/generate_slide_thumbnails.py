@@ -31,7 +31,12 @@ from app.identity import (
     decode_policy_version,
     source_fingerprint as canonical_source_fingerprint,
 )
-from app.meta_store import run_query_external, run_statement
+from app.meta_store import (
+    THUMBNAIL_REGISTRY_COLUMNS,
+    require_table_columns,
+    run_query_external,
+    run_statement,
+)
 from app.metadata_contract import validate_tile_metadata
 from app.slide_store import open_slide, s3_opts
 from app.tiles import NoSafeThumbnailOverview, get_thumbnail_bytes_with_plan, slide_metadata
@@ -42,6 +47,7 @@ REGISTRY_UPSERT_BATCH_SIZE = 1_000
 DEFAULT_SLIDES_PER_TASK = 2_000
 MAX_ARRAY_TASKS = 480
 TASK_MARKER_VERSION = 1
+KNOWN_NON_SERVABLE_PREFIX = "non-servable:"
 
 
 def source_fingerprint(row: Any) -> str | None:
@@ -98,28 +104,6 @@ WHERE image_id IS NOT NULL
   AND slide_path LIKE 's3://%'
   AND certification_status = 'valid'
 """.format(serving_manifest_table=SERVING_MANIFEST_TABLE)
-
-REGISTRY_CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS {registry_table} (
-    image_id STRING,
-    source_path STRING,
-    artifact_uri STRING,
-    width INT,
-    height INT,
-    content_type STRING,
-    tile_metadata_json STRING,
-    status STRING,
-    rendered_at TIMESTAMP,
-    error_message STRING,
-    manifest_version STRING
-)
-USING DELTA
-""".format(registry_table=THUMBNAIL_REGISTRY_TABLE)
-
-REGISTRY_MIGRATE_SQL = """
-ALTER TABLE {registry_table}
-ADD COLUMNS (tile_metadata_json STRING)
-""".format(registry_table=THUMBNAIL_REGISTRY_TABLE)
 
 REGISTRY_SELECT_SQL = """
 SELECT
@@ -435,7 +419,14 @@ def audit_thumbnail_run(
         "record_count": sum(task["record_count"] for task in complete_tasks),
         "success_count": sum(task["success_count"] for task in complete_tasks),
         "failure_count": sum(task["failure_count"] for task in complete_tasks),
-        "publishable": not incomplete_tasks and len(marker_complete_tasks) == task_count,
+        # A terminal worker task can still contain failed slide renders.  It
+        # is complete for bookkeeping, but the run is not publishable until
+        # every candidate succeeds.
+        "publishable": (
+            not incomplete_tasks
+            and len(marker_complete_tasks) == task_count
+            and not any(task["failure_count"] for task in tasks)
+        ),
         "quarantined": quarantined,
         "tasks": tasks,
     }
@@ -774,18 +765,35 @@ def _fetch_registry_rows(warehouse_id: str) -> list[RegistryRow]:
     return _normalize_registry_rows(run_query_external(REGISTRY_SELECT_SQL, warehouse_id))
 
 
+def fetch_registry_rows_for_image_ids(
+    warehouse_id: str, image_ids: Iterable[str]
+) -> list[RegistryRow]:
+    """Fetch registry records needed by one worker task.
+
+    Array workers process small candidate shards.  Querying the complete
+    registry in every worker is both wasteful and can exhaust the SQL result
+    service, while omitting registry rows forces expensive thumbnail renders
+    for artifacts that can be upgraded in place.  Restrict the query to the
+    task's image IDs so workers can safely reuse existing artifacts and only
+    render genuinely missing ones.
+    """
+    ids = sorted({str(image_id) for image_id in image_ids if str(image_id).strip()})
+    if not ids:
+        return []
+    placeholders = ", ".join(_sql_string(image_id) for image_id in ids)
+    sql = f"""
+{REGISTRY_SELECT_SQL}
+WHERE CAST(image_id AS STRING) IN ({placeholders})
+"""
+    return _normalize_registry_rows(run_query_external(sql, warehouse_id))
+
+
 def _ensure_registry_table(warehouse_id: str) -> None:
-    run_statement(REGISTRY_CREATE_SQL, warehouse_id)
-    # Existing registries predate the source-bound contract.  Delta accepts
-    # this idempotent schema extension, allowing an in-place rollout without
-    # rewriting the generated thumbnail artifacts.
-    try:
-        run_statement(REGISTRY_MIGRATE_SQL, warehouse_id)
-    except Exception as exc:
-        # CREATE TABLE already includes the column for new installations; an
-        # "already exists" response is therefore harmless.
-        if "already exists" not in str(exc).lower():
-            raise
+    require_table_columns(
+        THUMBNAIL_REGISTRY_TABLE,
+        warehouse_id,
+        THUMBNAIL_REGISTRY_COLUMNS,
+    )
 
 
 def _dedupe_inventory_rows(rows: list[InventoryRow]) -> list[InventoryRow]:
@@ -834,14 +842,19 @@ def _select_candidate_rows(
     *,
     retry_failures_only: bool,
 ) -> list[InventoryRow]:
+    # ``retry_failures_only`` is retained for CLI compatibility. A complete
+    # release must retry every non-success row in either mode; the only rows
+    # omitted are already-current successful records.
+    del retry_failures_only
     _validate_inventory_identity(inventory_rows)
     registry_by_image_and_source = _registry_by_image_id_and_source(registry_rows)
     candidates: list[InventoryRow] = []
     for row in inventory_rows:
         registry_row = registry_by_image_and_source.get((row.image_id, row.path))
         if registry_row is None:
-            if not retry_failures_only:
-                candidates.append(row)
+            # A missing registry row is always a candidate; it must never turn
+            # a known missing slide into an accepted partial release.
+            candidates.append(row)
             continue
         # A successful row written before tile_metadata_json was introduced
         # is not a complete source-bound record. Regenerate it so migration
@@ -862,10 +875,7 @@ def _select_candidate_rows(
             or policy_stale
             or schema_stale
         )
-        if retry_failures_only:
-            if registry_row.status != "success" or needs_regeneration:
-                candidates.append(row)
-        elif registry_row.status == "success" and needs_regeneration:
+        if registry_row.status != "success" or needs_regeneration:
             candidates.append(row)
     return candidates
 
@@ -1250,7 +1260,15 @@ def _successful_registry_for_inventory(
             continue
         current_fingerprint = _require_source_fingerprint(inventory_row)
         schema = _metadata_schema_version(row.tile_metadata_json)
-        if row.source_fingerprint not in (None, current_fingerprint):
+        if row.source_fingerprint != current_fingerprint:
+            continue
+        if (
+            not row.artifact_uri.strip()
+            or row.width <= 0
+            or row.height <= 0
+            or not row.content_type.strip()
+            or not row.content_type.lower().startswith("image/")
+        ):
             continue
         if not (row.tile_metadata_json or "").strip():
             continue
@@ -1258,10 +1276,16 @@ def _successful_registry_for_inventory(
             metadata = json.loads(row.tile_metadata_json)
         except (TypeError, json.JSONDecodeError):
             continue
-        valid, _ = validate_tile_metadata(metadata, allow_legacy=True)
+        # The serving manifest is the browser contract.  Legacy metadata may
+        # remain in the registry for migration, but it is not complete enough
+        # to certify a new release; the metadata-only regeneration path must
+        # upgrade it first.
+        valid, _ = validate_tile_metadata(metadata, allow_legacy=False)
         if not valid:
             continue
-        if schema == TILE_METADATA_SCHEMA_VERSION and _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
+        if schema != TILE_METADATA_SCHEMA_VERSION:
+            continue
+        if _metadata_policy_version(row.tile_metadata_json) != decode_policy_version():
             continue
         complete.append(row)
     return complete
@@ -1272,6 +1296,7 @@ def _build_manifest_from_registry(
     *,
     master_size: int,
     manifest_version: str,
+    excluded_slides: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     slides = {
         row.image_id: {
@@ -1284,13 +1309,16 @@ def _build_manifest_from_registry(
         }
         for row in registry_rows
     }
-    return {
+    manifest = {
         "version": 1,
         "manifest_version": manifest_version,
         "generated_at": datetime.now(UTC).isoformat(),
         "master_size": master_size,
         "slides": slides,
     }
+    if excluded_slides:
+        manifest["excluded_slides"] = excluded_slides
+    return manifest
 
 
 def _staged_manifest_uri(manifest_uri: str, manifest_version: str) -> str:
@@ -1312,16 +1340,49 @@ def publish_manifest_for_current_inventory(
     manifest_uri: str,
     master_size: int,
     manifest_version: str,
+    allow_known_nonservable: bool = False,
 ) -> dict[str, Any]:
     inventory_rows = _dedupe_inventory_rows(_fetch_inventory_rows(warehouse_id))
+    registry_rows = _fetch_registry_rows(warehouse_id)
     published_registry_rows = _successful_registry_for_inventory(
         inventory_rows,
-        _fetch_registry_rows(warehouse_id),
+        registry_rows,
     )
+    inventory_keys = {(row.image_id, row.path) for row in inventory_rows}
+    published_keys = {(row.image_id, row.source_path) for row in published_registry_rows}
+    missing_keys = sorted(inventory_keys - published_keys)
+    excluded_slides: list[dict[str, str]] = []
+    if allow_known_nonservable and missing_keys:
+        failed_by_key = {
+            (row.image_id, row.source_path): row
+            for row in registry_rows
+            if row.status == "failed"
+        }
+        known_missing: list[tuple[str, str]] = []
+        for key in missing_keys:
+            row = failed_by_key.get(key)
+            reason = (row.error_message or "").strip() if row else ""
+            if reason.lower().startswith(KNOWN_NON_SERVABLE_PREFIX):
+                known_missing.append(key)
+                excluded_slides.append(
+                    {
+                        "image_id": key[0],
+                        "source_path": key[1],
+                        "reason": reason,
+                    }
+                )
+        missing_keys = sorted(set(missing_keys) - set(known_missing))
+    if missing_keys:
+        raise RuntimeError(
+            "refusing to publish a partial WSI manifest: "
+            f"{len(missing_keys)} of {len(inventory_rows)} inventory slides "
+            "do not have a complete current thumbnail registry record"
+        )
     manifest = _build_manifest_from_registry(
         published_registry_rows,
         master_size=master_size,
         manifest_version=manifest_version,
+        excluded_slides=excluded_slides,
     )
     _publish_manifest(manifest_uri, manifest, manifest_version)
     return manifest
@@ -1338,12 +1399,16 @@ def run_incremental_pipeline(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[InventoryRow]]:
     _ensure_registry_table(warehouse_id)
     registry_rows = _fetch_registry_rows(warehouse_id)
-    candidates = discover_candidate_rows(
+    all_candidates = discover_candidate_rows(
         warehouse_id=warehouse_id,
         retry_failures_only=retry_failures_only,
-        limit=limit,
+        limit=None,
         registry_rows=registry_rows,
     )
+    candidates = all_candidates if limit is None else all_candidates[:limit]
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+    partial_batch = limit is not None and len(candidates) < len(all_candidates)
     manifest_version = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     with tempfile.TemporaryDirectory(
         prefix="thumbnail-results-",
@@ -1360,6 +1425,16 @@ def run_incremental_pipeline(
             registry_rows=registry_rows,
         )
         publish_registry_results(warehouse_id, [result_path])
+    if partial_batch:
+        raise RuntimeError(
+            "refusing to publish a partial WSI manifest: --limit selected "
+            f"{len(candidates)} of {len(all_candidates)} pending slides"
+        )
+    if failures:
+        raise RuntimeError(
+            "refusing to publish a partial WSI manifest: "
+            f"{len(failures)} of {len(candidates)} thumbnail renders failed"
+        )
     manifest = publish_manifest_for_current_inventory(
         warehouse_id=warehouse_id,
         manifest_uri=manifest_uri,
@@ -1398,7 +1473,14 @@ def main() -> int:
     parser.add_argument("--master-size", type=int, default=settings.thumbnail_master_size)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--failures-path", default="")
-    parser.add_argument("--retry-failures-only", action="store_true")
+    parser.add_argument(
+        "--retry-failures-only",
+        action="store_true",
+        help=(
+            "deprecated compatibility flag; all incomplete rows are retried "
+            "in every accepted run"
+        ),
+    )
     parser.add_argument("--summary-path", default="")
     args = parser.parse_args()
 

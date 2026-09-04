@@ -105,6 +105,8 @@ changing its candidate snapshot. Block cache is disabled for offline
 generation so one-time slide reads do not accumulate on GPFS. Successful
 publication removes candidate, result, temporary, and block-cache directories
 while retaining summaries, failure logs, and quarantined partial results.
+The PDM WSI bundle creates and upgrades the registry schema; thumbnail workers
+must only write rows and fail closed when the required columns are absent.
 
 ## Production thumbnail publication
 

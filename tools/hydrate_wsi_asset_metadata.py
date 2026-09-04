@@ -146,19 +146,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--fail-on-incomplete",
         action="store_true",
-        help="return non-zero after writing when any row lacks a complete registry record",
+        help="deprecated alias for the default fail-closed behavior",
+    )
+    parser.add_argument(
+        "--allow-incomplete",
+        action="store_true",
+        help=(
+            "diagnostic-only escape hatch: return success even when rows lack "
+            "a complete registry record"
+        ),
     )
     args = parser.parse_args(argv)
 
     study_id, rows = read_wsi_study(args.meta_wsi)
     registry = _read_registry(args.registry_jsonl)
     hydrated, stats = hydrate_rows(rows, registry)
-    _write_atomically(
-        args.output_data_wsi.parent,
-        study_id,
-        hydrated,
-        args.output_data_wsi,
-    )
     if args.report_json:
         incomplete_image_ids = [
             str(row.get("image_id") or "")
@@ -186,7 +188,19 @@ def main(argv: list[str] | None = None) -> int:
         temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, args.report_json)
     print(json.dumps(stats, sort_keys=True))
-    return 2 if args.fail_on_incomplete and (stats["incomplete"] or stats["source_mismatch"]) else 0
+    incomplete = stats["incomplete"] or stats["source_mismatch"]
+    if incomplete and not args.allow_incomplete:
+        # Do not leave a partially hydrated data file behind. The caller can
+        # inspect --report-json, repair the registry, and retry; the previous
+        # accepted snapshot remains untouched.
+        return 2
+    _write_atomically(
+        args.output_data_wsi.parent,
+        study_id,
+        hydrated,
+        args.output_data_wsi,
+    )
+    return 0
 
 
 if __name__ == "__main__":

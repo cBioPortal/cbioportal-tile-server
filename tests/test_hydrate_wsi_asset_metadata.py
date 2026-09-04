@@ -1,3 +1,6 @@
+from unittest.mock import patch
+
+from tools import hydrate_wsi_asset_metadata as module
 from tools.hydrate_wsi_asset_metadata import hydrate_rows
 
 
@@ -78,3 +81,27 @@ def test_does_not_replace_an_existing_source_with_a_different_registry_source():
     assert stats["source_mismatch"] == 1
     assert rows[0]["can_serve_tiles"] is False
     assert rows[0]["slide_path"] == "s3://other-slides/1.svs"
+
+
+def test_fail_closed_main_does_not_overwrite_output_with_partial_rows(tmp_path):
+    output = tmp_path / "data_wsi.txt"
+    output.write_text("previous accepted snapshot\n", encoding="utf-8")
+    with (
+        patch.object(module, "read_wsi_study", return_value=("study", [_row("1")])),
+        patch.object(module, "_read_registry", return_value={}),
+        patch.object(module, "_write_atomically") as write_atomically,
+    ):
+        exit_code = module.main(
+            [
+                "--meta-wsi",
+                str(tmp_path / "meta_wsi.txt"),
+                "--registry-jsonl",
+                str(tmp_path / "registry.jsonl"),
+                "--output-data-wsi",
+                str(output),
+            ]
+        )
+
+    assert exit_code == 2
+    assert output.read_text(encoding="utf-8") == "previous accepted snapshot\n"
+    write_atomically.assert_not_called()

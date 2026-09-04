@@ -322,7 +322,7 @@ class TestBatchSafety:
 
         audit = module.audit_thumbnail_run(str(run_dir), adopt_legacy=True)
 
-        assert audit["publishable"] is True
+        assert audit["publishable"] is False
         assert audit["legacy_adopted_task_indexes"] == [0]
         assert (run_dir / "results" / "task-0000.done.json").exists()
 
@@ -511,7 +511,7 @@ class TestDeltaSelection:
             retry_failures_only=True,
         ) == inventory
 
-    def test_default_mode_skips_existing_failed_rows(self):
+    def test_default_mode_retries_existing_failed_rows(self):
         inventory = [_inventory("1492808", "s3://bucket/b.svs")]
         registry = [
             module.RegistryRow(
@@ -534,7 +534,7 @@ class TestDeltaSelection:
             retry_failures_only=False,
         )
 
-        assert rows == []
+        assert rows == inventory
 
     def test_retry_mode_uses_failed_current_source_over_old_success(self):
         current = _inventory("1492807", "s3://bucket/promoted.svs", size=200)
@@ -648,9 +648,122 @@ class TestManifestBuild:
 
         assert module._successful_registry_for_inventory(inventory, registry) == []
 
+    def test_publisher_rejects_any_inventory_slide_missing_a_complete_record(self):
+        inventory = [
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
+        ]
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=inventory[0].path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
+            )
+        ]
+
+        with (
+            patch.object(module, "_fetch_inventory_rows", return_value=inventory),
+            patch.object(module, "_fetch_registry_rows", return_value=registry),
+            patch.object(module, "_publish_manifest") as publish_manifest,
+        ):
+            with pytest.raises(RuntimeError, match="refusing to publish a partial WSI manifest"):
+                module.publish_manifest_for_current_inventory(
+                    warehouse_id="wh",
+                    manifest_uri="s3://thumbs/manifest.json",
+                    master_size=1024,
+                    manifest_version="20260803120000",
+                )
+
+        publish_manifest.assert_not_called()
+
+    def test_publisher_can_exclude_explicitly_nonservable_source(self):
+        inventory = [
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
+        ]
+        registry = [
+            module.RegistryRow(
+                image_id="1492807",
+                source_path=inventory[0].path,
+                artifact_uri="s3://thumbs/1492807.jpg",
+                width=100,
+                height=80,
+                content_type="image/jpeg",
+                status="success",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="",
+                manifest_version="20260803000000",
+                tile_metadata_json=_tile_metadata(inventory[0]),
+                source_fingerprint=module.source_fingerprint(inventory[0]),
+            ),
+            module.RegistryRow(
+                image_id="1492808",
+                source_path=inventory[1].path,
+                artifact_uri="",
+                width=0,
+                height=0,
+                content_type="image/jpeg",
+                status="failed",
+                rendered_at="2026-08-03T00:00:00+00:00",
+                error_message="non-servable: unsupported multi-plane source",
+                manifest_version="20260803000000",
+            ),
+        ]
+
+        with (
+            patch.object(module, "_fetch_inventory_rows", return_value=inventory),
+            patch.object(module, "_fetch_registry_rows", return_value=registry),
+            patch.object(module, "_publish_manifest") as publish_manifest,
+        ):
+            manifest = module.publish_manifest_for_current_inventory(
+                warehouse_id="wh",
+                manifest_uri="s3://thumbs/manifest.json",
+                master_size=1024,
+                manifest_version="20260803120000",
+                allow_known_nonservable=True,
+            )
+
+        assert list(manifest["slides"]) == ["1492807"]
+        assert manifest["excluded_slides"][0]["image_id"] == "1492808"
+        publish_manifest.assert_called_once()
+
 
 class TestRunIncrementalPipeline:
-    def test_keeps_prior_good_entries_when_current_batch_has_failures(self):
+    def test_canary_limit_cannot_publish(self):
+        inventory = [
+            _inventory("1492807", "s3://bucket/a.svs"),
+            _inventory("1492808", "s3://bucket/b.svs"),
+        ]
+        with (
+            patch.object(module, "_ensure_registry_table"),
+            patch.object(module, "_fetch_inventory_rows", return_value=inventory),
+            patch.object(module, "_fetch_registry_rows", return_value=[]),
+            patch.object(module, "process_candidate_rows", return_value=[]),
+            patch.object(module, "publish_registry_results"),
+            patch.object(module, "_publish_manifest") as publish_manifest,
+        ):
+            with pytest.raises(RuntimeError, match="--limit selected 1 of 2"):
+                module.run_incremental_pipeline(
+                    warehouse_id="wh",
+                    manifest_uri="s3://thumbs/manifest.json",
+                    root_uri="s3://thumbs/masters",
+                    master_size=1024,
+                    limit=1,
+                    retry_failures_only=False,
+                )
+
+        publish_manifest.assert_not_called()
+
+    def test_does_not_publish_when_current_batch_has_failures(self):
         inventory = [
             _inventory("1492807", "s3://bucket/a.svs"),
             _inventory("1492808", "s3://bucket/b.svs"),
@@ -694,19 +807,17 @@ class TestRunIncrementalPipeline:
             patch.object(module, "_upsert_registry_rows"),
             patch.object(module, "_publish_manifest") as publish_manifest,
         ):
-            manifest, failures, candidates = module.run_incremental_pipeline(
-                warehouse_id="wh",
-                manifest_uri="s3://thumbs/manifest.json",
-                root_uri="s3://thumbs/masters",
-                master_size=1024,
-                limit=None,
-                retry_failures_only=False,
-            )
+            with pytest.raises(RuntimeError, match="refusing to publish a partial WSI manifest"):
+                module.run_incremental_pipeline(
+                    warehouse_id="wh",
+                    manifest_uri="s3://thumbs/manifest.json",
+                    root_uri="s3://thumbs/masters",
+                    master_size=1024,
+                    limit=None,
+                    retry_failures_only=False,
+                )
 
-        assert [row.image_id for row in candidates] == ["1492808"]
-        assert len(failures) == 1
-        assert list(manifest["slides"]) == ["1492807"]
-        publish_manifest.assert_called_once()
+        publish_manifest.assert_not_called()
 
 
 class TestSummaryPayload:

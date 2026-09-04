@@ -73,8 +73,6 @@ def canonical_association_preference(row: dict[str, Any]) -> tuple[object, ...]:
         block_number = block_number or legacy_block_number
     procedure_days = row.get("timeline_start_days")
     if procedure_days is None:
-        procedure_days = row.get("procedure_date_days")
-    if procedure_days is None:
         procedure_days = row.get("slide_timepoint_days")
     return (
         association_path_rank(row.get("slide_path")),

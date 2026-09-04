@@ -130,7 +130,84 @@ def test_resolved_flags_override_stale_stain_text_for_timeline_subtype():
     assert rows[0][5] == "IHC"
 
 
-def test_build_pathology_timeline_rows_uses_canonical_procedure_offset():
+def test_databricks_boolean_strings_keep_other_slides_on_timeline():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-3",
+                "sample_id": "S-3",
+                "match_level": "BLOCK",
+                "image_id": "img-5",
+                "part_number": "9",
+                "block_number": "7TP2",
+                "block_label": "7TP2",
+                "stain_name": "ELASTIC",
+                "stain_group": "SS",
+                "slide_path": "s3://bucket/img-5.svs",
+                "is_hne": "false",
+                "is_ihc": "false",
+                "timeline_start_days": "217",
+                "timeline_date_status": "AVAILABLE",
+            }
+        ],
+        "study_3",
+    )
+    assert len(rows) == 1
+    assert rows[0][5] == "Other"
+    assert rows[0][8:11] == ["1", "0", "1"]
+
+
+def test_databricks_false_boolean_string_is_non_servable_even_with_source_path():
+    """A serialized warehouse FALSE must never create a viewable linkout."""
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-3b",
+                "sample_id": "S-3b",
+                "match_level": "BLOCK",
+                "image_id": "img-5b",
+                "part_number": "9",
+                "block_number": "7TP2",
+                "block_label": "7TP2",
+                "stain_name": "H&E",
+                "stain_group": "H&E (Initial)",
+                "slide_path": "s3://bucket/img-5b.svs",
+                "can_serve_tiles": "FALSE",
+                "timeline_start_days": "217",
+                "timeline_date_status": "AVAILABLE",
+            }
+        ],
+        "study_3b",
+    )
+
+    assert rows[0][8:11] == ["0", "1", "1"]
+    assert rows[0][-1] == ""
+
+
+def test_specimen_key_is_redacted_before_linkout_generation():
+    rows = build_pathology_timeline_rows(
+        [
+            {
+                "patient_id": "P-4",
+                "sample_id": "S-4",
+                "match_level": "BLOCK",
+                "image_id": "img-6",
+                "part_number": 1,
+                "block_number": "2020-01-02",
+                "block_label": "A1",
+                "specimen_key": "block::part:1::block:2020-01-02",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "timeline_start_days": 1,
+                "timeline_date_status": "AVAILABLE",
+            }
+        ],
+        "study_4",
+    )
+    assert "2020-01-02" not in rows[0][-1]
+
+
+def test_build_pathology_timeline_rows_uses_canonical_relative_offset():
     rows = build_pathology_timeline_rows(
         [
             {
@@ -143,15 +220,15 @@ def test_build_pathology_timeline_rows_uses_canonical_procedure_offset():
                 "stain_name": "H&E",
                 "stain_group": "H&E",
                 "slide_path": "s3://bucket/slide-1.svs",
-                "procedure_date_days": -17,
-                "timepoint_source": "Procedure date",
+                "timeline_start_days": -17,
+                "timeline_date_status": "AVAILABLE",
             }
         ],
         "study_1",
     )
 
     assert rows[0][1] == "-17"
-    assert rows[0][11] == "Procedure date"
+    assert rows[0][11] == "Procedure date relative to first ICD-O diagnosis"
 
 
 def test_write_pathology_timeline_files_returns_written_pair(tmp_path: Path):
@@ -169,7 +246,8 @@ def test_write_pathology_timeline_files_returns_written_pair(tmp_path: Path):
                 "stain_name": "H&E",
                 "stain_group": "H&E",
                 "slide_path": "s3://bucket/slide-1.svs",
-                "procedure_date_days": 0,
+                "timeline_start_days": 0,
+                "timeline_date_status": "AVAILABLE",
             }
         ],
     )

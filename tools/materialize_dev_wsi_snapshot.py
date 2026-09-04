@@ -286,8 +286,9 @@ thumbnail_url STRING, thumbnail_width INT, thumbnail_height INT, thumbnail_conte
     meta_store.run_statement(
         f"""CREATE TABLE {tables['registry']} (
 image_id STRING, source_path STRING, artifact_uri STRING, width INT, height INT,
-content_type STRING, tile_metadata_json STRING, status STRING, rendered_at TIMESTAMP,
-error_message STRING, manifest_version STRING
+ content_type STRING, tile_metadata_json STRING, status STRING, rendered_at TIMESTAMP,
+ error_message STRING, manifest_version STRING, serving_artifact_uri STRING,
+ serving_width INT, serving_height INT
 ) USING DELTA""",
         warehouse_id,
     )
@@ -510,8 +511,8 @@ LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source
 SELECT sample_id, patient_id, MAX(association_version) AS association_version,
  MAX(updated_at) AS updated_at,
  COUNT(DISTINCT CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN image_id END) AS servable_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_hne THEN image_id END) AS non_servable_hne_slide_count,
- COUNT(DISTINCT CASE WHEN COALESCE(slide_path, '') NOT LIKE 's3://%' AND is_ihc THEN image_id END) AS non_servable_ihc_slide_count,
+ COUNT(DISTINCT CASE WHEN NOT can_serve_tiles AND is_hne THEN image_id END) AS non_servable_hne_slide_count,
+ COUNT(DISTINCT CASE WHEN NOT can_serve_tiles AND is_ihc THEN image_id END) AS non_servable_ihc_slide_count,
  MAX(CASE WHEN can_serve_tiles AND is_hne THEN 1 ELSE 0 END) AS has_hne,
  MAX(CASE WHEN can_serve_tiles AND is_ihc THEN 1 ELSE 0 END) AS has_ihc,
  ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN COALESCE(slide_type, stain_name) END)), ';') AS stain_types
@@ -527,6 +528,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--namespace", default="cdsi_dev.wsi_test")
     parser.add_argument("--warehouse-id", required=True)
     parser.add_argument("--manifest-uri")
+    parser.add_argument(
+        "--allow-incomplete-assets",
+        action="store_true",
+        help=(
+            "diagnostic-only escape hatch: load non-servable rows when the "
+            "registry has not hydrated every source asset. Normal dev loads "
+            "fail closed instead of presenting a partial WSI study."
+        ),
+    )
     parser.add_argument(
         "--artifact-root-uri",
         default=os.environ.get("THUMBNAIL_ARTIFACT_ROOT_URI", ""),
@@ -555,6 +565,15 @@ def main(argv: list[str] | None = None) -> int:
         "hydrated WSI asset fields: "
         + json.dumps(hydration_stats, sort_keys=True)
     )
+    if not args.allow_incomplete_assets and (
+        hydration_stats["incomplete"] or hydration_stats["source_mismatch"]
+    ):
+        raise ValueError(
+            "WSI asset hydration is incomplete: "
+            f"{hydration_stats['incomplete']} incomplete, "
+            f"{hydration_stats['source_mismatch']} source mismatches; "
+            "publish the complete thumbnail registry before loading the study"
+        )
     _validate_registry_artifacts(registry_records, args.artifact_root_uri)
     tables = _create_tables(args.warehouse_id, args.namespace)
     _load_source(args.warehouse_id, tables["source"], source_rows, args.batch_size)

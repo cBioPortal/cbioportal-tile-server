@@ -27,6 +27,8 @@ handlers. The production sequence is:
 1. A separate cron, Slurm, or equivalent scheduled job runs
    `tools/run_thumbnail_pipeline_slurm.sh` (or an equivalent wrapper around
    `tools/generate_slide_thumbnails.py`).
+   The batch retries every missing, failed, or stale slide and refuses to
+   publish a manifest until the complete inventory has current assets.
 2. The batch reads eligible `slide_inventory` rows and source slides from the
    S3/Dell ECS-compatible store, writes immutable master JPEGs back to that
    store, and upserts
@@ -36,22 +38,27 @@ handlers. The production sequence is:
 3. The thumbnail publisher automatically runs
    `tools/generate_thumbnail_variants.py` after the master registry is
    published. It creates 128×96 navigation derivatives under a
-   manifest-versioned prefix and publishes their serving pointers. The first
-   run adds the serving-pointer columns to the existing registry; reruns are
-   idempotent.
+   manifest-versioned prefix and publishes their serving pointers. The PDM
+   bundle owns the complete registry schema; workers fail closed if it is
+   missing or outdated.
 4. The PDM Databricks WSI bundle publishes the serving manifest, then computes
    canonical associations and `can_serve_tiles`. The bundle must run only
    after the thumbnail batch has completed for the input inventory (use a job
    dependency or completion watermark).
 5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
    dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`, and writes
-   the standard pathology timeline pair with procedure offsets and provenance.
+   the standard pathology timeline pair with diagnosis-relative offsets and
+   provenance.
    Every canonical slide with an available timeline date is represented;
    explicitly classified non-H&E/IHC slides use the `Other` timeline subtype
    and an all-slides linkout. Rows without a usable timeline date remain in
-   the WSI hierarchy but cannot be placed on the timeline.
+   the WSI hierarchy but cannot be placed on the timeline. Free-text specimen
+   labels are de-identified before validation so dates or MRN-like labels
+   cannot leak into the timeline.
 6. cBioPortal core imports the WSI snapshot and timeline files through the
-   standard study importer and is the sole ClickHouse writer.
+   standard study importer and is the sole ClickHouse writer. The exporter
+   reads the migrated `timeline_start_days` contract and temporarily accepts
+   the legacy timing columns while the warehouse migration is rolling out.
 
 The frontend is read-only: it requests the backend access bundle and then
 requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes
@@ -217,10 +224,14 @@ The output replacement is atomic. The command reports hydrated, unchanged,
 incomplete, and source-mismatch rows; only complete successful registry rows
 become servable. `materialize_dev_wsi_snapshot.py` performs this same join
 automatically before loading its isolated dev namespace, so the explicit
-command is only needed when repairing an already-exported study directory. Add
-`--fail-on-incomplete` in CI when a release must contain a complete pixel
-bundle for every association; omit it for a study that intentionally retains
-unavailable source rows as non-servable provenance.
+hydration command and the dev materializer fail closed by default when any
+source row is incomplete. Use `--allow-incomplete` or
+`--allow-incomplete-assets` only for diagnosis; those outputs are not valid
+release inputs.
+The explicit hydration command is useful when repairing an already-exported
+study directory. It fails closed by default when any association lacks a
+complete pixel bundle; use `--allow-incomplete` only for a diagnostic snapshot
+that intentionally retains unavailable source rows as non-servable provenance.
 
 Load the exported files through the standard cBioPortal importer. The core
 importer validates and resolves the complete snapshot, then writes the
