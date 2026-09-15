@@ -460,6 +460,7 @@ from pathlib import Path
 
 from tools.generate_slide_thumbnails import iter_candidate_rows
 from tools.generate_slide_thumbnails import process_candidate_rows
+from tools.generate_slide_thumbnails import fetch_registry_rows_for_image_ids
 from tools.generate_slide_thumbnails import write_task_completion_marker
 
 meta_file, result_dir, summary_path, failures_path, task_index, job_id = sys.argv[1:]
@@ -470,15 +471,21 @@ task_path = Path(meta["candidate_dir"]) / f"task-{task_number:04d}.jsonl"
 result_path = Path(result_dir) / f"task-{task_number:04d}.jsonl"
 partial_path = Path(f"{result_path}.partial.{job_id}.{os.getpid()}")
 partial_path.unlink(missing_ok=True)
-candidate_count = sum(1 for _ in iter_candidate_rows(str(task_path)))
+task_rows = list(iter_candidate_rows(str(task_path)))
+candidate_count = len(task_rows)
+registry_rows = fetch_registry_rows_for_image_ids(
+    meta["warehouse_id"],
+    (row.image_id for row in task_rows),
+)
 failures = process_candidate_rows(
     warehouse_id=meta["warehouse_id"],
     root_uri=meta["root_uri"],
     master_size=int(meta["master_size"]),
-    rows=iter_candidate_rows(str(task_path)),
+    rows=task_rows,
     manifest_version=meta["manifest_version"],
     result_path=str(partial_path),
     timeout_sec=int(meta["batch_timeout_sec"]),
+    registry_rows=registry_rows,
 )
 os.replace(partial_path, result_path)
 write_task_completion_marker(
@@ -523,18 +530,22 @@ from tools.generate_slide_thumbnails import cleanup_run_artifacts
 from tools.generate_slide_thumbnails import _iter_result_records
 from tools.generate_slide_thumbnails import publish_manifest_for_current_inventory
 from tools.generate_slide_thumbnails import publish_registry_results
-from tools.generate_thumbnail_variants import run_rows as generate_thumbnail_variants
+from tools.generate_thumbnail_variants import run as generate_thumbnail_variants
 from tools.generate_thumbnail_variants import variant_root_for_master
 
 meta_file, summary_path, failures_path, run_dir = sys.argv[1:]
 with open(meta_file, "r", encoding="utf-8") as handle:
     meta = json.load(handle)
 audit = audit_thumbnail_run(run_dir)
-if not audit["publishable"]:
+if audit["incomplete_task_count"]:
     raise RuntimeError(
         "thumbnail run is not publishable; incomplete tasks: "
         + ",".join(str(index) for index in audit["incomplete_task_indexes"])
     )
+# Publish every completed result, including explicit failures.  This makes a
+# failed release resumable: the retry pipeline can see the successful rows and
+# target only the failed source assets.  The manifest publication below still
+# fails closed until every inventory row has a complete current record.
 result_paths = [
     str(Path(task["result_path"]))
     for task in audit["tasks"]
@@ -543,14 +554,10 @@ result_paths = [
 stats = publish_registry_results(meta["warehouse_id"], result_paths)
 variant_summary = generate_thumbnail_variants(
     warehouse_id=meta["warehouse_id"],
-    rows=[
-        record
-        for record in _iter_result_records(result_paths)
-        if record.get("status") == "success" and record.get("artifact_uri")
-    ],
     root_uri=variant_root_for_master(meta["root_uri"]),
     workers=32,
     batch_size=5000,
+    limit=None,
     force=False,
 )
 if variant_summary["failed_count"]:
@@ -563,6 +570,7 @@ manifest = publish_manifest_for_current_inventory(
     manifest_uri=meta["manifest_uri"],
     master_size=int(meta["master_size"]),
     manifest_version=meta["manifest_version"],
+    allow_known_nonservable=True,
 )
 failures = [record for record in _iter_result_records(result_paths) if record.get("status") != "success"]
 summary = {

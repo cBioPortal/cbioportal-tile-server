@@ -24,14 +24,19 @@ def _table_name(environment_name: str, default: str) -> str:
         raise ValueError(f"{environment_name} must be a three-part table name")
     return value
 
-#: De-identified slide ↔ clinical join table (PHI-restricted via Unity Catalog)
-DEID_TABLE = "cdsi_eng_phi.pdm_base_tables_dev.impact_block_matched_slides_v1"
+#: De-identified slide ↔ clinical join table (PHI-restricted via Unity Catalog).
+#: Production must read the PDM production schema; local snapshots override it.
+DEID_TABLE = _table_name(
+    "WSI_DEID_TABLE", "cdsi_eng_phi.pdm_base_tables.impact_block_matched_slides_v1"
+)
 
 #: Legacy part-level sample ↔ slide relation with broader coverage than block matching
 PART_MATCH_TABLE = "cdsi_eng_phi.pdm_base_tables.impact_matched_slides"
 
-#: Cleaned slide-level universe used to scope diagnostic pathology coverage
-CLEANED_SLIDE_TABLE = "cdsi_eng_phi.pdm_base_tables_dev.case_breakdown_cleaned_v2"
+#: Cleaned slide-level universe used to scope diagnostic pathology coverage.
+CLEANED_SLIDE_TABLE = _table_name(
+    "WSI_CLEANED_SLIDE_TABLE", "cdsi_eng_phi.pdm_base_tables.case_breakdown_cleaned_v2"
+)
 
 #: Slide file inventory — contains s3:// paths for each image_id. The isolated
 #: dev snapshot overrides this with its source table.

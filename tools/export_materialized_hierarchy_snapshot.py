@@ -13,8 +13,10 @@ from app.config import settings
 
 try:
     from tools.wsi_study_format import write_wsi_study_files
+    from tools.generate_pathology_timeline_files import write_pathology_timeline_files
 except ModuleNotFoundError:  # Direct execution from the tools directory.
     from wsi_study_format import write_wsi_study_files
+    from generate_pathology_timeline_files import write_pathology_timeline_files
 
 
 def _read_patient_ids(study_dir: Path) -> list[str]:
@@ -65,6 +67,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
+        raise ValueError(
+            "WSI_ALLOWED_SOURCE_PREFIXES and WSI_ALLOWED_THUMBNAIL_PREFIXES "
+            "must be configured before publishing WSI files"
+        )
     study_dir = Path(args.study_dir).expanduser().resolve()
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
@@ -97,18 +104,19 @@ def main() -> int:
     if not rows:
         raise ValueError(f"No WSI association rows found for {args.study_id}")
     meta_path, data_path = write_wsi_study_files(output_dir, args.study_id, rows)
+    timeline_meta_path, timeline_data_path, timeline_row_count = (
+        write_pathology_timeline_files(output_dir, args.study_id, rows)
+    )
 
     print(
         f"Wrote {len(rows)} canonical WSI rows for {args.study_id} to "
         f"{meta_path} and {data_path}"
         f" (missing {len(missing)} patients)"
     )
-    if missing:
-        print("Missing patients:")
-        for patient_id in missing[:50]:
-            print(patient_id)
-        if len(missing) > 50:
-            print(f"... and {len(missing) - 50} more")
+    print(
+        f"Wrote {timeline_row_count} pathology timeline rows to "
+        f"{timeline_meta_path} and {timeline_data_path}"
+    )
     return 0
 
 

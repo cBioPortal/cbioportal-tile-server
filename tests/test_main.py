@@ -10,6 +10,46 @@ from tifffile import TiffFileError
 import app.main as main_module
 
 
+class TestReadinessIdentity:
+    def test_release_identity_is_reported_when_complete(self, monkeypatch):
+        monkeypatch.setattr(main_module.settings, "release_id", "candidate-1")
+        monkeypatch.setattr(main_module.settings, "image_git_sha", "a" * 40)
+        monkeypatch.setattr(
+            main_module.settings, "serving_contract_version", "wsi-serving-v2"
+        )
+        monkeypatch.setattr(
+            main_module.settings, "wsi_allowed_source_prefixes", ("s3://pathology/",)
+        )
+        monkeypatch.setattr(
+            main_module.settings,
+            "wsi_allowed_thumbnail_prefixes",
+            ("s3://mskmind-bkt/wsi-thumbnails/",),
+        )
+        with patch.object(main_module, "validate_wsi_auth_configuration"):
+            status, payload = main_module._readiness_status()
+
+        assert status == 200
+        assert payload["release_id"] == "candidate-1"
+        assert payload["image_git_sha"] == "a" * 40
+
+    def test_partial_release_identity_fails_readiness(self, monkeypatch):
+        monkeypatch.setattr(main_module.settings, "release_id", "candidate-1")
+        monkeypatch.setattr(main_module.settings, "image_git_sha", "")
+        monkeypatch.setattr(
+            main_module.settings, "wsi_allowed_source_prefixes", ("s3://pathology/",)
+        )
+        monkeypatch.setattr(
+            main_module.settings,
+            "wsi_allowed_thumbnail_prefixes",
+            ("s3://mskmind-bkt/wsi-thumbnails/",),
+        )
+        with patch.object(main_module, "validate_wsi_auth_configuration"):
+            status, payload = main_module._readiness_status()
+
+        assert status == 503
+        assert payload["status"] == "unavailable"
+
+
 class TestSingleFlight:
     @pytest.mark.asyncio
     async def test_long_owner_renews_distributed_lock(self, monkeypatch):
