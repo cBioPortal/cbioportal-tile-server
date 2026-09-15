@@ -53,6 +53,11 @@ def _env_json_file_map(name: str) -> dict[str, str]:
 
 @dataclass
 class Settings:
+    release_id: str = field(default_factory=lambda: _env_str("WSI_RELEASE_ID"))
+    image_git_sha: str = field(default_factory=lambda: _env_str("IMAGE_GIT_SHA"))
+    serving_contract_version: str = field(
+        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v2")
+    )
     # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
     wsi_auth_previous_secret: str = field(
@@ -65,6 +70,15 @@ class Settings:
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
+    )
+    # URI prefixes are an additional publication/privacy boundary. Keep these
+    # empty for generic local development; production deployments must set
+    # both allowlists explicitly before serving tiles.
+    wsi_allowed_source_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_PREFIXES", "")
+    )
+    wsi_allowed_thumbnail_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_THUMBNAIL_PREFIXES", "")
     )
 
     # S3 / Dell ECS connection

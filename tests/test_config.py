@@ -89,6 +89,27 @@ class TestOtherSettings:
         s = make_settings(WSI_AUTH_MAX_TTL="600")
         assert s.wsi_auth_max_ttl == 600
 
+    def test_release_identity_reads_environment(self):
+        s = make_settings(
+            WSI_RELEASE_ID="candidate-1",
+            IMAGE_GIT_SHA="a" * 40,
+            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v2",
+        )
+        assert s.release_id == "candidate-1"
+        assert s.image_git_sha == "a" * 40
+        assert s.serving_contract_version == "wsi-serving-v2"
+
+    def test_wsi_artifact_prefixes_read_environment(self):
+        s = make_settings(
+            WSI_ALLOWED_SOURCE_PREFIXES="s3://slides/, file:///app/testdata/",
+            WSI_ALLOWED_THUMBNAIL_PREFIXES="s3://thumbs/",
+        )
+        assert s.wsi_allowed_source_prefixes == [
+            "s3://slides/",
+            "file:///app/testdata/",
+        ]
+        assert s.wsi_allowed_thumbnail_prefixes == ["s3://thumbs/"]
+
     def test_max_image_operations_default(self):
         s = make_settings()
         assert s.max_image_operations == 2

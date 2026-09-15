@@ -14,6 +14,7 @@ import csv
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,9 +31,26 @@ from app.associations import (  # noqa: E402
     canonicalize_association_rows,
     derive_block_fields as _derive_block_fields,
 )
+from app.deid import DeidViolation, validate_timeline_public_row  # noqa: E402
 
 _TIMELINE_META_FILENAME = "meta_clinical_timeline_pathology_slides.txt"
 _TIMELINE_DATA_FILENAME = "data_clinical_timeline_pathology_slides.txt"
+
+_TIMELINE_DATE_PATTERNS = (
+    re.compile(r"(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)"),
+    re.compile(r"(?<!\d)(?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])[-_/](?:19|20)\d{2}(?!\d)"),
+    re.compile(r"(?<!\d)(?:0?[1-9]|[12]\d|3[01])[-_/](?:0?[1-9]|1[0-2])[-_/](?:19|20)\d{2}(?!\d)"),
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|"
+        r"may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?)\s+(?:0?[1-9]|[12]\d|3[01])(?:st|nd|rd|th)?"
+        r"(?:,)?\s+(?:19|20)\d{2})(?![a-z0-9])"
+    ),
+    re.compile(r"(?<!\d)(?:19|20)\d{6}(?!\d)"),
+)
+_TIMELINE_MRN_PATTERN = re.compile(
+    r"(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}"
+)
 
 _ASSOCIATION_QUERY = """
 SELECT
@@ -48,11 +66,54 @@ SELECT
     part_description,
     stain_name,
     stain_group,
+    is_hne,
+    is_ihc,
     slide_path,
     can_serve_tiles,
     specimen_key,
-    procedure_date_days,
-    timepoint_source
+    timeline_start_days,
+    timeline_date_status
+FROM {canonical_table}
+WHERE patient_id IN ({placeholders})
+ORDER BY
+    patient_id,
+    timeline_start_days,
+    sample_id,
+    match_level,
+    image_id
+"""
+
+# Older production refreshes exposed the relative date under the retired
+# ``procedure_date_days``/``timepoint_source`` names.  Keep the public query
+# above on the versioned contract, but make the exporter able to read one of
+# those tables while the migration is rolling through the warehouse.  The
+# result aliases are deliberately the current names before they reach the
+# timeline formatter.
+_LEGACY_ASSOCIATION_QUERY = """
+SELECT
+    patient_id,
+    sample_id,
+    match_level,
+    image_id,
+    part_key,
+    part_number,
+    block_key,
+    block_number,
+    block_label,
+    part_description,
+    stain_name,
+    stain_group,
+    is_hne,
+    is_ihc,
+    slide_path,
+    can_serve_tiles,
+    specimen_key,
+    procedure_date_days AS timeline_start_days,
+    CASE
+        WHEN procedure_date_days IS NOT NULL THEN 'AVAILABLE'
+        ELSE 'MISSING_PROCEDURE_DATE'
+    END AS timeline_date_status,
+    timepoint_source AS slide_timepoint_source
 FROM {canonical_table}
 WHERE patient_id IN ({placeholders})
 ORDER BY
@@ -144,6 +205,16 @@ def _run_query(wc, warehouse_id: str, sql: str) -> list[dict]:
     return [dict(zip(columns, row)) for row in (stmt.result.data_array or [])]
 
 
+def _table_columns(wc, warehouse_id: str, table_name: str) -> set[str]:
+    """Return the warehouse columns used to select the migration-safe query."""
+    rows = _run_query(wc, warehouse_id, f"DESCRIBE TABLE {table_name}")
+    return {
+        str(row.get("col_name") or row.get("column_name") or "").strip().lower()
+        for row in rows
+        if str(row.get("col_name") or row.get("column_name") or "").strip()
+    }
+
+
 def _chunk(items: list[str], size: int):
     for index in range(0, len(items), size):
         yield items[index : index + size]
@@ -190,10 +261,32 @@ def _infer_slide_type(
     is_hne: bool | None = None,
     is_ihc: bool | None = None,
 ) -> str | None:
+    # The canonical association pipeline resolves these flags for every real
+    # slide.  Preserve a third category when both are explicitly false so a
+    # valid slide (for example an unstained recut) is not silently dropped
+    # from the clinical timeline.  Rows without resolved flags retain the
+    # legacy text-based behavior, which keeps synthetic/legacy records such as
+    # "SLIDES SUBMITTED" out of the pathology-slide timeline.
+    def as_bool(value: bool | str | None) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+        return None
+
+    is_hne = as_bool(is_hne)
+    is_ihc = as_bool(is_ihc)
     if is_ihc is True:
         return "IHC"
     if is_hne is True:
         return "H&E"
+    if is_hne is False and is_ihc is False:
+        return "Other"
     group = (stain_group or "").lower()
     name = re.sub(r"\s+", " ", (stain_name or "").lower()).strip()
     if group == "ihc":
@@ -204,7 +297,39 @@ def _infer_slide_type(
 
 
 def _clean_timeline_text(value: str | None) -> str:
-    return re.sub(r"\s+", " ", (value or "")).strip()
+    text = re.sub(r"\s+", " ", (value or "")).strip()
+    text = _TIMELINE_MRN_PATTERN.sub("[REDACTED_MRN]", text)
+    for pattern in _TIMELINE_DATE_PATTERNS:
+        text = pattern.sub("[REDACTED_DATE]", text)
+    return text
+
+
+def _as_bool(value: object) -> bool | None:
+    """Parse warehouse boolean values without treating ``"false"`` as true.
+
+    Databricks SQL exports booleans as strings when the result is serialized
+    through JSON/CSV.  Calling ``bool(value)`` on those strings is unsafe:
+    both ``"true"`` and ``"false"`` are non-empty and therefore truthy.  A
+    missing/unknown value is kept as ``None`` so the legacy slide-path
+    fallback remains explicit at the call site.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    return None
+
+
+def _safe_specimen_key(value: str | None, fallback: str) -> str:
+    """Normalize a source specimen key to the same public key shape as WSI."""
+    text = _clean_timeline_text(value)
+    text = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", text).strip("_")
+    return text or fallback
 
 
 def _format_specimen_label(
@@ -250,7 +375,9 @@ def _build_linkout(
     params = {
         "studyId": study_id,
         "caseId": patient_id,
-        "stainFilter": "hne" if subtype == "H&E" else "ihc",
+        "stainFilter": (
+            "hne" if subtype == "H&E" else "ihc" if subtype == "IHC" else "all"
+        ),
         "matchLevel": match_level,
         "specimenKey": specimen_key,
     }
@@ -269,20 +396,39 @@ def _fetch_canonical_associations(
     from databricks.sdk import WorkspaceClient
 
     wc = WorkspaceClient()
+    columns = _table_columns(wc, warehouse_id, _CANONICAL_ASSOCIATION_TABLE)
+    current_timing = {"timeline_start_days", "timeline_date_status"}.issubset(columns)
+    legacy_timing = {"procedure_date_days", "timepoint_source"}.issubset(columns)
+    if not current_timing and not legacy_timing:
+        raise RuntimeError(
+            f"{_CANONICAL_ASSOCIATION_TABLE} has neither the current timeline "
+            "columns nor the legacy migration columns"
+        )
+    query_template = _ASSOCIATION_QUERY if current_timing else _LEGACY_ASSOCIATION_QUERY
+
     rows: list[dict] = []
-    for batch in _chunk(patient_ids, 500):
+    # Keep the IN-list below Databricks' 25 MB inline-result limit. Parallel
+    # batches make a full-study export practical without changing the result
+    # contract or retaining any PHI in the query itself.
+    batches = list(_chunk(patient_ids, 500))
+
+    def fetch(batch: list[str]) -> list[dict]:
         escaped = [patient_id.replace("'", "\\'") for patient_id in batch]
         placeholders = ", ".join(f"'{patient_id}'" for patient_id in escaped)
-        rows.extend(
-            _run_query(
-                wc,
-                warehouse_id,
-                _ASSOCIATION_QUERY.format(
-                    canonical_table=_CANONICAL_ASSOCIATION_TABLE,
-                    placeholders=placeholders,
-                ),
-            )
+        from databricks.sdk import WorkspaceClient
+
+        return _run_query(
+            WorkspaceClient(),
+            warehouse_id,
+            query_template.format(
+                canonical_table=_CANONICAL_ASSOCIATION_TABLE,
+                placeholders=placeholders,
+            ),
         )
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for batch_rows in executor.map(fetch, batches):
+            rows.extend(batch_rows)
     return rows
 
 
@@ -299,10 +445,15 @@ def build_pathology_timeline_rows(
         if not patient_id or not image_id:
             continue
 
-        slide_timepoint_days = row.get(
-            "procedure_date_days", row.get("slide_timepoint_days")
-        )
+        slide_timepoint_days = row.get("timeline_start_days")
         if slide_timepoint_days is None:
+            # Keep local legacy fixtures readable; production SQL never
+            # selects the retired procedure-relative column.
+            slide_timepoint_days = row.get("slide_timepoint_days")
+        if slide_timepoint_days is None:
+            continue
+        timeline_status = str(row.get("timeline_date_status") or "").strip().upper()
+        if timeline_status and timeline_status != "AVAILABLE":
             continue
         try:
             start_date = int(slide_timepoint_days)
@@ -331,8 +482,9 @@ def build_pathology_timeline_rows(
             part_number, block_number, block_label = _derive_block_fields(
                 row.get("block_id"), row.get("block_label")
             )
-        specimen_key = row.get("specimen_key") or build_specimen_key(
-            raw_match_level, part_number, block_number
+        specimen_key = _safe_specimen_key(
+            row.get("specimen_key"),
+            build_specimen_key(raw_match_level, part_number, block_number),
         )
         specimen = _format_specimen_label(
             raw_match_level,
@@ -341,9 +493,10 @@ def build_pathology_timeline_rows(
             block_label,
             block_number,
         )
+        parsed_can_serve_tiles = _as_bool(row.get("can_serve_tiles"))
         can_serve_tiles = (
-            bool(row["can_serve_tiles"])
-            if row.get("can_serve_tiles") is not None
+            parsed_can_serve_tiles
+            if parsed_can_serve_tiles is not None
             else str(row.get("slide_path") or "").startswith("s3://")
         )
         sample_display = _sample_display_value(row.get("sample_id"), raw_match_level)
@@ -371,10 +524,15 @@ def build_pathology_timeline_rows(
             )
             grouped_rows[group_key] = grouped
 
+        timepoint_source = (
+            "Procedure date relative to first ICD-O diagnosis"
+            if timeline_status == "AVAILABLE"
+            else row.get("timeline_date_status") or row.get("slide_timepoint_source")
+        )
         grouped.add_image(
             image_id=image_id,
             can_serve_tiles=can_serve_tiles,
-            timepoint_source=row.get("timepoint_source", row.get("slide_timepoint_source")),
+            timepoint_source=timepoint_source,
         )
 
     ordered_groups = sorted(
@@ -436,6 +594,18 @@ def _write_timeline_meta(study_dir: Path, study_id: str) -> None:
 
 
 def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
+    columns = [
+        "PATIENT_ID", "START_DATE", "STOP_DATE", "EVENT_TYPE", "SAMPLE_ID",
+        "SUBTYPE", "MATCH_LEVEL", "SPECIMEN", "IMAGE_COUNT",
+        "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE", "LINKOUT",
+    ]
+    for row_number, row in enumerate(rows, start=1):
+        try:
+            validate_timeline_public_row(dict(zip(columns, row)))
+        except DeidViolation as error:
+            raise ValueError(
+                f"timeline row {row_number} violates the de-identification contract: {error}"
+            ) from error
     with (study_dir / _TIMELINE_DATA_FILENAME).open(
         "w", encoding="utf-8", newline=""
     ) as handle:
@@ -460,6 +630,20 @@ def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
         writer.writerows(rows)
 
 
+def write_pathology_timeline_files(
+    study_dir: Path, study_id: str, association_rows: list[dict]
+) -> tuple[Path, Path, int]:
+    """Write the canonical pathology timeline pair from association rows."""
+    timeline_rows = build_pathology_timeline_rows(association_rows, study_id)
+    _write_timeline_meta(study_dir, study_id)
+    _write_timeline_data(study_dir, timeline_rows)
+    return (
+        study_dir / _TIMELINE_META_FILENAME,
+        study_dir / _TIMELINE_DATA_FILENAME,
+        len(timeline_rows),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     study_dir = args.study_dir.expanduser().resolve()
@@ -472,16 +656,15 @@ def main(argv: list[str] | None = None) -> int:
     association_rows = _fetch_canonical_associations(
         patient_ids, args.warehouse_id
     )
-    timeline_rows = build_pathology_timeline_rows(association_rows, study_id)
-
-    _write_timeline_meta(study_dir, study_id)
-    _write_timeline_data(study_dir, timeline_rows)
+    meta_path, data_path, row_count = write_pathology_timeline_files(
+        study_dir, study_id, association_rows
+    )
 
     print(f"Study dir: {study_dir}")
     print(f"Study id: {study_id}")
-    print(f"Pathology timeline rows: {len(timeline_rows)}")
-    print(f"Written: {_TIMELINE_META_FILENAME}")
-    print(f"Written: {_TIMELINE_DATA_FILENAME}")
+    print(f"Pathology timeline rows: {row_count}")
+    print(f"Written: {meta_path.name}")
+    print(f"Written: {data_path.name}")
     return 0
 
 

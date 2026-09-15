@@ -221,11 +221,11 @@ def _merge_into_sample_file(path: Path, counts: dict[str, dict[str, int]]) -> No
 def main() -> int:
     args = _parse_args()
     study_dir = Path(args.study_dir).expanduser().resolve()
-    meta_path = study_dir / args.meta_filename
+    output_meta_path = study_dir / args.meta_filename
     data_path = study_dir / args.data_filename
     if args.wsi_meta:
-        meta_path = Path(args.wsi_meta).expanduser().resolve()
-        counts = _load_counts(meta_path, args.study_id)
+        input_meta_path = Path(args.wsi_meta).expanduser().resolve()
+        counts = _load_counts(input_meta_path, args.study_id)
     else:
         sample_ids = _read_study_sample_ids(study_dir / args.sample_file)
         counts = _load_counts_from_live_canonical(sample_ids, args.warehouse_id)
@@ -234,7 +234,7 @@ def main() -> int:
         _merge_into_sample_file(sample_file_path, counts)
         print(f"Merged WSI count columns into {sample_file_path}")
     else:
-        _write_meta_file(meta_path, args.study_id, data_path.name)
+        _write_meta_file(output_meta_path, args.study_id, data_path.name)
         _write_data_file(data_path, counts)
         print(f"Wrote {len(counts)} sample WSI count rows to {data_path}")
     return 0
