@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -166,6 +167,14 @@ class _GroupedTimelineRow:
     @property
     def timepoint_source(self) -> str:
         return _clean_timeline_text(", ".join(sorted(self.timepoint_sources)))
+
+    @property
+    def image_ids(self) -> str:
+        """Stable machine-readable membership for exact backend joins."""
+        return json.dumps(
+            sorted(self.servable_image_ids | self.non_servable_image_ids),
+            separators=(",", ":"),
+        )
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -563,6 +572,7 @@ def build_pathology_timeline_rows(
                 str(group.non_servable_image_count),
                 str(group.total_image_count),
                 group.timepoint_source,
+                group.image_ids,
                 _build_linkout(
                     study_id=study_id,
                     patient_id=group.patient_id,
@@ -597,7 +607,7 @@ def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
     columns = [
         "PATIENT_ID", "START_DATE", "STOP_DATE", "EVENT_TYPE", "SAMPLE_ID",
         "SUBTYPE", "MATCH_LEVEL", "SPECIMEN", "IMAGE_COUNT",
-        "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE", "LINKOUT",
+        "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE", "IMAGE_IDS", "LINKOUT",
     ]
     for row_number, row in enumerate(rows, start=1):
         try:
@@ -624,6 +634,7 @@ def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
                 "NON_SERVABLE_IMAGE_COUNT",
                 "TOTAL_IMAGE_COUNT",
                 "TIMEPOINT_SOURCE",
+                "IMAGE_IDS",
                 "LINKOUT",
             ]
         )

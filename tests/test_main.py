@@ -15,7 +15,7 @@ class TestReadinessIdentity:
         monkeypatch.setattr(main_module.settings, "release_id", "candidate-1")
         monkeypatch.setattr(main_module.settings, "image_git_sha", "a" * 40)
         monkeypatch.setattr(
-            main_module.settings, "serving_contract_version", "wsi-serving-v2"
+            main_module.settings, "serving_contract_version", "wsi-serving-v3"
         )
         monkeypatch.setattr(
             main_module.settings, "wsi_allowed_source_prefixes", ("s3://pathology/",)

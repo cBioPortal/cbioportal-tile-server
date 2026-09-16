@@ -736,7 +736,7 @@ def _readiness_status() -> tuple[int, dict]:
                 raise InvalidWsiToken("WSI release ID is not configured")
             if not re.fullmatch(r"[0-9a-fA-F]{40}", settings.image_git_sha):
                 raise InvalidWsiToken("WSI image git SHA is not a full commit")
-            if settings.serving_contract_version != "wsi-serving-v2":
+            if settings.serving_contract_version != "wsi-serving-v3":
                 raise InvalidWsiToken("unsupported WSI serving contract version")
         return 200, payload
     except InvalidWsiToken:
