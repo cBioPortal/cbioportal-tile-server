@@ -29,6 +29,36 @@ def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
         )
 
 
+def test_artifact_uri_allows_pipeline_date_under_approved_prefix():
+    validate_artifact_uri(
+        "s3://pathology/2026-08-19/slide-1.svs",
+        image_id="slide-1",
+        kind="source",
+        prefixes=("s3://pathology/",),
+    )
+
+
+def test_timeline_rows_require_sorted_unique_image_ids():
+    validate_timeline_public_row(
+        {
+            "PATIENT_ID": "P-1",
+            "IMAGE_COUNT": "1",
+            "NON_SERVABLE_IMAGE_COUNT": "1",
+            "TOTAL_IMAGE_COUNT": "2",
+            "IMAGE_IDS": '["slide-1","slide-2"]',
+            "START_DATE": "-14",
+        }
+    )
+    with pytest.raises(DeidViolation):
+        validate_timeline_public_row(
+            {
+                "PATIENT_ID": "P-1",
+                "IMAGE_IDS": '["slide-2","slide-1"]',
+                "START_DATE": "-14",
+            }
+        )
+
+
 def test_public_wsi_row_rejects_mrn_and_absolute_date_but_keeps_pseudonyms():
     row = {
         "PATIENT_ID": "P-1",

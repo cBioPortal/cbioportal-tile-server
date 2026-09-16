@@ -186,7 +186,8 @@ def validate_artifact_uri(
             raise DeidViolation(f"malformed {kind} URI")
     if any(segment in {".", ".."} for segment in decoded_path.split("/")):
         raise DeidViolation(f"unsafe {kind} URI path")
-    if prefixes and not _uri_is_under_prefix(value, prefixes):
+    prefix_match = _uri_is_under_prefix(value, prefixes) if prefixes else False
+    if prefixes and not prefix_match:
         raise DeidViolation(f"unapproved {kind} URI prefix")
 
     filename = decoded_path.rsplit("/", 1)[-1]
@@ -198,11 +199,16 @@ def validate_artifact_uri(
     # checks below are the privacy boundary; they must not be bypassed by a
     # user-controlled query or path traversal.
     lowered = (value + " " + decoded_path).lower()
+    # Approved object-store roots are deployment-controlled release boundaries;
+    # their folder names may contain pipeline dates. Identifiers remain
+    # forbidden regardless of prefix.
     if (
-        _contains_absolute_date(value)
-        or _contains_absolute_date(decoded_path)
-        or _COMPACT_DATE.search(value)
-        or _COMPACT_DATE.search(decoded_path)
+        (not prefix_match and (
+            _contains_absolute_date(value)
+            or _contains_absolute_date(decoded_path)
+            or _COMPACT_DATE.search(value)
+            or _COMPACT_DATE.search(decoded_path)
+        ))
         or _LABELLED_MRN.search(value)
         or _LABELLED_MRN.search(decoded_path)
     ):
@@ -269,6 +275,19 @@ def validate_timeline_public_row(row: Mapping[str, object]) -> None:
     for field, value in row.items():
         if field.upper() in forbidden or field.lower() in _FORBIDDEN_FIELDS:
             raise DeidViolation(f"forbidden timeline field: {field}")
+        if field.upper() == "IMAGE_IDS":
+            try:
+                image_ids = json.loads(_text(value))
+            except (TypeError, ValueError) as error:
+                raise DeidViolation("IMAGE_IDS must be a JSON array") from error
+            if (
+                not isinstance(image_ids, list)
+                or not image_ids
+                or any(not isinstance(image_id, str) or not image_id.strip() for image_id in image_ids)
+                or image_ids != sorted(set(image_ids))
+            ):
+                raise DeidViolation("IMAGE_IDS must be a sorted, unique string array")
+            continue
         if field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
             _assert_safe_text(field, value)
     for field in ("START_DATE", "STOP_DATE"):

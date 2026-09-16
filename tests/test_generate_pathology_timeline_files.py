@@ -71,6 +71,7 @@ def test_build_pathology_timeline_rows_groups_counts_from_canonical_associations
             "0",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-1"]',
             "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=hne&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
         ],
         [
@@ -86,6 +87,7 @@ def test_build_pathology_timeline_rows_groups_counts_from_canonical_associations
             "1",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-2"]',
             "",
         ],
         [
@@ -101,6 +103,7 @@ def test_build_pathology_timeline_rows_groups_counts_from_canonical_associations
             "0",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-3"]',
             "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=ihc&matchLevel=Unmatched&specimenKey=unmatched%3A%3A%3F%3A%3A%3F",
         ],
     ]
@@ -128,6 +131,7 @@ def test_resolved_flags_override_stale_stain_text_for_timeline_subtype():
         "study_2",
     )
     assert rows[0][5] == "IHC"
+    assert rows[0][1] == "0"
 
 
 def test_databricks_boolean_strings_keep_other_slides_on_timeline():
@@ -306,6 +310,7 @@ def test_build_pathology_timeline_rows_deduplicates_same_image_across_match_buck
             "0",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-1"]',
             "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=hne&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
         ]
     ]
@@ -360,6 +365,7 @@ def test_build_pathology_timeline_rows_collapses_non_servable_duplicate_specimen
             "2",
             "2",
             "Procedure date relative to tumor sequencing",
+            '["img-1","img-2"]',
             "",
         ]
     ]
@@ -440,6 +446,7 @@ def test_build_pathology_timeline_rows_keeps_explicitly_classified_other_slides(
             "0",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-1"]',
             "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=all&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
         ]
     ]
@@ -480,6 +487,7 @@ def test_build_pathology_timeline_rows_sanitizes_multiline_specimen_labels():
             "1",
             "1",
             "Procedure date relative to tumor sequencing",
+            '["img-1"]',
             "",
         ]
     ]
@@ -597,6 +605,7 @@ def test_main_writes_pathology_timeline_files(monkeypatch, tmp_path: Path):
         "NON_SERVABLE_IMAGE_COUNT",
         "TOTAL_IMAGE_COUNT",
         "TIMEPOINT_SOURCE",
+        "IMAGE_IDS",
         "LINKOUT",
     ]
     assert reader[1] == [
@@ -612,5 +621,6 @@ def test_main_writes_pathology_timeline_files(monkeypatch, tmp_path: Path):
         "0",
         "1",
         "Procedure date relative to tumor sequencing",
+        '["img-1"]',
         "/patient/wsiHESlides?studyId=test_study&caseId=P-1&stainFilter=hne&matchLevel=PART&specimenKey=part%3A%3A2&sampleId=S-1",
     ]
