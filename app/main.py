@@ -62,6 +62,7 @@ from .annotations import close_db as close_annotation_db
 from .annotations import router as annotation_router
 from .agent import init_db as init_agent_db
 from .agent import router as agent_router
+from .research import router as research_router
 from .oncokb import router as oncokb_router
 from .slides import SlideCache
 from .thumbnail_store import (
@@ -335,7 +336,7 @@ async def require_wsi_capability(request: Request, call_next):
     path = request.scope["path"]
     if path in ("/health", "/wsi/health", "/ready", "/metrics"):
         return await call_next(request)
-    if path.startswith(("/annotations", "/api/oncokb", "/agent")):
+    if path.startswith(("/annotations", "/api/oncokb", "/agent", "/research")):
         return await call_next(request)
     # Browser clients send an unauthenticated OPTIONS request before any
     # cross-origin request that includes the Authorization header.  CORS
@@ -384,6 +385,7 @@ PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorizatio
 app.include_router(annotation_router)
 app.include_router(oncokb_router)
 app.include_router(agent_router)
+app.include_router(research_router)
 
 
 async def _in_thread(fn, *args):

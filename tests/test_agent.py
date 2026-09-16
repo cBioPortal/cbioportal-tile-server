@@ -29,6 +29,47 @@ def make_context() -> agent.AgentContext:
     )
 
 
+def test_bedrock_region_tool_only_advertises_live_tile_model():
+    tool = next(
+        item["toolSpec"]
+        for item in agent._bedrock_tools()
+        if item["toolSpec"]["name"] == "wsi_find_regions"
+    )
+    schema = tool["inputSchema"]["json"]
+
+    assert schema["properties"]["model"]["enum"] == ["quiltnet_pmb"]
+    assert "tile-retrieval" in tool["description"]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_similar_slides_does_not_relabel_another_model(monkeypatch):
+    async def fake_manifest():
+        return {
+            "slides": [
+                {
+                    "study_id": "study-a",
+                    "slide_id": "slide-a",
+                    "similar_slides": [
+                        {"slide_id": "titan-slide", "model": "reef_v2_titan"},
+                    ],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(agent, "_load_manifest", fake_manifest)
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-a", context=make_context()
+    )
+
+    result = await agent._bedrock_tool(
+        "wsi_find_similar_slides",
+        {"model": "reef_v2_optimus", "top_k": 5},
+        run_context,
+    )
+
+    assert result == {"model": "reef_v2_optimus", "slides": []}
+
+
 @pytest.fixture
 async def agent_db(tmp_path, monkeypatch):
     db_path = tmp_path / "agent.db"
@@ -118,6 +159,39 @@ def test_api_key_file_is_read_without_exposing_contents(tmp_path, monkeypatch):
     assert agent.os.environ["OPENAI_API_KEY"] == key
 
 
+def test_bedrock_accepts_standard_environment_credentials(monkeypatch):
+    monkeypatch.setattr(agent.settings, "agent_profile", "")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    assert agent._bedrock_configured() is True
+
+
+def test_bedrock_accepts_task_specific_environment_credentials(monkeypatch):
+    monkeypatch.setattr(agent.settings, "agent_profile", "")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setenv("BEDROCK_AWS_ACCESS_KEY_ID", "test-access-key")
+    monkeypatch.setenv("BEDROCK_AWS_SECRET_ACCESS_KEY", "test-secret-key")
+    assert agent._bedrock_configured() is True
+
+
+def test_bedrock_client_isolated_from_slide_store_endpoint(monkeypatch):
+    class FakeSession:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def client(self, service, **kwargs):
+            return service, kwargs
+
+    monkeypatch.setattr(agent.boto3, "Session", FakeSession)
+    monkeypatch.setattr(agent.settings, "agent_profile", "")
+    monkeypatch.setattr(agent.settings, "agent_region", "us-east-1")
+    monkeypatch.delenv("BEDROCK_AWS_ENDPOINT_URL", raising=False)
+    service, client_kwargs = agent._bedrock_client()
+    assert service == "bedrock-runtime"
+    assert client_kwargs["endpoint_url"] == "https://bedrock-runtime.us-east-1.amazonaws.com"
+
+
 @pytest.mark.asyncio
 async def test_action_list_is_session_and_user_scoped(agent_db):
     context = make_context()
@@ -156,3 +230,85 @@ async def test_stream_emits_text_and_completion_without_writing(agent_db, monkey
     )
     assert events[-1].startswith("event: complete")
     assert await agent._list_actions("session-a", "user-a", "study-a") == []
+
+
+@pytest.mark.asyncio
+async def test_bedrock_stream_emits_text_and_persists_tool_proposal(agent_db, monkeypatch):
+    class FakeBedrockClient:
+        calls = 0
+
+        def converse(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"text": "I found a candidate region."},
+                                {
+                                    "toolUse": {
+                                        "toolUseId": "tool-1",
+                                        "name": "wsi_propose_annotations",
+                                        "input": {
+                                            "geometry_type": "rectangle",
+                                            "points": [{"x": 10, "y": 20}, {"x": 30, "y": 40}],
+                                            "label": "candidate",
+                                            "layer_name": "AI review",
+                                            "color": "#7b61ff",
+                                            "confidence": 0.8,
+                                            "rationale": "The viewport contains a candidate region.",
+                                        },
+                                    }
+                                },
+                            ],
+                        }
+                    }
+                }
+            return {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "The proposal is ready for approval."}],
+                    }
+                }
+            }
+
+    fake_client = FakeBedrockClient()
+    monkeypatch.setattr(agent.settings, "agent_provider", "bedrock")
+    monkeypatch.setattr(agent.settings, "agent_profile", "test-profile")
+    monkeypatch.setattr(agent, "_bedrock_configured", lambda: True)
+    monkeypatch.setattr(agent, "_bedrock_client", lambda: fake_client)
+    request = agent.ChatRequest(
+        session_id="session-bedrock", message="Find a candidate", context=make_context()
+    )
+
+    events = [chunk async for chunk in agent._stream_agent(request, "user-a")]
+
+    assert any("I found a candidate region." in chunk for chunk in events)
+    assert any("The proposal is ready for approval." in chunk for chunk in events)
+    proposal_events = [chunk for chunk in events if chunk.startswith("event: proposal")]
+    assert len(proposal_events) == 1
+    assert "AI review" in proposal_events[0]
+    assert events[-1].startswith("event: complete")
+    actions = await agent._list_actions("session-bedrock", "user-a", "study-a")
+    assert len(actions) == 1
+    assert actions[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_bedrock_stream_surfaces_provider_failure_as_error_event(agent_db, monkeypatch):
+    class FailingClient:
+        def converse(self, **kwargs):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(agent.settings, "agent_provider", "bedrock")
+    monkeypatch.setattr(agent, "_bedrock_configured", lambda: True)
+    monkeypatch.setattr(agent, "_bedrock_client", lambda: FailingClient())
+    request = agent.ChatRequest(
+        session_id="session-bedrock-error", message="Summarize", context=make_context()
+    )
+
+    events = [chunk async for chunk in agent._stream_agent(request, "user-a")]
+
+    assert any(chunk.startswith("event: error") for chunk in events)

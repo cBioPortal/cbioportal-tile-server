@@ -203,8 +203,42 @@ class Settings:
     )
     oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
-    agent_model: str = field(default_factory=lambda: _env_str("OPENAI_MODEL", "gpt-5.6-terra"))
+    agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
+    agent_model: str = field(
+        default_factory=lambda: _env_str(
+            "BEDROCK_AGENT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+    )
+    agent_region: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_REGION", "us-east-1"))
+    agent_profile: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_PROFILE"))
     agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    research_enabled: bool = field(default_factory=lambda: _env_bool("WSI_RESEARCH_ENABLED", False))
+    research_manifest_uri: str = field(default_factory=lambda: _env_str("WSI_RESEARCH_MANIFEST_URI"))
+    research_rate_limit_per_minute: int = field(
+        default_factory=lambda: _env_int("WSI_RESEARCH_RATE_LIMIT_PER_MINUTE", 30)
+    )
+    # QuiltNet retrieval runs in a separate process because its model and
+    # feature tensors are much larger than the pixel-serving workers.
+    research_embedding_url: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URL")
+    )
+    research_embedding_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS", 60.0)
+    )
+    research_embedding_in_process: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_EMBEDDING_IN_PROCESS", False)
+    )
+    research_static_fallback: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_STATIC_FALLBACK", True)
+    )
+    research_embedding_cache_dir: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_CACHE_DIR", "/cache/research-embeddings")
+    )
+    quiltnet_model_name: str = field(
+        default_factory=lambda: _env_str(
+            "QUILTNET_MODEL_NAME", "hf-hub:wisdomik/QuiltNet-B-16-PMB"
+        )
+    )
     agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
     agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
 

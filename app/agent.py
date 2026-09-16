@@ -23,7 +23,30 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
-from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_tool
+import asyncpg
+import boto3
+try:
+    from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_tool
+except ModuleNotFoundError:  # Bedrock deployments do not need the legacy SDK.
+    class RunContextWrapper:  # type: ignore[no-redef]
+        def __init__(self, context: Any):
+            self.context = context
+
+    class ModelSettings:  # type: ignore[no-redef]
+        def __init__(self, **kwargs: Any):
+            self.settings = kwargs
+
+    class Agent:  # type: ignore[no-redef]
+        def __init__(self, **kwargs: Any):
+            self.settings = kwargs
+
+    class Runner:  # type: ignore[no-redef]
+        @staticmethod
+        def run_streamed(*args: Any, **kwargs: Any):
+            raise RuntimeError("The OpenAI agent provider is not installed")
+
+    def function_tool(function):  # type: ignore[no-redef]
+        return function
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,11 +54,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from .auth import scoped_user_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
+from .research import _load_manifest, _similar_slides_for_model, search_regions_for_agent
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-_AGENT_READ_USER = Depends(scoped_user_dependency({"annotations:read"}))
+_AGENT_READ_USER = Depends(
+    scoped_user_dependency({"agent:chat", "research:read", "annotations:read"})
+)
 _AGENT_READ_WRITE_USER = Depends(
     scoped_user_dependency({"annotations:read", "annotations:write"})
 )
@@ -108,6 +134,7 @@ class AgentAction(BaseModel):
     session_id: str
     action_type: Literal[
         "create_annotation",
+        "annotation_batch",
         "update_annotation",
         "delete_annotation",
         "viewer_action",
@@ -691,6 +718,15 @@ create pending proposals and the user must approve them in the UI.  Annotation
 coordinates must be normalized to the supplied slide image as x/y values from
 0 through 1000.  Propose only coarse rectangles or polygons and include a
 short rationale and confidence.  Do not infer or invent patient facts.
+
+For a request to find tissue or morphology, call wsi_find_regions with the
+user's natural-language description.  The retrieval service expands and
+tokenizes the description into pathology concepts; do not make the user
+guess a model vocabulary.  You may provide positive_concepts and
+negative_concepts when the user explicitly states inclusions or exclusions.
+Always set model to quiltnet_pmb for region searches; the other published
+embeddings are slide-level indexes and do not return tile regions.
+Similarity is a research ranking, not a diagnostic confidence score.
 """
 
 
@@ -731,11 +767,320 @@ def _agent_input(request: ChatRequest) -> list[dict[str, Any]]:
     return [{"role": "user", "content": content}]
 
 
+def _bedrock_client():
+    session_kwargs: dict[str, Any] = {
+        "profile_name": settings.agent_profile or None,
+        "region_name": settings.agent_region or None,
+    }
+    # Some ECS task definitions keep Bedrock credentials separate from the
+    # credentials used for slide storage.  Pass them explicitly when present.
+    if not session_kwargs["profile_name"] and os.environ.get("BEDROCK_AWS_ACCESS_KEY_ID"):
+        session_kwargs.update(
+            aws_access_key_id=os.environ.get("BEDROCK_AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("BEDROCK_AWS_SECRET_ACCESS_KEY"),
+            aws_session_token=os.environ.get("BEDROCK_AWS_SESSION_TOKEN"),
+        )
+    session = boto3.Session(**session_kwargs)
+    endpoint_url = os.environ.get("BEDROCK_AWS_ENDPOINT_URL") or (
+        f"https://bedrock-runtime.{settings.agent_region}.amazonaws.com"
+    )
+    return session.client("bedrock-runtime", endpoint_url=endpoint_url)
+
+
+def _bedrock_configured() -> bool:
+    profile_name = settings.agent_profile or os.environ.get("AWS_PROFILE")
+    if not profile_name:
+        # ECS task credentials and other workload identity providers expose
+        # credentials through the standard AWS environment variables.
+        return bool(
+            (
+                os.environ.get("AWS_ACCESS_KEY_ID")
+                and os.environ.get("AWS_SECRET_ACCESS_KEY")
+            )
+            or (
+                os.environ.get("BEDROCK_AWS_ACCESS_KEY_ID")
+                and os.environ.get("BEDROCK_AWS_SECRET_ACCESS_KEY")
+            )
+        )
+    try:
+        session = boto3.Session(
+            profile_name=profile_name,
+            region_name=settings.agent_region or None,
+        )
+        return session.get_credentials() is not None
+    except Exception:
+        logger.exception("Unable to inspect Bedrock credentials")
+        return False
+
+
+def _bedrock_tools() -> list[dict[str, Any]]:
+    point = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "number", "minimum": 0, "maximum": 1000},
+            "y": {"type": "number", "minimum": 0, "maximum": 1000},
+        },
+        "required": ["x", "y"],
+    }
+    return [
+        {
+            "toolSpec": {
+                "name": "wsi_find_regions",
+                "description": "Find tumor or tissue regions on the current slide using the live QuiltNet tile-retrieval index. Use quiltnet_pmb; the other research models are slide-level indexes and cannot return tile regions.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "query": {"type": "string"},
+                    "positive_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
+                    "negative_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 2},
+                    "model": {"type": "string", "enum": ["quiltnet_pmb"]},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                }, "required": ["query", "model"]}},
+            }
+        },
+        {
+            "toolSpec": {
+                "name": "wsi_find_similar_slides",
+                "description": "Find published slides similar to the current slide using a slide embedding model.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "model": {"type": "string", "enum": ["reef_v1_hoptimus0", "reef_v2_hoptimus1", "reef_v2_optimus", "reef_v2_titan"]},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                }, "required": ["model"]}},
+            }
+        },
+        {
+            "toolSpec": {
+                "name": "wsi_propose_annotations",
+                "description": "Create one reversible annotation proposal for user approval. Points are normalized to 0..1000.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "geometry_type": {"type": "string", "enum": ["rectangle", "polygon"]},
+                    "points": {"type": "array", "items": point, "minItems": 2, "maxItems": 100},
+                    "label": {"type": "string"},
+                    "layer_name": {"type": "string"},
+                    "color": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rationale": {"type": "string"},
+                }, "required": ["geometry_type", "points", "label", "layer_name", "color", "confidence", "rationale"]}},
+            }
+        },
+        {
+            "toolSpec": {
+                "name": "wsi_propose_annotation_batch",
+                "description": "Create up to 50 reversible annotation proposals for one approval action.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "annotations": {"type": "array", "maxItems": 50, "items": {"type": "object"}},
+                    "rationale": {"type": "string"},
+                }, "required": ["annotations", "rationale"]}},
+            }
+        },
+        {
+            "toolSpec": {
+                "name": "wsi_propose_viewer_action",
+                "description": "Create a reversible viewer navigation proposal.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "action": {"type": "string", "enum": ["select_slide", "set_filters", "go_to_coordinates", "zoom"]},
+                    "parameters": {"type": "object"},
+                    "rationale": {"type": "string"},
+                }, "required": ["action", "parameters", "rationale"]}},
+            }
+        },
+    ]
+
+
+def _validate_annotation_input(value: dict[str, Any]) -> dict[str, Any]:
+    geometry_type = value.get("geometry_type")
+    if geometry_type not in {"rectangle", "polygon"}:
+        raise ValueError("geometry_type must be rectangle or polygon")
+    points = [Point.model_validate(point) for point in value.get("points", [])]
+    if len(points) < (3 if geometry_type == "polygon" else 2) or len(points) > 100:
+        raise ValueError("Annotation geometry has an invalid number of points")
+    label = str(value.get("label", "")).strip()
+    layer_name = str(value.get("layer_name", "")).strip()
+    color = str(value.get("color", ""))
+    confidence = value.get("confidence")
+    if not label or len(label) > 200 or not layer_name or len(layer_name) > 100:
+        raise ValueError("Annotation label and layer are required")
+    if not color.startswith("#") or len(color) not in {4, 7, 9}:
+        raise ValueError("Annotation color must be a hex color")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool) or not 0 <= confidence <= 1:
+        raise ValueError("Annotation confidence must be between 0 and 1")
+    return {
+        "geometry_type": geometry_type,
+        "points": [point.model_dump() for point in points],
+        "label": label,
+        "layer_name": layer_name,
+        "color": color,
+        "confidence": float(confidence),
+    }
+
+
+async def _bedrock_tool(
+    name: str, arguments: dict[str, Any], run_context: AgentRunContext
+) -> dict[str, Any]:
+    if name == "wsi_find_regions":
+        manifest = await _load_manifest()
+        positive = arguments.get("positive_concepts")
+        negative = arguments.get("negative_concepts")
+        query_plan = None
+        if isinstance(positive, list) or isinstance(negative, list):
+            query_plan = {
+                "primary": str(arguments.get("query", "")).strip(),
+                "positive": positive if isinstance(positive, list) else [],
+                "negative": negative if isinstance(negative, list) else [],
+            }
+        requested_model = str(arguments.get("model", "quiltnet_pmb"))
+        if requested_model != "quiltnet_pmb":
+            logger.warning(
+                "Ignoring unsupported region model %s; using quiltnet_pmb",
+                requested_model,
+            )
+        result = await search_regions_for_agent(
+            manifest,
+            run_context.context.study_id,
+            run_context.context.slide_id,
+            "quiltnet_pmb",
+            min(10, max(1, int(arguments.get("top_k", 5)))),
+            str(arguments.get("query", "")),
+            run_context.context.viewport.slide_width,
+            run_context.context.viewport.slide_height,
+            query_plan,
+        )
+        return {**result, "normalized_coordinate_space": "0..1000"}
+    if name == "wsi_find_similar_slides":
+        manifest = await _load_manifest()
+        row = next(
+            (
+                row
+                for row in manifest["slides"]
+                if isinstance(row, dict)
+                and row.get("study_id") == run_context.context.study_id
+                and str(row.get("slide_id")) == run_context.context.slide_id
+            ),
+            None,
+        )
+        if row is None:
+            return {"slides": []}
+        model = str(arguments.get("model", "reef_v2_titan"))
+        top_k = min(10, max(1, int(arguments.get("top_k", 5))))
+        return {"model": model, "slides": _similar_slides_for_model(row, model, top_k)}
+    if name == "wsi_propose_annotations":
+        payload = _validate_annotation_input(arguments)
+        payload.update({
+            "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
+            "context": _context_snapshot(run_context.context),
+        })
+        action = await _insert_action(run_context, "create_annotation", payload)
+        return {"proposal_id": action.id, "status": action.status}
+    if name == "wsi_propose_annotation_batch":
+        raw_annotations = arguments.get("annotations")
+        if not isinstance(raw_annotations, list) or not 1 <= len(raw_annotations) <= 50:
+            raise ValueError("annotations must contain 1-50 items")
+        payload = {
+            "annotations": [_validate_annotation_input(item) for item in raw_annotations],
+            "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
+            "context": _context_snapshot(run_context.context),
+        }
+        action = await _insert_action(run_context, "annotation_batch", payload)
+        return {"proposal_id": action.id, "status": action.status}
+    if name == "wsi_propose_viewer_action":
+        action_name = arguments.get("action")
+        parameters = arguments.get("parameters")
+        if action_name not in {"select_slide", "set_filters", "go_to_coordinates", "zoom"} or not isinstance(parameters, dict):
+            raise ValueError("Invalid viewer action")
+        payload = {
+            "action": action_name,
+            "parameters": parameters,
+            "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
+            "context": _context_snapshot(run_context.context),
+        }
+        action = await _insert_action(run_context, "viewer_action", payload)
+        return {"proposal_id": action.id, "status": action.status}
+    raise ValueError(f"Unknown Bedrock tool: {name}")
+
+
+def _bedrock_user_content(request: ChatRequest) -> list[dict[str, Any]]:
+    context = request.context.model_dump(exclude={"viewport": {"image_data_url"}})
+    prompt = json.dumps(
+        {
+            "current_context": context,
+            "conversation": [message.model_dump() for message in request.history],
+            "current_request": request.message,
+        },
+        separators=(",", ":"),
+    )
+    content: list[dict[str, Any]] = [{"text": prompt}]
+    image_url = request.context.viewport.image_data_url
+    if image_url:
+        encoded = image_url.split(",", 1)[1]
+        content.append({"image": {"format": "jpeg", "source": {"bytes": base64.b64decode(encoded)}}})
+    return content
+
+
+async def _stream_bedrock(request: ChatRequest, user_sub: str):
+    run_context = AgentRunContext(user_sub=user_sub, session_id=request.session_id, context=request.context)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": _bedrock_user_content(request)}]
+    client = _bedrock_client()
+    for _ in range(6):
+        response = await asyncio.to_thread(
+            client.converse,
+            modelId=settings.agent_model,
+            system=[{"text": _agent_instructions()}],
+            messages=messages,
+            toolConfig={"tools": _bedrock_tools()},
+            inferenceConfig={"maxTokens": 1500, "temperature": 0.1},
+        )
+        output = response.get("output", {}).get("message", {})
+        content = output.get("content", [])
+        text_parts = [block.get("text", "") for block in content if isinstance(block, dict) and block.get("text")]
+        if text_parts:
+            yield _sse("message.delta", {"text": "".join(text_parts)})
+        tool_uses = [block.get("toolUse") for block in content if isinstance(block, dict) and block.get("toolUse")]
+        if not tool_uses:
+            break
+        messages.append(output)
+        results = []
+        for tool_use in tool_uses:
+            name = str(tool_use.get("name", ""))
+            yield _sse("tool.called", {"name": name})
+            try:
+                result = await _bedrock_tool(name, tool_use.get("input", {}), run_context)
+                result_content = {"json": result}
+            except Exception as exc:
+                logger.warning(
+                    "Bedrock WSI tool failed (%s): %s: %s",
+                    name,
+                    type(exc).__name__,
+                    str(exc),
+                )
+                result_content = {"json": {"error": "Tool unavailable for this request"}}
+            results.append({"toolResult": {"toolUseId": tool_use.get("toolUseId"), "content": [result_content]}})
+        messages.append({"role": "user", "content": results})
+    for proposal_id in run_context.proposal_ids:
+        proposal = await _get_action(proposal_id, user_sub)
+        if proposal:
+            yield _sse("proposal", proposal.model_dump())
+    yield _sse("complete", {"proposal_ids": run_context.proposal_ids})
+
+
 def _sse(event: str, payload: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
 
 
 async def _stream_agent(request: ChatRequest, user_sub: str):
+    # The legacy stream remains available to offline unit tests and explicit
+    # OpenAI-provider development runs. Bedrock runs require configured AWS
+    # credentials before attempting the provider call.
+    if settings.agent_provider.lower() == "bedrock" and _bedrock_configured():
+        try:
+            async for chunk in _stream_bedrock(request, user_sub):
+                yield chunk
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Bedrock WSI agent run failed")
+            yield _sse(
+                "error",
+                {"message": "The research assistant could not complete this request."},
+            )
+        return
     run_context = AgentRunContext(
         user_sub=user_sub,
         session_id=request.session_id,
@@ -786,10 +1131,10 @@ def _require_study(user: dict[str, Any], study_id: str) -> None:
 async def agent_health() -> dict[str, Any]:
     return {
         "enabled": bool(settings.agent_enabled),
-        "configured": bool(
-            os.environ.get("OPENAI_API_KEY", "").startswith("sk-")
-            or _read_api_key_file()
-        ),
+        "configured": _bedrock_configured()
+        if settings.agent_provider.lower() == "bedrock"
+        else bool(os.environ.get("OPENAI_API_KEY", "").startswith("sk-") or _read_api_key_file()),
+        "provider": settings.agent_provider,
         "model": settings.agent_model,
     }
 
@@ -803,7 +1148,12 @@ async def agent_chat(
         raise HTTPException(
             status_code=404, detail="WSI research assistant is disabled"
         )
-    if not _ensure_openai_credentials():
+    configured = (
+        _bedrock_configured()
+        if settings.agent_provider.lower() == "bedrock"
+        else _ensure_openai_credentials()
+    )
+    if not configured:
         raise HTTPException(
             status_code=503, detail="WSI research assistant is not configured"
         )
