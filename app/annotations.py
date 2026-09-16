@@ -77,10 +77,22 @@ def _is_visible(row: dict, user_sub: str, user_groups: set[str]) -> bool:
     return bool(user_groups.intersection(groups))
 
 
+def _can_modify(row: dict, user: dict) -> bool:
+    if row["created_by"] == user["sub"]:
+        return True
+    return bool(
+        settings.annotation_local_development
+        and user.get("sub") == "local-development"
+    )
+
+
 class AnnotationBody(BaseModel):
     label: str = ""
     comment: str = ""
     type: str = ""
+    layer_name: str = "Default"
+    color: str = "#2f80ed"
+    provenance: dict[str, Any] | None = None
 
 
 class AnnotationTarget(BaseModel):
@@ -117,6 +129,20 @@ class AnnotationUpdate(BaseModel):
     visible_to: list[str] | None = None
     version: int = Field(
         ..., description="Must match current version (optimistic lock)"
+    )
+
+
+class AnnotationBatchItem(BaseModel):
+    body: AnnotationBody
+    target: AnnotationTarget
+    visible_to: list[str] | None = None
+
+
+class AnnotationBatchIn(BaseModel):
+    slide_id: str | None = None
+    study_id: str | None = None
+    annotations: list[AnnotationIn | AnnotationBatchItem] = Field(
+        min_length=1, max_length=100
     )
 
 
@@ -415,6 +441,48 @@ async def create_annotation(
     return _row_to_out(row)
 
 
+@router.post("/batch", response_model=list[AnnotationOut], status_code=status.HTTP_201_CREATED)
+async def create_annotation_batch(
+    data: AnnotationBatchIn,
+    user: dict = Depends(require_user),
+) -> list[AnnotationOut]:
+    """Create a bounded group of annotations under one delegated capability."""
+    normalized: list[AnnotationIn] = []
+    for annotation in data.annotations:
+        if isinstance(annotation, AnnotationIn):
+            normalized.append(annotation)
+        elif data.slide_id and data.study_id:
+            normalized.append(
+                AnnotationIn(
+                    slide_id=data.slide_id,
+                    study_id=data.study_id,
+                    body=annotation.body,
+                    target=annotation.target,
+                    visible_to=annotation.visible_to,
+                )
+            )
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail="Batch items without slide_id/study_id require top-level scope",
+            )
+    study_ids = {annotation.study_id for annotation in normalized}
+    if len(study_ids) != 1:
+        raise HTTPException(status_code=422, detail="A batch must contain one study")
+    study_id = next(iter(study_ids))
+    if user.get("study_id") and user["study_id"] != study_id:
+        raise HTTPException(
+            status_code=403, detail="Token study scope does not match request"
+        )
+    rows: list[dict] = []
+    for annotation in normalized:
+        if _storage_kind() == "postgres":
+            rows.append(await _create_postgres(annotation, user["sub"]))
+        else:
+            rows.append(await _create_sqlite(annotation, user["sub"]))
+    return [_row_to_out(row) for row in rows]
+
+
 @router.put("/{annotation_id}", response_model=AnnotationOut)
 async def update_annotation(
     annotation_id: str,
@@ -432,7 +500,7 @@ async def update_annotation(
         raise HTTPException(
             status_code=403, detail="Token study scope does not match annotation"
         )
-    if existing["created_by"] != user["sub"]:
+    if not _can_modify(existing, user):
         raise HTTPException(
             status_code=403, detail="Only the creator may update this annotation"
         )
@@ -511,7 +579,7 @@ async def delete_annotation(
         raise HTTPException(
             status_code=403, detail="Token study scope does not match annotation"
         )
-    if existing["created_by"] != user["sub"]:
+    if not _can_modify(existing, user):
         raise HTTPException(
             status_code=403, detail="Only the creator may delete this annotation"
         )

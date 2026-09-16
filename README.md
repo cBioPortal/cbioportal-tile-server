@@ -116,6 +116,7 @@ optional Redis cache:
 | `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
 | `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
+| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Dev-only compatibility for legacy seeded rows under the synthetic local-development subject |
 | `ONCOKB_API_TOKEN` | — | Optional OncoKB token for annotation enrichment |
 | `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
 | `OPENAI_MODEL` | `gpt-5.6-terra` | Model used by the research assistant |

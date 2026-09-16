@@ -198,6 +198,9 @@ class Settings:
     annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
     keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
     annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
+    annotation_local_development: bool = field(
+        default_factory=lambda: _env_bool("ANNOTATION_LOCAL_DEVELOPMENT", False)
+    )
     oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
     agent_model: str = field(default_factory=lambda: _env_str("OPENAI_MODEL", "gpt-5.6-terra"))

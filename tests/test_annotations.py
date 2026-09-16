@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from app import annotations
 from app.annotations import (
     AnnotationBody,
+    AnnotationBatchIn,
     AnnotationIn,
     AnnotationOut,
     AnnotationTarget,
@@ -90,6 +91,34 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
 
 
 @pytest.mark.asyncio
+async def test_annotation_batch_preserves_layer_color_and_provenance():
+    owner = user("owner")
+    batch = AnnotationBatchIn(
+        annotations=[
+            annotation_input(),
+            AnnotationIn(
+                slide_id="slide-1",
+                study_id="study-1",
+                body=AnnotationBody(
+                    label="AI region",
+                    type="Polygon",
+                    layer_name="AI review",
+                    color="#7b61ff",
+                    provenance={"source": "agent", "model": "quiltnet_pmb"},
+                ),
+                target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg/>"}),
+            ),
+        ]
+    )
+    created = await annotations.create_annotation_batch(batch, owner)
+
+    assert len(created) == 2
+    assert created[1].body.layer_name == "AI review"
+    assert created[1].body.color == "#7b61ff"
+    assert created[1].body.provenance == {"source": "agent", "model": "quiltnet_pmb"}
+
+
+@pytest.mark.asyncio
 async def test_annotation_visibility_honors_creator_groups_and_public_rows():
     owner = user("owner")
     private = await annotations.create_annotation(annotation_input(), owner)
@@ -140,6 +169,18 @@ async def test_annotation_writes_require_creator_and_matching_study_scope():
     with pytest.raises(HTTPException) as non_creator_delete:
         await annotations.delete_annotation(created.id, user("other"))
     assert non_creator_delete.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_local_development_subject_can_manage_legacy_annotations(monkeypatch):
+    monkeypatch.setattr(annotations.settings, "annotation_local_development", True)
+    created = await annotations.create_annotation(annotation_input(), user("legacy-owner"))
+
+    await annotations.delete_annotation(created.id, user("local-development"))
+
+    assert await annotations.list_annotations(
+        "slide-1", "study-1", user("local-development")
+    ) == []
 
 
 @pytest.mark.asyncio
