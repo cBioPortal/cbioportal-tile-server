@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from .quiltnet_retrieval import QuiltNetUnavailable, get_retriever
+from .quiltnet_retrieval import QuiltNetUnavailable, get_retriever, runtime_info
 
 app = FastAPI(title="WSI QuiltNet retrieval worker")
 
@@ -27,8 +27,8 @@ class SearchRequest(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "quiltnet-retrieval"}
+def health() -> dict[str, Any]:
+    return {"status": "ok", "service": "quiltnet-retrieval", **runtime_info()}
 
 
 @app.post("/v1/search")

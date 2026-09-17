@@ -8,10 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # The retrieval worker is isolated from the pixel server because the text
-# encoder and its CPU tensors are intentionally a large optional dependency.
+# encoder and its feature tensors are a large optional dependency.  The CUDA
+# wheel uses the host NVIDIA driver; it can still run on CPU when no GPU is
+# exposed (QUILTNET_DEVICE=auto).
 RUN pip install --no-cache-dir \
-    --extra-index-url https://download.pytorch.org/whl/cpu \
-    torch==2.5.1+cpu \
+    --index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.5.1 torchvision==0.20.1 \
+    && pip install --no-cache-dir \
     "fastapi>=0.111.0" \
     "uvicorn[standard]>=0.30.0" \
     "boto3>=1.34.0" \

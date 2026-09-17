@@ -124,12 +124,15 @@ services:
       dockerfile: Dockerfile.quiltnet
     profiles: ["research"]
     environment:
+      NVIDIA_VISIBLE_DEVICES: ${QUILTNET_GPU:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       BEDROCK_AWS_REGION: ${BEDROCK_AWS_REGION:-us-east-1}
       WSI_RESEARCH_EMBEDDING_CACHE_DIR: /cache/research-embeddings
       QUILTNET_MODEL_NAME: ${QUILTNET_MODEL_NAME:-hf-hub:wisdomik/QuiltNet-B-16-PMB}
+      QUILTNET_DEVICE: ${QUILTNET_DEVICE:-auto}
       HF_HOME: /cache/huggingface
     volumes:
       - research_embeddings:/cache/research-embeddings
@@ -140,6 +143,11 @@ services:
         limits:
           cpus: "2.0"
           memory: ${RESEARCH_WORKER_MEMORY_LIMIT:-4g}
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

@@ -29,7 +29,7 @@ class QuiltNetUnavailable(RuntimeError):
 
 
 _model_lock = threading.Lock()
-_model_bundle: tuple[Any, Any] | None = None
+_model_bundle: tuple[Any, Any, str] | None = None
 _artifact_lock = threading.Lock()
 
 
@@ -72,7 +72,53 @@ def _download_artifact_locked(uri: str, path: Path) -> Path:
     return path
 
 
-def _load_model() -> tuple[Any, Any]:
+def _select_device(torch: Any) -> str:
+    requested = settings.quiltnet_device.strip().lower()
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cpu":
+        return "cpu"
+    if requested.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise QuiltNetUnavailable(
+                "QuiltNet CUDA is configured but no CUDA device is available"
+            )
+        return requested
+    raise QuiltNetUnavailable(
+        f"Unsupported QuiltNet device {settings.quiltnet_device!r}; use auto, cpu, or cuda"
+    )
+
+
+def runtime_info() -> dict[str, Any]:
+    requested = settings.quiltnet_device.strip().lower()
+    try:
+        import torch
+    except ImportError:
+        return {
+            "configured_device": requested,
+            "active_device": "unavailable",
+            "cuda_available": False,
+            "model_loaded": _model_bundle is not None,
+        }
+
+    cuda_available = bool(torch.cuda.is_available())
+    if _model_bundle is not None:
+        active_device = _model_bundle[2]
+    elif requested == "auto":
+        active_device = "cuda" if cuda_available else "cpu"
+    elif requested.startswith("cuda") and not cuda_available:
+        active_device = "unavailable"
+    else:
+        active_device = requested
+    return {
+        "configured_device": requested,
+        "active_device": active_device,
+        "cuda_available": cuda_available,
+        "model_loaded": _model_bundle is not None,
+    }
+
+
+def _load_model() -> tuple[Any, Any, str]:
     global _model_bundle
     if _model_bundle is not None:
         return _model_bundle
@@ -88,15 +134,20 @@ def _load_model() -> tuple[Any, Any]:
             ) from exc
         try:
             model_name = settings.quiltnet_model_name
+            device = _select_device(torch)
             model, _, _ = open_clip.create_model_and_transforms(
-                model_name, device="cpu"
+                model_name, device=device
             )
             model.eval()
             tokenizer = open_clip.get_tokenizer(model_name)
         except Exception as exc:
             raise QuiltNetUnavailable("Unable to load the QuiltNet text encoder") from exc
-        _model_bundle = (model, tokenizer)
-        logger.info("Loaded QuiltNet text encoder %s", settings.quiltnet_model_name)
+        _model_bundle = (model, tokenizer, device)
+        logger.info(
+            "Loaded QuiltNet text encoder %s on %s",
+            settings.quiltnet_model_name,
+            device,
+        )
         return _model_bundle
 
 
@@ -200,7 +251,7 @@ def _prompt_variants(concept: str) -> list[str]:
 
 
 class QuiltNetRetriever:
-    """Lazy, CPU-safe retrieval over one slide's published tile embeddings."""
+    """Lazy retrieval over one slide's published tile embeddings."""
 
     def search(
         self,
@@ -240,7 +291,7 @@ class QuiltNetRetriever:
         normalized = np.zeros_like(features)
         normalized[valid] = features[valid] / norms[valid]
 
-        model, tokenizer = _load_model()
+        model, tokenizer, device = _load_model()
         positive = [str(item).strip() for item in query_plan.get("positive", []) if str(item).strip()]
         negative = [str(item).strip() for item in query_plan.get("negative", []) if str(item).strip()]
         if not positive:
@@ -252,17 +303,32 @@ class QuiltNetRetriever:
         import torch
 
         with torch.inference_mode():
-            positive_vectors = _as_numpy(model.encode_text(tokenizer(prompts))).astype(np.float32)
+            positive_tokens = tokenizer(prompts)
+            if hasattr(positive_tokens, "to"):
+                positive_tokens = positive_tokens.to(device)
+            positive_vectors = _as_numpy(model.encode_text(positive_tokens)).astype(np.float32)
             positive_vectors /= np.maximum(np.linalg.norm(positive_vectors, axis=1, keepdims=True), 1e-8)
             query_vector = positive_vectors.mean(axis=0)
             query_vector /= max(float(np.linalg.norm(query_vector)), 1e-8)
-            scores = normalized @ query_vector
+            if device.startswith("cuda"):
+                feature_tensor = torch.from_numpy(normalized).to(device)
+                query_tensor = torch.from_numpy(query_vector).to(device)
+                scores = _as_numpy(feature_tensor @ query_tensor).astype(np.float32)
+            else:
+                scores = normalized @ query_vector
             if negative_prompts:
-                negative_vectors = _as_numpy(model.encode_text(tokenizer(negative_prompts))).astype(np.float32)
+                negative_tokens = tokenizer(negative_prompts)
+                if hasattr(negative_tokens, "to"):
+                    negative_tokens = negative_tokens.to(device)
+                negative_vectors = _as_numpy(model.encode_text(negative_tokens)).astype(np.float32)
                 negative_vectors /= np.maximum(np.linalg.norm(negative_vectors, axis=1, keepdims=True), 1e-8)
                 negative_vector = negative_vectors.mean(axis=0)
                 negative_vector /= max(float(np.linalg.norm(negative_vector)), 1e-8)
-                scores -= 0.35 * (normalized @ negative_vector)
+                if device.startswith("cuda"):
+                    negative_tensor = torch.from_numpy(negative_vector).to(device)
+                    scores -= 0.35 * _as_numpy(feature_tensor @ negative_tensor).astype(np.float32)
+                else:
+                    scores -= 0.35 * (normalized @ negative_vector)
 
         candidate_order = np.argsort(-scores)[: min(count, max(top_k * 12, top_k))]
         patch_size = _infer_patch_size(coordinates, coordinate_metadata, model_record)

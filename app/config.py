@@ -239,6 +239,9 @@ class Settings:
             "QUILTNET_MODEL_NAME", "hf-hub:wisdomik/QuiltNet-B-16-PMB"
         )
     )
+    quiltnet_device: str = field(
+        default_factory=lambda: _env_str("QUILTNET_DEVICE", "auto")
+    )
     agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
     agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
 
