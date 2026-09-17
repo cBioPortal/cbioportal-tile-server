@@ -124,15 +124,24 @@ services:
       dockerfile: Dockerfile.quiltnet
     profiles: ["research"]
     environment:
-      NVIDIA_VISIBLE_DEVICES: ${QUILTNET_GPU:-0}
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       BEDROCK_AWS_REGION: ${BEDROCK_AWS_REGION:-us-east-1}
       WSI_RESEARCH_EMBEDDING_CACHE_DIR: /cache/research-embeddings
+      WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES: ${WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES:-21474836480}
       QUILTNET_MODEL_NAME: ${QUILTNET_MODEL_NAME:-hf-hub:wisdomik/QuiltNet-B-16-PMB}
-      QUILTNET_DEVICE: ${QUILTNET_DEVICE:-auto}
+      QUILTNET_DEVICE: ${QUILTNET_DEVICE:-cpu}
+      QUILTNET_PROMPT_CACHE_SIZE: ${QUILTNET_PROMPT_CACHE_SIZE:-4096}
+      QUILTNET_SCORE_CHUNK_SIZE: ${QUILTNET_SCORE_CHUNK_SIZE:-65536}
+      QUILTNET_TORCH_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      QUILTNET_TORCH_INTEROP_THREADS: ${QUILTNET_TORCH_INTEROP_THREADS:-1}
+      QUILTNET_MAX_CONCURRENT_SEARCHES: ${QUILTNET_MAX_CONCURRENT_SEARCHES:-1}
+      QUILTNET_MAX_QUEUE: ${QUILTNET_MAX_QUEUE:-8}
+      QUILTNET_QUEUE_TIMEOUT_SECONDS: ${QUILTNET_QUEUE_TIMEOUT_SECONDS:-30}
+      OMP_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
       HF_HOME: /cache/huggingface
     volumes:
       - research_embeddings:/cache/research-embeddings
@@ -143,17 +152,12 @@ services:
         limits:
           cpus: "2.0"
           memory: ${RESEARCH_WORKER_MEMORY_LIMIT:-4g}
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 30s
+      retries: 6
+      start_period: 120s
 
   redis:
     image: redis:7.4.5-alpine

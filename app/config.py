@@ -234,6 +234,32 @@ class Settings:
     research_embedding_cache_dir: str = field(
         default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_CACHE_DIR", "/cache/research-embeddings")
     )
+    research_embedding_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES", 20 * 1024**3
+        )
+    )
+    quiltnet_prompt_cache_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_PROMPT_CACHE_SIZE", 4096)
+    )
+    quiltnet_score_chunk_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_SCORE_CHUNK_SIZE", 65_536)
+    )
+    quiltnet_torch_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_THREADS", 2)
+    )
+    quiltnet_torch_interop_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_INTEROP_THREADS", 1)
+    )
+    quiltnet_max_concurrent_searches: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_CONCURRENT_SEARCHES", 1)
+    )
+    quiltnet_max_queue: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_QUEUE", 8)
+    )
+    quiltnet_queue_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("QUILTNET_QUEUE_TIMEOUT_SECONDS", 30.0)
+    )
     quiltnet_model_name: str = field(
         default_factory=lambda: _env_str(
             "QUILTNET_MODEL_NAME", "hf-hub:wisdomik/QuiltNet-B-16-PMB"

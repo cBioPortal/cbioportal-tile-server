@@ -7,12 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# The retrieval worker is isolated from the pixel server because the text
-# encoder and its feature tensors are a large optional dependency.  The
-# default image is CPU-only so a cold, mostly uncached catalog does not
-# require a GPU allocation.
 RUN pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cpu \
+    --index-url https://download.pytorch.org/whl/cu124 \
     torch==2.5.1 torchvision==0.20.1 \
     && pip install --no-cache-dir \
     "fastapi>=0.111.0" \
