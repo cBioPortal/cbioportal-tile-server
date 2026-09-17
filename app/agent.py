@@ -2,8 +2,8 @@
 
 The assistant can inspect a caller-supplied viewport and propose reversible
 viewer or annotation actions.  It never writes annotations directly: every
-proposal is persisted as ``pending`` and must be approved by the caller
-before the frontend applies it through the existing annotation API.
+proposal is persisted as ``pending`` and must be approved by the caller.
+Annotation approval is committed atomically with its proposal state.
 """
 
 from __future__ import annotations
@@ -51,6 +51,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import annotations as annotation_store
 from .auth import scoped_user_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
@@ -98,6 +99,11 @@ class ViewportContext(BaseModel):
     center_x: float | None = Field(default=None, ge=0)
     center_y: float | None = Field(default=None, ge=0)
     zoom: float | None = Field(default=None, gt=0)
+    # These values bind a proposal to the exact displayed slide source and
+    # viewer frame used to create its image/transform pair.
+    source_fingerprint: str | None = Field(default=None, min_length=8, max_length=512)
+    capture_id: str | None = Field(default=None, min_length=1, max_length=128)
+    viewer_generation: int | None = Field(default=None, ge=0)
 
 
 class EmbeddingContext(BaseModel):
@@ -162,12 +168,25 @@ class ActionOutcome(BaseModel):
     detail: str = Field(default="", max_length=1000)
 
 
+class CommitAnnotationsRequest(BaseModel):
+    source_fingerprint: str = Field(min_length=8, max_length=512)
+    viewer_generation: int | None = Field(default=None, ge=0)
+    slide_id: str = Field(min_length=1, max_length=200)
+
+
 @dataclass
 class AgentRunContext:
     user_sub: str
     session_id: str
     context: AgentContext
     proposal_ids: list[str] = field(default_factory=list)
+    retrieval_candidates: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+class AgentCommitResponse(BaseModel):
+    action: AgentAction
+    annotations: list[annotation_store.AnnotationOut]
+    idempotent: bool = False
 
 
 def _settings_db_url() -> str:
@@ -466,6 +485,15 @@ def _ensure_openai_credentials() -> bool:
 
 
 def _validate_context(context: AgentContext) -> None:
+    if (
+        not context.viewport.source_fingerprint
+        or not context.viewport.capture_id
+        or context.viewport.viewer_generation is None
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="WSI source binding is required; reload the slide before using the assistant",
+        )
     if context.viewport.image_data_url:
         data_url = context.viewport.image_data_url
         if not data_url.startswith("data:image/jpeg;base64,"):
@@ -543,6 +571,287 @@ def _context_snapshot(context: AgentContext) -> dict[str, Any]:
     }
 
 
+def _finite_point(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("x"), (int, float))
+        and not isinstance(value.get("x"), bool)
+        and isinstance(value.get("y"), (int, float))
+        and not isinstance(value.get("y"), bool)
+        and math.isfinite(float(value["x"]))
+        and math.isfinite(float(value["y"]))
+    )
+
+
+def _canonicalize_annotation(
+    value: dict[str, Any],
+    run_context: AgentRunContext,
+    *,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert one proposal into immutable slide-pixel coordinates.
+
+    The model may describe viewport-normalized points or refer to a retrieval
+    candidate.  Only this boundary performs conversion; preview and approval
+    consume the resulting slide-pixel payload verbatim.
+    """
+    defaults = defaults or {}
+    raw = {**defaults, **value}
+    source = str(raw.get("coordinate_space", "viewport"))
+    if source not in {
+        "viewport",
+        "slide_pixels",
+        "retrieved_candidate",
+        "high_resolution_region",
+    }:
+        raise ValueError("Unsupported annotation coordinate space")
+
+    context = run_context.context
+    viewport = context.viewport
+    source_fingerprint = viewport.source_fingerprint
+    capture_id = raw.get("capture_id") or viewport.capture_id
+    if not source_fingerprint or not capture_id:
+        raise ValueError("Annotation source binding is missing; request a fresh viewport")
+    if viewport.capture_id and capture_id != viewport.capture_id:
+        raise ValueError("Annotation capture is stale; request a fresh viewport")
+
+    if source == "slide_pixels":
+        raw_points = raw.get("points")
+        if not isinstance(raw_points, list) or not all(_finite_point(point) for point in raw_points):
+            raise ValueError("Slide-pixel annotation points are invalid")
+        normalized_input = {
+            **raw,
+            "points": [
+                {
+                    "x": min(1000.0, max(0.0, float(point["x"]) / max(viewport.slide_width, 1) * 1000.0)),
+                    "y": min(1000.0, max(0.0, float(point["y"]) / max(viewport.slide_height, 1) * 1000.0)),
+                }
+                for point in raw_points
+            ],
+        }
+    else:
+        normalized_input = raw
+    normalized = _validate_annotation_input(normalized_input)
+    points = normalized["points"]
+    slide_points: list[dict[str, float]]
+    candidate_id = raw.get("candidate_id")
+    if source == "retrieved_candidate":
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise ValueError("A retrieval candidate_id is required")
+        candidate = run_context.retrieval_candidates.get(candidate_id)
+        candidate_points = candidate.get("points") if candidate else None
+        if not isinstance(candidate_points, list):
+            raise ValueError("The retrieval candidate is not available for this run")
+        points = [Point.model_validate(point).model_dump() for point in candidate_points]
+        slide_points = [
+            {
+                "x": float(point["x"]) / 1000.0 * viewport.slide_width,
+                "y": float(point["y"]) / 1000.0 * viewport.slide_height,
+            }
+            for point in points
+        ]
+    elif source == "high_resolution_region":
+        region = raw.get("coordinate_region")
+        if not isinstance(region, dict):
+            raise ValueError("A high-resolution coordinate region is required")
+        if not all(
+            isinstance(region.get(name), (int, float))
+            and not isinstance(region.get(name), bool)
+            and math.isfinite(float(region[name]))
+            for name in ("x", "y")
+        ):
+            raise ValueError("The annotation region is invalid")
+        if not all(
+            isinstance(region.get(name), (int, float))
+            and not isinstance(region.get(name), bool)
+            and math.isfinite(float(region[name]))
+            for name in ("width", "height")
+        ):
+            raise ValueError("The annotation region is invalid")
+        x = float(region["x"])
+        y = float(region["y"])
+        width = float(region["width"])
+        height = float(region["height"])
+        if (
+            x < 0
+            or y < 0
+            or width <= 0
+            or height <= 0
+            or x + width > viewport.slide_width
+            or y + height > viewport.slide_height
+        ):
+            raise ValueError("The annotation region is outside the slide")
+        slide_points = [
+            {"x": x + float(point["x"]) / 1000.0 * width,
+             "y": y + float(point["y"]) / 1000.0 * height}
+            for point in points
+        ]
+    elif source == "slide_pixels":
+        raw_points = value.get("points")
+        if not isinstance(raw_points, list) or not all(_finite_point(point) for point in raw_points):
+            raise ValueError("Slide-pixel annotation points are invalid")
+        if len(raw_points) < (3 if normalized["geometry_type"] == "polygon" else 2) or len(raw_points) > 100:
+            raise ValueError("Annotation geometry has an invalid number of points")
+        slide_points = [{"x": float(point["x"]), "y": float(point["y"])} for point in raw_points]
+    else:
+        image_width = viewport.image_width or viewport.slide_width
+        image_height = viewport.image_height or viewport.slide_height
+        transform = viewport.image_transform
+        if transform is not None and (
+            len(transform) != 6 or not all(math.isfinite(value) for value in transform)
+        ):
+            raise ValueError("The viewport image transform is invalid")
+        slide_points = []
+        for point in points:
+            u = float(point["x"]) / 1000.0 * image_width
+            v = float(point["y"]) / 1000.0 * image_height
+            if transform:
+                x = transform[0] * u + transform[1] * v + transform[2]
+                y = transform[3] * u + transform[4] * v + transform[5]
+            else:
+                x = float(point["x"]) / 1000.0 * viewport.slide_width
+                y = float(point["y"]) / 1000.0 * viewport.slide_height
+            slide_points.append({"x": x, "y": y})
+
+    if any(
+        point["x"] < 0
+        or point["y"] < 0
+        or point["x"] > viewport.slide_width
+        or point["y"] > viewport.slide_height
+        for point in slide_points
+    ):
+        raise ValueError("Annotation points are outside the slide")
+    canonical = {
+        **normalized,
+        "points": slide_points,
+        "geometry_version": 2,
+        "coordinate_space": "slide_pixels",
+        "source_kind": source,
+        "source_fingerprint": source_fingerprint,
+        "capture_id": capture_id,
+        "viewer_generation": viewport.viewer_generation,
+        "slide_dimensions": {
+            "width": viewport.slide_width,
+            "height": viewport.slide_height,
+        },
+    }
+    if source == "high_resolution_region":
+        canonical["coordinate_region"] = raw["coordinate_region"]
+    if candidate_id:
+        canonical["candidate_id"] = candidate_id
+    return canonical
+
+
+def _svg_selector(geometry_type: str, points: list[dict[str, float]]) -> str:
+    if geometry_type == "rectangle":
+        xs = [point["x"] for point in points]
+        ys = [point["y"] for point in points]
+        x = min(xs)
+        y = min(ys)
+        return (
+            f'<svg><rect x="{x:g}" y="{y:g}" '
+            f'width="{max(xs) - x:g}" height="{max(ys) - y:g}" /></svg>'
+        )
+    values = " ".join(f'{point["x"]:g},{point["y"]:g}' for point in points)
+    return f'<svg><polygon points="{values}" /></svg>'
+
+
+def _canonical_action_annotations(
+    action: AgentAction,
+) -> list[annotation_store.AnnotationIn]:
+    payload = action.payload
+    context = payload.get("context")
+    viewport = context.get("viewport") if isinstance(context, dict) else None
+    if not isinstance(viewport, dict):
+        raise HTTPException(status_code=409, detail="Proposal capture context is missing")
+    width = viewport.get("slide_width")
+    height = viewport.get("slide_height")
+    drafts = payload.get("annotations") if action.action_type == "annotation_batch" else [payload]
+    source_fingerprint = (
+        drafts[0].get("source_fingerprint")
+        if isinstance(drafts, list) and drafts and isinstance(drafts[0], dict)
+        else payload.get("source_fingerprint")
+    )
+    if (
+        not isinstance(width, (int, float))
+        or not isinstance(height, (int, float))
+        or width <= 0
+        or height <= 0
+        or not isinstance(source_fingerprint, str)
+        or source_fingerprint != viewport.get("source_fingerprint")
+    ):
+        raise HTTPException(status_code=409, detail="Proposal source binding is invalid")
+    if not isinstance(drafts, list) or not 1 <= len(drafts) <= 100:
+        raise HTTPException(status_code=422, detail="Annotation proposal is empty or too large")
+    result: list[annotation_store.AnnotationIn] = []
+    for draft in drafts:
+        if (
+            not isinstance(draft, dict)
+            or draft.get("geometry_version") != 2
+            or draft.get("coordinate_space") != "slide_pixels"
+        ):
+            raise HTTPException(status_code=409, detail="Proposal coordinates are not canonical")
+        if draft.get("source_fingerprint") != source_fingerprint:
+            raise HTTPException(status_code=409, detail="Proposal source binding is invalid")
+        points = draft.get("points")
+        geometry_type = draft.get("geometry_type")
+        if (
+            geometry_type not in {"rectangle", "polygon"}
+            or not isinstance(points, list)
+            or len(points) < (3 if geometry_type == "polygon" else 2)
+            or len(points) > 100
+            or not all(_finite_point(point) for point in points)
+            or any(
+                float(point["x"]) < 0
+                or float(point["y"]) < 0
+                or float(point["x"]) > float(width)
+                or float(point["y"]) > float(height)
+                for point in points
+            )
+        ):
+            raise HTTPException(status_code=422, detail="Proposal geometry is invalid")
+        layer_name = str(draft.get("layer_name") or payload.get("layer_name") or "Default").strip()
+        color = str(draft.get("color") or payload.get("color") or "#3b82f6")
+        label = str(draft.get("label") or "AI proposal").strip()
+        if not layer_name or len(layer_name) > 100 or not label or len(label) > 200:
+            raise HTTPException(status_code=422, detail="Proposal annotation metadata is invalid")
+        provenance = dict(payload.get("provenance") or {})
+        provenance.update(
+            {
+                "source": "agent",
+                "proposal_id": action.id,
+                "candidate_id": draft.get("candidate_id") or provenance.get("candidate_id"),
+                "confidence": draft.get("confidence", provenance.get("confidence")),
+                "rationale": payload.get("rationale", ""),
+            }
+        )
+        body = annotation_store.AnnotationBody(
+            label=label,
+            comment=layer_name,
+            type=f"{layer_name}|{color}",
+            layer_name=layer_name,
+            color=color,
+            provenance=provenance,
+        )
+        result.append(
+            annotation_store.AnnotationIn(
+                slide_id=action.slide_id,
+                study_id=action.study_id,
+                body=body,
+                target=annotation_store.AnnotationTarget(
+                    selector={
+                        "type": "SvgSelector",
+                        "value": _svg_selector(
+                            geometry_type,
+                            [{"x": float(point["x"]), "y": float(point["y"])} for point in points],
+                        ),
+                    }
+                ),
+            )
+        )
+    return result
+
+
 @function_tool
 async def propose_annotation(
     context: RunContextWrapper[AgentRunContext],
@@ -570,8 +879,17 @@ async def propose_annotation(
         run_context,
         "create_annotation",
         {
-            "geometry_type": geometry_type,
-            "points": [point.model_dump() for point in points],
+            **_canonicalize_annotation(
+                {
+                    "geometry_type": geometry_type,
+                    "points": [point.model_dump() for point in points],
+                    "label": label,
+                    "layer_name": layer_name,
+                    "color": color,
+                    "confidence": confidence,
+                },
+                run_context,
+            ),
             "label": label.strip(),
             "layer_name": layer_name.strip(),
             "color": color,
@@ -724,9 +1042,13 @@ context is insufficient.
 Every state-changing request requires a proposal tool call.  Never claim that
 an annotation, navigation, or filter change has been applied: tools only
 create pending proposals and the user must approve them in the UI.  Annotation
-coordinates must be normalized to the supplied slide image as x/y values from
-0 through 1000.  Propose only coarse rectangles or polygons and include a
-short rationale and confidence.  Do not infer or invent patient facts.
+  coordinates must be tied to the supplied capture.  Prefer
+  coordinate_space=retrieved_candidate with a candidate_id from
+  wsi_find_regions; otherwise use viewport coordinates from 0 through 1000 and
+  include the capture_id.  The server converts proposals to immutable
+  slide-pixel coordinates before preview or approval.  Propose only coarse
+  rectangles or polygons and include a short rationale and confidence.  Do not
+  infer or invent patient facts.
 
 For a request to find tissue or morphology, call wsi_find_regions with the
 user's natural-language description.  The retrieval service expands and
@@ -835,7 +1157,7 @@ def _bedrock_tools() -> list[dict[str, Any]]:
         {
             "toolSpec": {
                 "name": "wsi_find_regions",
-                "description": "Find tumor or tissue regions on the current slide using the live QuiltNet tile-retrieval index. Use quiltnet_pmb; the other research models are slide-level indexes and cannot return tile regions.",
+                "description": "Find tumor or tissue regions on the current slide using the live QuiltNet tile-retrieval index. Results are normalized to the full slide and each candidate_id can be used by an annotation proposal.",
                 "inputSchema": {"json": {"type": "object", "properties": {
                     "query": {"type": "string"},
                     "positive_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
@@ -858,10 +1180,14 @@ def _bedrock_tools() -> list[dict[str, Any]]:
         {
             "toolSpec": {
                 "name": "wsi_propose_annotations",
-                "description": "Create one reversible annotation proposal for user approval. Points are normalized to 0..1000.",
+                "description": "Create one reversible annotation proposal for user approval. Prefer a retrieved candidate; otherwise use viewport coordinates and the supplied capture_id.",
                 "inputSchema": {"json": {"type": "object", "properties": {
                     "geometry_type": {"type": "string", "enum": ["rectangle", "polygon"]},
                     "points": {"type": "array", "items": point, "minItems": 2, "maxItems": 100},
+                    "coordinate_space": {"type": "string", "enum": ["viewport", "retrieved_candidate", "high_resolution_region"]},
+                    "capture_id": {"type": "string"},
+                    "candidate_id": {"type": "string"},
+                    "coordinate_region": {"type": "object"},
                     "label": {"type": "string"},
                     "layer_name": {"type": "string"},
                     "color": {"type": "string"},
@@ -873,8 +1199,10 @@ def _bedrock_tools() -> list[dict[str, Any]]:
         {
             "toolSpec": {
                 "name": "wsi_propose_annotation_batch",
-                "description": "Create up to 50 reversible annotation proposals for one approval action.",
+                "description": "Create up to 50 reversible annotation proposals for one approval action. Each item can use a retrieved candidate or the current viewport capture.",
                 "inputSchema": {"json": {"type": "object", "properties": {
+                    "coordinate_space": {"type": "string", "enum": ["viewport", "retrieved_candidate", "high_resolution_region"]},
+                    "capture_id": {"type": "string"},
                     "annotations": {"type": "array", "maxItems": 50, "items": {"type": "object"}},
                     "rationale": {"type": "string"},
                 }, "required": ["annotations", "rationale"]}},
@@ -952,6 +1280,9 @@ async def _bedrock_tool(
             run_context.context.viewport.slide_height,
             query_plan,
         )
+        for region in result.get("regions", []):
+            if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
+                run_context.retrieval_candidates[region["candidate_id"]] = region
         return {**result, "normalized_coordinate_space": "0..1000"}
     if name == "wsi_find_similar_slides":
         manifest = await _load_manifest()
@@ -971,7 +1302,7 @@ async def _bedrock_tool(
         top_k = min(10, max(1, int(arguments.get("top_k", 5))))
         return {"model": model, "slides": _similar_slides_for_model(row, model, top_k)}
     if name == "wsi_propose_annotations":
-        payload = _validate_annotation_input(arguments)
+        payload = _canonicalize_annotation(arguments, run_context)
         payload.update({
             "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
             "context": _context_snapshot(run_context.context),
@@ -983,7 +1314,10 @@ async def _bedrock_tool(
         if not isinstance(raw_annotations, list) or not 1 <= len(raw_annotations) <= 50:
             raise ValueError("annotations must contain 1-50 items")
         payload = {
-            "annotations": [_validate_annotation_input(item) for item in raw_annotations],
+            "annotations": [
+                _canonicalize_annotation(item, run_context, defaults=arguments)
+                for item in raw_annotations
+            ],
             "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
             "context": _context_snapshot(run_context.context),
         }
@@ -1216,12 +1550,206 @@ async def _transition_action(
     return updated
 
 
+async def _committed_annotation_rows(
+    ids: list[str],
+    db: Any,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for annotation_id in ids:
+        if isinstance(db, aiosqlite.Connection):
+            cursor = await db.execute(
+                "SELECT * FROM annotations WHERE id = ?", (annotation_id,)
+            )
+            row = await cursor.fetchone()
+        else:
+            row = await db.fetchrow(
+                """
+                SELECT
+                    id, slide_id, study_id, body, target, created_by, visible_to,
+                    version,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
+                FROM annotations WHERE id = $1
+                """,
+                annotation_id,
+            )
+        if row is not None:
+            rows.append(dict(row))
+    return rows
+
+
+async def _commit_annotations(
+    action_id: str,
+    user_sub: str,
+    request: CommitAnnotationsRequest,
+) -> AgentCommitResponse:
+    columns = (
+        "id, session_id, action_type, study_id, slide_id, payload_json, status, "
+        "created_at, decided_at, outcome_json"
+    )
+
+    async def finish(
+        db: Any,
+        action_row: Any,
+        *,
+        commit: bool = True,
+    ) -> AgentCommitResponse:
+        action = _row_to_action(action_row)
+        if action.slide_id != request.slide_id:
+            raise HTTPException(status_code=409, detail="The proposal slide is no longer active")
+        if action.status == "completed":
+            outcome = action.outcome or {}
+            ids = outcome.get("annotation_ids", [])
+            if not isinstance(ids, list):
+                raise HTTPException(status_code=409, detail="Completed proposal has invalid outcome")
+            rows = await _committed_annotation_rows([str(item) for item in ids], db)
+            return AgentCommitResponse(
+                action=action,
+                annotations=[annotation_store._row_to_out(row) for row in rows],
+                idempotent=True,
+            )
+        if action.status != "pending":
+            raise HTTPException(status_code=409, detail="Proposal is no longer pending")
+        action_drafts = (
+            action.payload.get("annotations")
+            if action.action_type == "annotation_batch"
+            else [action.payload]
+        )
+        action_source = (
+            action_drafts[0].get("source_fingerprint")
+            if isinstance(action_drafts, list)
+            and action_drafts
+            and isinstance(action_drafts[0], dict)
+            else None
+        )
+        if action_source != request.source_fingerprint:
+            raise HTTPException(status_code=409, detail="The proposal source is stale")
+        if request.viewer_generation is not None:
+            generations = {
+                draft.get("viewer_generation")
+                for draft in action_drafts
+                if isinstance(draft, dict)
+            }
+            if generations != {request.viewer_generation}:
+                raise HTTPException(status_code=409, detail="The proposal viewer generation is stale")
+        annotations = _canonical_action_annotations(action)
+        rows: list[dict[str, Any]] = []
+        for annotation in annotations:
+            if isinstance(db, aiosqlite.Connection):
+                rows.append(
+                    await annotation_store._insert_sqlite_connection(
+                        db, annotation, user_sub
+                    )
+                )
+            else:
+                rows.append(
+                    await annotation_store._insert_postgres_connection(
+                        db, annotation, user_sub
+                    )
+                )
+        ids = [str(row["id"]) for row in rows]
+        decided_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        outcome = {"success": True, "detail": "Annotations committed", "annotation_ids": ids}
+        if isinstance(db, aiosqlite.Connection):
+            await db.execute(
+                """
+                UPDATE agent_actions
+                SET status = 'completed', decided_at = ?, outcome_json = ?
+                WHERE id = ? AND user_sub = ? AND status = 'pending'
+                """,
+                (decided_at, json.dumps(outcome), action_id, user_sub),
+            )
+            cursor = await db.execute(
+                f"SELECT {columns} FROM agent_actions WHERE id = ?", (action_id,)
+            )
+            updated_row = await cursor.fetchone()
+        else:
+            updated_row = await db.fetchrow(
+                """
+                UPDATE agent_actions
+                SET status = 'completed', decided_at = $1, outcome_json = $2
+                WHERE id = $3 AND user_sub = $4 AND status = 'pending'
+                RETURNING id, session_id, action_type, study_id, slide_id,
+                          payload_json, status, created_at, decided_at, outcome_json
+                """,
+                decided_at,
+                json.dumps(outcome),
+                action_id,
+                user_sub,
+            )
+        if updated_row is None:
+            raise HTTPException(status_code=409, detail="Proposal is no longer pending")
+        if commit and isinstance(db, aiosqlite.Connection):
+            await db.commit()
+        return AgentCommitResponse(
+            action=_row_to_action(updated_row),
+            annotations=[annotation_store._row_to_out(row) for row in rows],
+        )
+
+    if _storage_kind() == "postgres":
+        conn = await asyncpg.connect(_get_db_url())
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    f"SELECT {columns} FROM agent_actions WHERE id = $1 AND user_sub = $2 FOR UPDATE",
+                    action_id,
+                    user_sub,
+                )
+                if row is None:
+                    raise HTTPException(status_code=404, detail="Agent proposal not found")
+                return await finish(conn, row, commit=False)
+        finally:
+            await conn.close()
+    db = await aiosqlite.connect(_get_db_path())
+    try:
+        await annotation_store._apply_sqlite_pragmas(db)
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
+            f"SELECT {columns} FROM agent_actions WHERE id = ? AND user_sub = ?",
+            (action_id, user_sub),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Agent proposal not found")
+        return await finish(db, row)
+    except Exception:
+        if db.in_transaction:
+            await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
 @router.post("/actions/{action_id}/apply", response_model=AgentAction)
 async def apply_agent_action(
     action_id: str,
     user: dict[str, Any] = _AGENT_READ_WRITE_USER,
 ) -> AgentAction:
+    action = await _get_action(action_id, user["sub"])
+    if action and action.action_type in {"create_annotation", "annotation_batch"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Annotation proposals must be committed through the atomic commit endpoint",
+        )
     return await _transition_action(action_id, user, "pending", "approved")
+
+
+@router.post(
+    "/actions/{action_id}/commit-annotations",
+    response_model=AgentCommitResponse,
+)
+async def commit_agent_annotations(
+    action_id: str,
+    request: CommitAnnotationsRequest,
+    user: dict[str, Any] = _AGENT_READ_WRITE_USER,
+) -> AgentCommitResponse:
+    action = await _get_action(action_id, user["sub"])
+    if not action:
+        raise HTTPException(status_code=404, detail="Agent proposal not found")
+    _require_study(user, action.study_id)
+    return await _commit_annotations(action_id, user["sub"], request)
 
 
 @router.post("/actions/{action_id}/reject", response_model=AgentAction)

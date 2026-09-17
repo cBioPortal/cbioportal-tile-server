@@ -6,6 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app import agent
+from app import annotations as annotation_store
 
 
 def make_context() -> agent.AgentContext:
@@ -28,6 +29,9 @@ def make_context() -> agent.AgentContext:
             image_width=100,
             image_height=80,
             image_transform=[1, 0, 0, 0, 1, 0],
+            source_fingerprint="source-v2-fingerprint",
+            capture_id="capture-1",
+            viewer_generation=3,
         ),
     )
 
@@ -92,6 +96,7 @@ async def agent_db(tmp_path, monkeypatch):
     db_path = tmp_path / "agent.db"
     monkeypatch.setattr(agent.settings, "annotation_database_url", "")
     await agent.init_db(db_path=str(db_path), db_url="")
+    await annotation_store.init_db(db_path=str(db_path), db_url="")
     agent._rate_windows.clear()
     yield
 
@@ -103,8 +108,8 @@ async def test_pending_proposal_requires_single_approval(agent_db):
     )
     proposal = await agent._insert_action(
         run_context,
-        "create_annotation",
-        {"geometry_type": "rectangle", "points": [{"x": 1, "y": 2}]},
+        "viewer_action",
+        {"action": "zoom"},
     )
     assert proposal.status == "pending"
 
@@ -329,3 +334,153 @@ async def test_bedrock_stream_surfaces_provider_failure_as_error_event(agent_db,
     events = [chunk async for chunk in agent._stream_agent(request, "user-a")]
 
     assert any(chunk.startswith("event: error") for chunk in events)
+
+
+@pytest.mark.asyncio
+async def test_annotation_proposal_is_canonicalized_to_slide_pixels(agent_db):
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-canonical", context=make_context()
+    )
+    result = await agent._bedrock_tool(
+        "wsi_propose_annotations",
+        {
+            "geometry_type": "polygon",
+            "points": [{"x": 100, "y": 200}, {"x": 300, "y": 200}, {"x": 300, "y": 400}],
+            "label": "candidate",
+            "layer_name": "Tumor",
+            "color": "#ef4444",
+            "confidence": 0.8,
+            "rationale": "The captured viewport contains a candidate.",
+        },
+        run_context,
+    )
+    proposal = (await agent._get_action(result["proposal_id"], "user-a"))
+    assert proposal is not None
+    assert proposal.payload["geometry_version"] == 2
+    assert proposal.payload["coordinate_space"] == "slide_pixels"
+    assert proposal.payload["source_fingerprint"] == "source-v2-fingerprint"
+    assert proposal.payload["capture_id"] == "capture-1"
+    assert proposal.payload["points"] == [
+        {"x": 10.0, "y": 16.0},
+        {"x": 30.0, "y": 16.0},
+        {"x": 30.0, "y": 32.0},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_annotation_commit_is_atomic_and_idempotent(agent_db):
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-commit", context=make_context()
+    )
+    result = await agent._bedrock_tool(
+        "wsi_propose_annotations",
+        {
+            "geometry_type": "rectangle",
+            "points": [{"x": 100, "y": 100}, {"x": 300, "y": 300}],
+            "label": "candidate",
+            "layer_name": "Tumor",
+            "color": "#ef4444",
+            "confidence": 0.8,
+            "rationale": "The captured viewport contains a candidate.",
+        },
+        run_context,
+    )
+    request = agent.CommitAnnotationsRequest(
+        source_fingerprint="source-v2-fingerprint",
+        viewer_generation=3,
+        slide_id="slide-a",
+    )
+    first = await agent._commit_annotations(result["proposal_id"], "user-a", request)
+    second = await agent._commit_annotations(result["proposal_id"], "user-a", request)
+
+    assert first.idempotent is False
+    assert second.idempotent is True
+    assert first.action.status == "completed"
+    assert [item.id for item in first.annotations] == [item.id for item in second.annotations]
+    assert len(await annotation_store._list_sqlite("slide-a", "study-a", "user-a")) == 1
+
+
+@pytest.mark.asyncio
+async def test_annotation_commit_rejects_stale_source_without_writing(agent_db):
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-stale", context=make_context()
+    )
+    result = await agent._bedrock_tool(
+        "wsi_propose_annotations",
+        {
+            "geometry_type": "rectangle",
+            "points": [{"x": 100, "y": 100}, {"x": 300, "y": 300}],
+            "label": "candidate",
+            "layer_name": "Tumor",
+            "color": "#ef4444",
+            "confidence": 0.8,
+            "rationale": "The captured viewport contains a candidate.",
+        },
+        run_context,
+    )
+    request = agent.CommitAnnotationsRequest(
+        source_fingerprint="different-source-v2",
+        viewer_generation=3,
+        slide_id="slide-a",
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await agent._commit_annotations(result["proposal_id"], "user-a", request)
+
+    assert error.value.status_code == 409
+    assert await annotation_store._list_sqlite("slide-a", "study-a", "user-a") == []
+    proposal = await agent._get_action(result["proposal_id"], "user-a")
+    assert proposal is not None and proposal.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_annotation_commit_rolls_back_all_rows_on_failure(agent_db, monkeypatch):
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-rollback", context=make_context()
+    )
+    result = await agent._bedrock_tool(
+        "wsi_propose_annotation_batch",
+        {
+            "annotations": [
+                {
+                    "geometry_type": "rectangle",
+                    "points": [{"x": 100, "y": 100}, {"x": 200, "y": 200}],
+                    "label": "one",
+                    "layer_name": "Tumor",
+                    "color": "#ef4444",
+                    "confidence": 0.8,
+                },
+                {
+                    "geometry_type": "rectangle",
+                    "points": [{"x": 300, "y": 300}, {"x": 400, "y": 400}],
+                    "label": "two",
+                    "layer_name": "Tumor",
+                    "color": "#ef4444",
+                    "confidence": 0.8,
+                },
+            ],
+            "rationale": "Two candidates in the captured viewport.",
+        },
+        run_context,
+    )
+    original = annotation_store._insert_sqlite_connection
+    calls = 0
+
+    async def fail_second(db, data, user_sub, annotation_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated annotation insert failure")
+        return await original(db, data, user_sub, annotation_id)
+
+    monkeypatch.setattr(annotation_store, "_insert_sqlite_connection", fail_second)
+    request = agent.CommitAnnotationsRequest(
+        source_fingerprint="source-v2-fingerprint",
+        viewer_generation=3,
+        slide_id="slide-a",
+    )
+    with pytest.raises(RuntimeError, match="simulated"):
+        await agent._commit_annotations(result["proposal_id"], "user-a", request)
+    assert await annotation_store._list_sqlite("slide-a", "study-a", "user-a") == []
+    proposal = await agent._get_action(result["proposal_id"], "user-a")
+    assert proposal is not None and proposal.status == "pending"

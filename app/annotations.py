@@ -250,49 +250,38 @@ async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[di
 
 
 async def _create_sqlite(data: AnnotationIn, user_sub: str) -> dict:
-    ann_id = str(uuid.uuid4())
-    visible_to_json = (
-        json.dumps(data.visible_to) if data.visible_to is not None else None
-    )
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
-        db.row_factory = aiosqlite.Row
-        await db.execute(
-            """
-            INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ann_id,
-                data.slide_id,
-                data.study_id,
-                data.body.model_dump_json(),
-                _sqlite_target_json(data.target.selector),
-                user_sub,
-                visible_to_json,
-            ),
-        )
+        row = await _insert_sqlite_connection(db, data, user_sub)
         await db.commit()
-        cursor = await db.execute("SELECT * FROM annotations WHERE id = ?", (ann_id,))
-        row = await cursor.fetchone()
-    return dict(row)
+    return row
 
 
-async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
-    ann_id = str(uuid.uuid4())
+async def _insert_sqlite_connection(
+    db: aiosqlite.Connection,
+    data: AnnotationIn,
+    user_sub: str,
+    annotation_id: str | None = None,
+) -> dict:
+    ann_id = annotation_id or str(uuid.uuid4())
     visible_to_json = (
         json.dumps(data.visible_to) if data.visible_to is not None else None
     )
-    async with connection(_get_db_url()) as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING
-                id, slide_id, study_id, body, target, created_by, visible_to, version,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
-                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
-            """,
+    db.row_factory = aiosqlite.Row
+    await db.execute(
+        """
+        INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+    db.row_factory = aiosqlite.Row
+    await db.execute(
+        """
+        INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+>>>>>>> 166c575 (fix(agent): commit canonical slide annotations atomically)
             ann_id,
             data.slide_id,
             data.study_id,
@@ -300,8 +289,50 @@ async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
             _sqlite_target_json(data.target.selector),
             user_sub,
             visible_to_json,
-        )
-        return dict(row)
+        ),
+    )
+    cursor = await db.execute("SELECT * FROM annotations WHERE id = ?", (ann_id,))
+    row = await cursor.fetchone()
+    if row is None:
+        raise RuntimeError("Annotation insert did not return a row")
+    return dict(row)
+
+
+async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
+    async with connection(_get_db_url()) as conn:
+        return await _insert_postgres_connection(conn, data, user_sub)
+
+
+async def _insert_postgres_connection(
+    conn: asyncpg.Connection,
+    data: AnnotationIn,
+    user_sub: str,
+    annotation_id: str | None = None,
+) -> dict:
+    ann_id = annotation_id or str(uuid.uuid4())
+    visible_to_json = (
+        json.dumps(data.visible_to) if data.visible_to is not None else None
+    )
+    row = await conn.fetchrow(
+        """
+        INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING
+            id, slide_id, study_id, body, target, created_by, visible_to, version,
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+            to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
+        """,
+        ann_id,
+        data.slide_id,
+        data.study_id,
+        data.body.model_dump_json(),
+        _sqlite_target_json(data.target.selector),
+        user_sub,
+        visible_to_json,
+    )
+    if row is None:
+        raise RuntimeError("Annotation insert did not return a row")
+    return dict(row)
 
 
 async def _get_existing_sqlite(annotation_id: str) -> dict | None:
