@@ -100,6 +100,14 @@ class ViewportContext(BaseModel):
     zoom: float | None = Field(default=None, gt=0)
 
 
+class EmbeddingContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["quiltnet"]
+    scope: Literal["study"]
+    slide_ids: list[str] = Field(default_factory=list, max_length=200)
+
+
 class AgentContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -115,6 +123,7 @@ class AgentContext(BaseModel):
     existing_annotations: list[dict[str, Any]] = Field(
         default_factory=list, max_length=100
     )
+    embedding_context: EmbeddingContext | None = None
     viewport: ViewportContext
 
 

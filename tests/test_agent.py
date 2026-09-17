@@ -17,6 +17,9 @@ def make_context() -> agent.AgentContext:
         filters={"stain_filter": "hne"},
         slide_metadata={"magnification": "20x"},
         patient_context={"sample": {"sample_id": "sample-a"}},
+        embedding_context=agent.EmbeddingContext(
+            provider="quiltnet", scope="study", slide_ids=["slide-a", "slide-b"]
+        ),
         viewport=agent.ViewportContext(
             slide_width=1000,
             slide_height=800,
@@ -27,6 +30,20 @@ def make_context() -> agent.AgentContext:
             image_transform=[1, 0, 0, 0, 1, 0],
         ),
     )
+
+
+def test_agent_input_preserves_embedding_context():
+    request = agent.ChatRequest(
+        session_id="session-a", message="Summarize this", context=make_context()
+    )
+
+    prompt = json.loads(agent._agent_input(request)[0]["content"][0]["text"])
+
+    assert prompt["current_context"]["embedding_context"] == {
+        "provider": "quiltnet",
+        "scope": "study",
+        "slide_ids": ["slide-a", "slide-b"],
+    }
 
 
 def test_bedrock_region_tool_only_advertises_live_tile_model():
