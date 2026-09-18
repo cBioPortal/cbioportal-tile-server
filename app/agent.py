@@ -25,6 +25,7 @@ from typing import Any, Literal
 import aiosqlite
 import asyncpg
 import boto3
+from botocore.exceptions import ClientError
 try:
     from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_tool
 except ModuleNotFoundError:  # Bedrock deployments do not need the legacy SDK.
@@ -181,6 +182,8 @@ class AgentRunContext:
     context: AgentContext
     proposal_ids: list[str] = field(default_factory=list)
     retrieval_candidates: dict[str, dict[str, Any]] = field(default_factory=dict)
+    retrieval_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    last_tool_error: dict[str, Any] | None = None
 
 
 class AgentCommitResponse(BaseModel):
@@ -250,6 +253,28 @@ async def _init_sqlite(path: str) -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_candidates_session "
             "ON agent_retrieval_candidates(session_id, user_sub, study_id, slide_id)"
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_retrieval_runs (
+                run_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                study_id TEXT NOT NULL,
+                slide_id TEXT NOT NULL,
+                source_fingerprint TEXT,
+                viewer_generation INTEGER,
+                model TEXT NOT NULL,
+                query TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_runs_scope "
+            "ON agent_retrieval_runs(session_id, user_sub, study_id, slide_id, created_at)"
         )
         await db.commit()
 
@@ -576,6 +601,222 @@ async def _load_retrieval_candidates(
         if isinstance(candidate_id, str) and isinstance(payload, dict):
             result[candidate_id] = payload
     return result
+
+
+def _utc_string(offset_seconds: int = 0) -> str:
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset_seconds)
+    )
+
+
+async def _store_retrieval_run(
+    run_context: AgentRunContext,
+    run_id: str,
+    model: str,
+    query: str,
+    regions: list[dict[str, Any]],
+) -> None:
+    payload = {"regions": regions, "normalized_coordinate_space": "0..1000"}
+    created_at = _utc_string()
+    expires_at = _utc_string(24 * 60 * 60)
+    values = (
+        run_id,
+        run_context.session_id,
+        run_context.user_sub,
+        run_context.context.study_id,
+        run_context.context.slide_id,
+        run_context.context.viewport.source_fingerprint,
+        run_context.context.viewport.viewer_generation,
+        model,
+        query,
+        json.dumps(payload, separators=(",", ":")),
+        created_at,
+        expires_at,
+    )
+    if _storage_kind() == "postgres":
+        conn = await asyncpg.connect(_get_db_url())
+        try:
+            await conn.execute(
+                """
+                DELETE FROM agent_retrieval_runs
+                WHERE session_id = $1 AND user_sub = $2
+                  AND expires_at <= timezone('utc', now())
+                """,
+                run_context.session_id,
+                run_context.user_sub,
+            )
+            await conn.execute(
+                """
+                INSERT INTO agent_retrieval_runs
+                    (run_id, session_id, user_sub, study_id, slide_id,
+                     source_fingerprint, viewer_generation, model, query,
+                     payload_json, created_at, expires_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (run_id) DO UPDATE SET payload_json = EXCLUDED.payload_json,
+                    created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at
+                """,
+                *values,
+            )
+            await conn.execute(
+                """
+                DELETE FROM agent_retrieval_runs
+                WHERE session_id = $1 AND user_sub = $2
+                  AND study_id = $3 AND slide_id = $4
+                  AND run_id NOT IN (
+                      SELECT run_id FROM agent_retrieval_runs
+                      WHERE session_id = $1 AND user_sub = $2
+                        AND study_id = $3 AND slide_id = $4
+                      ORDER BY created_at DESC LIMIT 100
+                  )
+                """,
+                run_context.session_id,
+                run_context.user_sub,
+                run_context.context.study_id,
+                run_context.context.slide_id,
+            )
+        finally:
+            await conn.close()
+    else:
+        async with aiosqlite.connect(_get_db_path()) as db:
+            await _apply_sqlite_pragmas(db)
+            await db.execute(
+                "DELETE FROM agent_retrieval_runs WHERE expires_at <= ?",
+                (_utc_string(),),
+            )
+            await db.execute(
+                """
+                INSERT INTO agent_retrieval_runs
+                    (run_id, session_id, user_sub, study_id, slide_id,
+                     source_fingerprint, viewer_generation, model, query,
+                     payload_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET payload_json = excluded.payload_json,
+                    created_at = excluded.created_at, expires_at = excluded.expires_at
+                """,
+                values,
+            )
+            await db.execute(
+                """
+                DELETE FROM agent_retrieval_runs
+                WHERE session_id = ? AND user_sub = ?
+                  AND study_id = ? AND slide_id = ?
+                  AND run_id NOT IN (
+                      SELECT run_id FROM agent_retrieval_runs
+                      WHERE session_id = ? AND user_sub = ?
+                        AND study_id = ? AND slide_id = ?
+                      ORDER BY created_at DESC LIMIT 100
+                  )
+                """,
+                (
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                ),
+            )
+            await db.commit()
+
+
+async def _load_retrieval_runs(
+    run_context: AgentRunContext,
+) -> dict[str, dict[str, Any]]:
+    if _storage_kind() == "postgres":
+        conn = await asyncpg.connect(_get_db_url())
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT run_id, source_fingerprint, viewer_generation, model,
+                       query, payload_json, created_at
+                FROM agent_retrieval_runs
+                WHERE session_id = $1 AND user_sub = $2 AND study_id = $3
+                  AND slide_id = $4 AND expires_at > timezone('utc', now())
+                ORDER BY created_at DESC LIMIT 5
+                """,
+                run_context.session_id,
+                run_context.user_sub,
+                run_context.context.study_id,
+                run_context.context.slide_id,
+            )
+        finally:
+            await conn.close()
+    else:
+        async with aiosqlite.connect(_get_db_path()) as db:
+            await _apply_sqlite_pragmas(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT run_id, source_fingerprint, viewer_generation, model,
+                       query, payload_json, created_at
+                FROM agent_retrieval_runs
+                WHERE session_id = ? AND user_sub = ? AND study_id = ?
+                  AND slide_id = ? AND expires_at > ?
+                ORDER BY created_at DESC LIMIT 5
+                """,
+                (
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                    _utc_string(),
+                ),
+            )
+            rows = await cursor.fetchall()
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        def value(name: str, index: int) -> Any:
+            try:
+                return row[name]
+            except (KeyError, IndexError, TypeError):
+                return row[index]
+
+        run_id = value("run_id", 0)
+        payload = _decode_json(value("payload_json", 5), {})
+        if isinstance(run_id, str) and isinstance(payload, dict):
+            result[run_id] = {
+                "run_id": run_id,
+                "source_fingerprint": value("source_fingerprint", 1),
+                "viewer_generation": value("viewer_generation", 2),
+                "model": value("model", 3),
+                "query": value("query", 4),
+                "created_at": str(value("created_at", 6)),
+                **payload,
+            }
+    return result
+
+
+def _retrieval_prompt_context(
+    retrieval_runs: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for run in retrieval_runs.values():
+        regions = run.get("regions", [])
+        candidates = []
+        if isinstance(regions, list):
+            for region in regions:
+                if not isinstance(region, dict):
+                    continue
+                candidates.append(
+                    {
+                        "rank": region.get("rank"),
+                        "candidate_id": region.get("candidate_id"),
+                        "score": region.get("score"),
+                    }
+                )
+        summaries.append(
+            {
+                "retrieval_run_id": run.get("run_id"),
+                "query": run.get("query"),
+                "model": run.get("model"),
+                "created_at": run.get("created_at"),
+                "candidates": candidates[:10],
+            }
+        )
+    return summaries
 
 
 async def _change_action_status(
@@ -918,6 +1159,9 @@ def _canonicalize_annotation(
         canonical["coordinate_region"] = raw["coordinate_region"]
     if candidate_id:
         canonical["candidate_id"] = candidate_id
+    retrieval_run_id = raw.get("retrieval_run_id")
+    if isinstance(retrieval_run_id, str) and retrieval_run_id:
+        canonical["retrieval_run_id"] = retrieval_run_id
     return canonical
 
 
@@ -1000,6 +1244,8 @@ def _canonical_action_annotations(
                 "source": "agent",
                 "proposal_id": action.id,
                 "candidate_id": draft.get("candidate_id") or provenance.get("candidate_id"),
+                "retrieval_run_id": draft.get("retrieval_run_id")
+                or provenance.get("retrieval_run_id"),
                 "confidence": draft.get("confidence", provenance.get("confidence")),
                 "rationale": payload.get("rationale", ""),
             }
@@ -1221,13 +1467,14 @@ context is insufficient.
 Every state-changing request requires a proposal tool call.  Never claim that
 an annotation, navigation, or filter change has been applied: tools only
 create pending proposals and the user must approve them in the UI.  Annotation
-  coordinates must be tied to the supplied capture.  Prefer
-  coordinate_space=retrieved_candidate with a candidate_id from
-  wsi_find_regions; otherwise use viewport coordinates from 0 through 1000 and
-  include the capture_id.  The server converts proposals to immutable
-  slide-pixel coordinates before preview or approval.  Propose only coarse
-  rectangles or polygons and include a short rationale and confidence.  Do not
-  infer or invent patient facts.
+  coordinates must be tied to the supplied capture.  For retrieval results,
+  use wsi_propose_retrieval_annotations with the retrieval_run_id and ranks
+  supplied in the current context.  Do not invent candidate IDs or copy
+  candidate geometry into individual proposal calls.  Otherwise use viewport
+  coordinates from 0 through 1000 and include the capture_id.  The server
+  converts proposals to immutable slide-pixel coordinates before preview or
+  approval.  Propose only coarse rectangles or polygons and include a short
+  rationale and confidence.  Do not infer or invent patient facts.
 
 For a request to find tissue or morphology, call wsi_find_regions with the
 user's natural-language description.  The retrieval service expands and
@@ -1323,6 +1570,47 @@ def _bedrock_configured() -> bool:
         return False
 
 
+def _provider_error(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, ClientError):
+        code = str(exc.response.get("Error", {}).get("Code", "provider_error"))
+        if code in {"ExpiredToken", "ExpiredTokenException", "UnrecognizedClientException"}:
+            return {
+                "code": "bedrock_credentials_expired",
+                "message": "Assistant credentials expired; refresh the dev SAML session.",
+                "retryable": True,
+            }
+        return {
+            "code": "bedrock_provider_error",
+            "message": "The Bedrock assistant could not complete this request.",
+            "retryable": False,
+        }
+    if isinstance(exc, ValueError):
+        return {
+            "code": "invalid_tool_request",
+            "message": str(exc),
+            "retryable": True,
+        }
+    return {
+        "code": "agent_tool_error",
+        "message": "The assistant tool could not complete this request.",
+        "retryable": True,
+    }
+
+
+async def _bedrock_converse(**kwargs: Any) -> dict[str, Any]:
+    client = _bedrock_client()
+    for attempt in range(2):
+        try:
+            return await asyncio.to_thread(client.converse, **kwargs)
+        except ClientError as exc:
+            error = _provider_error(exc)
+            if error["code"] != "bedrock_credentials_expired" or attempt:
+                raise
+            logger.warning("Bedrock credentials expired; reloading the provider session")
+            client = _bedrock_client()
+    raise RuntimeError("Bedrock request did not return a response")
+
+
 def _bedrock_tools() -> list[dict[str, Any]]:
     point = {
         "type": "object",
@@ -1344,6 +1632,21 @@ def _bedrock_tools() -> list[dict[str, Any]]:
                     "model": {"type": "string", "enum": ["quiltnet_pmb"]},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
                 }, "required": ["query", "model"]}},
+            }
+        },
+        {
+            "toolSpec": {
+                "name": "wsi_propose_retrieval_annotations",
+                "description": "Create one atomic, reversible annotation proposal batch from ranked candidates in a server-owned retrieval run. Use this for QuiltNet results; the server resolves candidate coordinates.",
+                "inputSchema": {"json": {"type": "object", "properties": {
+                    "retrieval_run_id": {"type": "string"},
+                    "ranks": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 50},
+                    "label": {"type": "string"},
+                    "layer_name": {"type": "string"},
+                    "color": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "rationale": {"type": "string"},
+                }, "required": ["retrieval_run_id", "ranks", "label", "layer_name", "color", "confidence", "rationale"]}},
             }
         },
         {
@@ -1459,18 +1762,108 @@ async def _bedrock_tool(
             run_context.context.viewport.slide_height,
             query_plan,
         )
-        for region in result.get("regions", []):
+        retrieval_run_id = str(uuid.uuid4())
+        regions = [
+            {
+                **region,
+                "retrieval_run_id": retrieval_run_id,
+            }
+            for region in result.get("regions", [])
+            if isinstance(region, dict)
+        ]
+        result = {
+            **result,
+            "regions": regions,
+            "retrieval_run_id": retrieval_run_id,
+        }
+        for region in regions:
             if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
                 run_context.retrieval_candidates[region["candidate_id"]] = region
         await _store_retrieval_candidates(
             run_context,
-            [
-                region
-                for region in result.get("regions", [])
-                if isinstance(region, dict)
-            ],
+            regions,
+        )
+        run_context.retrieval_runs[retrieval_run_id] = {
+            "run_id": retrieval_run_id,
+            "source_fingerprint": run_context.context.viewport.source_fingerprint,
+            "viewer_generation": run_context.context.viewport.viewer_generation,
+            "model": "quiltnet_pmb",
+            "query": str(arguments.get("query", "")),
+            "regions": regions,
+        }
+        await _store_retrieval_run(
+            run_context,
+            retrieval_run_id,
+            "quiltnet_pmb",
+            str(arguments.get("query", "")),
+            regions,
         )
         return {**result, "normalized_coordinate_space": "0..1000"}
+    if name == "wsi_propose_retrieval_annotations":
+        retrieval_run_id = arguments.get("retrieval_run_id")
+        if not isinstance(retrieval_run_id, str) or not retrieval_run_id:
+            raise ValueError("A retrieval_run_id is required")
+        retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
+        if retrieval_run is None:
+            run_context.retrieval_runs = await _load_retrieval_runs(run_context)
+            retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
+        if retrieval_run is None:
+            raise ValueError("The retrieval run is expired or unavailable; run a fresh search")
+        source_fingerprint = retrieval_run.get("source_fingerprint")
+        current_fingerprint = run_context.context.viewport.source_fingerprint
+        if source_fingerprint and source_fingerprint != current_fingerprint:
+            raise ValueError("The retrieval run belongs to a changed slide source; run a fresh search")
+        ranks = arguments.get("ranks")
+        if (
+            not isinstance(ranks, list)
+            or not 1 <= len(ranks) <= 50
+            or any(not isinstance(rank, int) or isinstance(rank, bool) or rank < 1 for rank in ranks)
+            or len(set(ranks)) != len(ranks)
+        ):
+            raise ValueError("ranks must contain 1-50 unique positive integers")
+        regions_by_rank = {
+            region.get("rank"): region
+            for region in retrieval_run.get("regions", [])
+            if isinstance(region, dict) and isinstance(region.get("rank"), int)
+        }
+        selected = []
+        for rank in ranks:
+            region = regions_by_rank.get(rank)
+            if region is None:
+                raise ValueError(f"Retrieval rank {rank} is unavailable; run a fresh search")
+            candidate_id = region.get("candidate_id")
+            if not isinstance(candidate_id, str) or not isinstance(region.get("points"), list):
+                raise ValueError("The retrieval run contains an invalid candidate")
+            run_context.retrieval_candidates[candidate_id] = region
+            selected.append(
+                _canonicalize_annotation(
+                    {
+                        "geometry_type": "rectangle",
+                        "points": region["points"],
+                        "coordinate_space": "retrieved_candidate",
+                        "candidate_id": candidate_id,
+                        "retrieval_run_id": retrieval_run_id,
+                        "label": arguments["label"],
+                        "layer_name": arguments["layer_name"],
+                        "color": arguments["color"],
+                        "confidence": arguments["confidence"],
+                    },
+                    run_context,
+                )
+            )
+        payload = {
+            "annotations": selected,
+            "retrieval_run_id": retrieval_run_id,
+            "rationale": _safe_rationale(str(arguments["rationale"])),
+            "context": _context_snapshot(run_context.context),
+        }
+        action = await _insert_action(run_context, "annotation_batch", payload)
+        return {
+            "proposal_id": action.id,
+            "status": action.status,
+            "retrieval_run_id": retrieval_run_id,
+            "ranks": ranks,
+        }
     if name == "wsi_find_similar_slides":
         manifest = await _load_manifest()
         row = next(
@@ -1526,8 +1919,13 @@ async def _bedrock_tool(
     raise ValueError(f"Unknown Bedrock tool: {name}")
 
 
-def _bedrock_user_content(request: ChatRequest) -> list[dict[str, Any]]:
+def _bedrock_user_content(
+    request: ChatRequest,
+    retrieval_runs: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     context = request.context.model_dump(exclude={"viewport": {"image_data_url"}})
+    if retrieval_runs:
+        context["retrieval_runs"] = _retrieval_prompt_context(retrieval_runs)
     prompt = json.dumps(
         {
             "current_context": context,
@@ -1551,11 +1949,16 @@ async def _stream_bedrock(request: ChatRequest, user_sub: str):
         context=request.context,
     )
     run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
-    messages: list[dict[str, Any]] = [{"role": "user", "content": _bedrock_user_content(request)}]
-    client = _bedrock_client()
+    run_context.retrieval_runs = await _load_retrieval_runs(run_context)
+    for retrieval_run in run_context.retrieval_runs.values():
+        for region in retrieval_run.get("regions", []):
+            if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
+                run_context.retrieval_candidates[region["candidate_id"]] = region
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": _bedrock_user_content(request, run_context.retrieval_runs)}
+    ]
     for _ in range(6):
-        response = await asyncio.to_thread(
-            client.converse,
+        response = await _bedrock_converse(
             modelId=settings.agent_model,
             system=[{"text": _agent_instructions()}],
             messages=messages,
@@ -1578,21 +1981,31 @@ async def _stream_bedrock(request: ChatRequest, user_sub: str):
             try:
                 result = await _bedrock_tool(name, tool_use.get("input", {}), run_context)
                 result_content = {"json": result}
+                run_context.last_tool_error = None
             except Exception as exc:
+                error = _provider_error(exc)
+                run_context.last_tool_error = error
                 logger.warning(
                     "Bedrock WSI tool failed (%s): %s: %s",
                     name,
                     type(exc).__name__,
                     str(exc),
                 )
-                result_content = {"json": {"error": "Tool unavailable for this request"}}
+                yield _sse("tool.error", {"name": name, **error})
+                result_content = {"json": {"error": error}}
             results.append({"toolResult": {"toolUseId": tool_use.get("toolUseId"), "content": [result_content]}})
         messages.append({"role": "user", "content": results})
     for proposal_id in run_context.proposal_ids:
         proposal = await _get_action(proposal_id, user_sub)
         if proposal:
             yield _sse("proposal", proposal.model_dump())
-    yield _sse("complete", {"proposal_ids": run_context.proposal_ids})
+    completion: dict[str, Any] = {
+        "proposal_ids": run_context.proposal_ids,
+        "success": run_context.last_tool_error is None,
+    }
+    if run_context.last_tool_error:
+        completion["error"] = run_context.last_tool_error
+    yield _sse("complete", completion)
 
 
 def _sse(event: str, payload: Any) -> str:
@@ -1609,12 +2022,9 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
                 yield chunk
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception("Bedrock WSI agent run failed")
-            yield _sse(
-                "error",
-                {"message": "The research assistant could not complete this request."},
-            )
+            yield _sse("error", _provider_error(exc))
         return
     run_context = AgentRunContext(
         user_sub=user_sub,

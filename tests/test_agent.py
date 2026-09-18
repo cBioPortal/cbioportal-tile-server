@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import HTTPException
 
 from app import agent
@@ -103,6 +104,7 @@ async def test_retrieval_candidates_survive_the_next_chat_turn(agent_db, monkeyp
                     "candidate_id": "necrosis-candidate-1",
                     "points": [{"x": 100, "y": 200}, {"x": 300, "y": 400}],
                     "score": 0.41,
+                    "rank": 1,
                 }
             ],
             "retrieval_mode": "semantic",
@@ -119,21 +121,22 @@ async def test_retrieval_candidates_survive_the_next_chat_turn(agent_db, monkeyp
         {"query": "necrotic tissue", "model": "quiltnet_pmb", "top_k": 1},
         first_run,
     )
+    retrieval_run_id = result["retrieval_run_id"]
     assert result["regions"][0]["candidate_id"] in first_run.retrieval_candidates
 
     second_run = agent.AgentRunContext(
         user_sub="user-a", session_id="session-retrieval", context=make_context()
     )
     second_run.retrieval_candidates = await agent._load_retrieval_candidates(second_run)
+    second_run.retrieval_runs = await agent._load_retrieval_runs(second_run)
     assert "necrosis-candidate-1" in second_run.retrieval_candidates
+    assert retrieval_run_id in second_run.retrieval_runs
 
     proposal = await agent._bedrock_tool(
-        "wsi_propose_annotations",
+        "wsi_propose_retrieval_annotations",
         {
-            "geometry_type": "rectangle",
-            "points": [{"x": 0, "y": 0}, {"x": 1, "y": 1}],
-            "coordinate_space": "retrieved_candidate",
-            "candidate_id": "necrosis-candidate-1",
+            "retrieval_run_id": retrieval_run_id,
+            "ranks": [1],
             "label": "Necrotic tissue",
             "layer_name": "AI research",
             "color": "#ef4444",
@@ -144,10 +147,37 @@ async def test_retrieval_candidates_survive_the_next_chat_turn(agent_db, monkeyp
     )
     action = await agent._get_action(proposal["proposal_id"], "user-a")
     assert action is not None
-    assert action.payload["points"] == [
+    assert action.payload["annotations"][0]["points"] == [
         {"x": 100.0, "y": 160.0},
         {"x": 300.0, "y": 320.0},
     ]
+
+
+@pytest.mark.asyncio
+async def test_bedrock_reloads_client_once_after_expired_credentials(monkeypatch):
+    class ExpiringClient:
+        def __init__(self, expires=False):
+            self.calls = 0
+            self.expires = expires
+
+        def converse(self, **kwargs):
+            self.calls += 1
+            if self.expires and self.calls == 1:
+                raise ClientError(
+                    {"Error": {"Code": "ExpiredTokenException"}}, "Converse"
+                )
+            return {"output": {"message": {"content": []}}}
+
+    clients = [ExpiringClient(expires=True), ExpiringClient()]
+
+    def fake_client():
+        return clients.pop(0)
+
+    monkeypatch.setattr(agent, "_bedrock_client", fake_client)
+    response = await agent._bedrock_converse(modelId="test-model")
+
+    assert response["output"]["message"]["content"] == []
+    assert clients == []
 
 
 @pytest.fixture

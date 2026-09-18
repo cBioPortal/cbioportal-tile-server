@@ -142,25 +142,50 @@ async def migrate_agent(conn: asyncpg.Connection) -> None:
         )
         await _mark_migration(conn, "agent_actions")
 
-    if await _migration_complete(conn, "agent_retrieval_candidates"):
+    if not await _migration_complete(conn, "agent_retrieval_candidates"):
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_retrieval_candidates (
+                session_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                study_id TEXT NOT NULL,
+                slide_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
+                PRIMARY KEY (session_id, user_sub, study_id, slide_id, candidate_id)
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_candidates_session "
+            "ON agent_retrieval_candidates(session_id, user_sub, study_id, slide_id)"
+        )
+        await _mark_migration(conn, "agent_retrieval_candidates")
+
+    if await _migration_complete(conn, "agent_retrieval_runs"):
         return
 
     await conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS agent_retrieval_candidates (
+        CREATE TABLE IF NOT EXISTS agent_retrieval_runs (
+            run_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
             user_sub TEXT NOT NULL,
             study_id TEXT NOT NULL,
             slide_id TEXT NOT NULL,
-            candidate_id TEXT NOT NULL,
+            source_fingerprint TEXT,
+            viewer_generation INTEGER,
+            model TEXT NOT NULL,
+            query TEXT NOT NULL,
             payload_json TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
-            PRIMARY KEY (session_id, user_sub, study_id, slide_id, candidate_id)
+            expires_at TIMESTAMPTZ NOT NULL
         )
         """
     )
     await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_candidates_session "
-        "ON agent_retrieval_candidates(session_id, user_sub, study_id, slide_id)"
+        "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_runs_scope "
+        "ON agent_retrieval_runs(session_id, user_sub, study_id, slide_id, created_at)"
     )
-    await _mark_migration(conn, "agent_retrieval_candidates")
+    await _mark_migration(conn, "agent_retrieval_runs")
