@@ -91,6 +91,65 @@ async def test_bedrock_similar_slides_does_not_relabel_another_model(monkeypatch
     assert result == {"model": "reef_v2_optimus", "slides": []}
 
 
+@pytest.mark.asyncio
+async def test_retrieval_candidates_survive_the_next_chat_turn(agent_db, monkeypatch):
+    async def fake_manifest():
+        return {"slides": []}
+
+    async def fake_search(*args, **kwargs):
+        return {
+            "regions": [
+                {
+                    "candidate_id": "necrosis-candidate-1",
+                    "points": [{"x": 100, "y": 200}, {"x": 300, "y": 400}],
+                    "score": 0.41,
+                }
+            ],
+            "retrieval_mode": "semantic",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(agent, "_load_manifest", fake_manifest)
+    monkeypatch.setattr(agent, "search_regions_for_agent", fake_search)
+    first_run = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-retrieval", context=make_context()
+    )
+    result = await agent._bedrock_tool(
+        "wsi_find_regions",
+        {"query": "necrotic tissue", "model": "quiltnet_pmb", "top_k": 1},
+        first_run,
+    )
+    assert result["regions"][0]["candidate_id"] in first_run.retrieval_candidates
+
+    second_run = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-retrieval", context=make_context()
+    )
+    second_run.retrieval_candidates = await agent._load_retrieval_candidates(second_run)
+    assert "necrosis-candidate-1" in second_run.retrieval_candidates
+
+    proposal = await agent._bedrock_tool(
+        "wsi_propose_annotations",
+        {
+            "geometry_type": "rectangle",
+            "points": [{"x": 0, "y": 0}, {"x": 1, "y": 1}],
+            "coordinate_space": "retrieved_candidate",
+            "candidate_id": "necrosis-candidate-1",
+            "label": "Necrotic tissue",
+            "layer_name": "AI research",
+            "color": "#ef4444",
+            "confidence": 0.7,
+            "rationale": "Retrieved candidate for review.",
+        },
+        second_run,
+    )
+    action = await agent._get_action(proposal["proposal_id"], "user-a")
+    assert action is not None
+    assert action.payload["points"] == [
+        {"x": 100.0, "y": 160.0},
+        {"x": 300.0, "y": 320.0},
+    ]
+
+
 @pytest.fixture
 async def agent_db(tmp_path, monkeypatch):
     db_path = tmp_path / "agent.db"

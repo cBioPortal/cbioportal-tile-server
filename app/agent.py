@@ -233,6 +233,24 @@ async def _init_sqlite(path: str) -> None:
             "CREATE INDEX IF NOT EXISTS idx_agent_actions_session "
             "ON agent_actions(session_id, user_sub)"
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_retrieval_candidates (
+                session_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                study_id TEXT NOT NULL,
+                slide_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (session_id, user_sub, study_id, slide_id, candidate_id)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_candidates_session "
+            "ON agent_retrieval_candidates(session_id, user_sub, study_id, slide_id)"
+        )
         await db.commit()
 
 
@@ -397,6 +415,167 @@ async def _list_actions(
             )
             rows = await cursor.fetchall()
     return [_row_to_action(row) for row in rows]
+
+
+async def _store_retrieval_candidates(
+    run_context: AgentRunContext,
+    regions: list[dict[str, Any]],
+) -> None:
+    candidates = [
+        region
+        for region in regions
+        if isinstance(region, dict)
+        and isinstance(region.get("candidate_id"), str)
+        and region["candidate_id"]
+        and isinstance(region.get("points"), list)
+    ]
+    if not candidates:
+        return
+
+    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    values = [
+        (
+            run_context.session_id,
+            run_context.user_sub,
+            run_context.context.study_id,
+            run_context.context.slide_id,
+            region["candidate_id"],
+            json.dumps(region, separators=(",", ":")),
+            created_at,
+        )
+        for region in candidates
+    ]
+    if _storage_kind() == "postgres":
+        conn = await asyncpg.connect(_get_db_url())
+        try:
+            await conn.executemany(
+                """
+                INSERT INTO agent_retrieval_candidates
+                    (session_id, user_sub, study_id, slide_id, candidate_id,
+                     payload_json, created_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (session_id, user_sub, study_id, slide_id, candidate_id)
+                DO UPDATE SET payload_json = EXCLUDED.payload_json,
+                              created_at = EXCLUDED.created_at
+                """,
+                values,
+            )
+            await conn.execute(
+                """
+                DELETE FROM agent_retrieval_candidates
+                WHERE session_id = $1 AND user_sub = $2
+                  AND study_id = $3 AND slide_id = $4
+                  AND candidate_id NOT IN (
+                      SELECT candidate_id
+                      FROM agent_retrieval_candidates
+                      WHERE session_id = $1 AND user_sub = $2
+                        AND study_id = $3 AND slide_id = $4
+                      ORDER BY created_at DESC
+                      LIMIT 100
+                  )
+                """,
+                run_context.session_id,
+                run_context.user_sub,
+                run_context.context.study_id,
+                run_context.context.slide_id,
+            )
+        finally:
+            await conn.close()
+    else:
+        async with aiosqlite.connect(_get_db_path()) as db:
+            await _apply_sqlite_pragmas(db)
+            await db.executemany(
+                """
+                INSERT INTO agent_retrieval_candidates
+                    (session_id, user_sub, study_id, slide_id, candidate_id,
+                     payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, user_sub, study_id, slide_id, candidate_id)
+                DO UPDATE SET payload_json = excluded.payload_json,
+                              created_at = excluded.created_at
+                """,
+                values,
+            )
+            await db.execute(
+                """
+                DELETE FROM agent_retrieval_candidates
+                WHERE session_id = ? AND user_sub = ?
+                  AND study_id = ? AND slide_id = ?
+                  AND candidate_id NOT IN (
+                      SELECT candidate_id
+                      FROM agent_retrieval_candidates
+                      WHERE session_id = ? AND user_sub = ?
+                        AND study_id = ? AND slide_id = ?
+                      ORDER BY created_at DESC
+                      LIMIT 100
+                  )
+                """,
+                (
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                ),
+            )
+            await db.commit()
+
+
+async def _load_retrieval_candidates(
+    run_context: AgentRunContext,
+) -> dict[str, dict[str, Any]]:
+    if _storage_kind() == "postgres":
+        conn = await asyncpg.connect(_get_db_url())
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT candidate_id, payload_json
+                FROM agent_retrieval_candidates
+                WHERE session_id = $1 AND user_sub = $2
+                  AND study_id = $3 AND slide_id = $4
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                run_context.session_id,
+                run_context.user_sub,
+                run_context.context.study_id,
+                run_context.context.slide_id,
+            )
+        finally:
+            await conn.close()
+    else:
+        async with aiosqlite.connect(_get_db_path()) as db:
+            await _apply_sqlite_pragmas(db)
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT candidate_id, payload_json
+                FROM agent_retrieval_candidates
+                WHERE session_id = ? AND user_sub = ?
+                  AND study_id = ? AND slide_id = ?
+                ORDER BY created_at DESC
+                LIMIT 100
+                """,
+                (
+                    run_context.session_id,
+                    run_context.user_sub,
+                    run_context.context.study_id,
+                    run_context.context.slide_id,
+                ),
+            )
+            rows = await cursor.fetchall()
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        candidate_id = row["candidate_id"] if isinstance(row, dict) else row[0]
+        payload_json = row["payload_json"] if isinstance(row, dict) else row[1]
+        payload = _decode_json(payload_json)
+        if isinstance(candidate_id, str) and isinstance(payload, dict):
+            result[candidate_id] = payload
+    return result
 
 
 async def _change_action_status(
@@ -1283,6 +1462,14 @@ async def _bedrock_tool(
         for region in result.get("regions", []):
             if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
                 run_context.retrieval_candidates[region["candidate_id"]] = region
+        await _store_retrieval_candidates(
+            run_context,
+            [
+                region
+                for region in result.get("regions", [])
+                if isinstance(region, dict)
+            ],
+        )
         return {**result, "normalized_coordinate_space": "0..1000"}
     if name == "wsi_find_similar_slides":
         manifest = await _load_manifest()
@@ -1358,7 +1545,12 @@ def _bedrock_user_content(request: ChatRequest) -> list[dict[str, Any]]:
 
 
 async def _stream_bedrock(request: ChatRequest, user_sub: str):
-    run_context = AgentRunContext(user_sub=user_sub, session_id=request.session_id, context=request.context)
+    run_context = AgentRunContext(
+        user_sub=user_sub,
+        session_id=request.session_id,
+        context=request.context,
+    )
+    run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
     messages: list[dict[str, Any]] = [{"role": "user", "content": _bedrock_user_content(request)}]
     client = _bedrock_client()
     for _ in range(6):
@@ -1429,6 +1621,10 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
         session_id=request.session_id,
         context=request.context,
     )
+    try:
+        run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
+    except Exception:
+        logger.exception("Failed to load persisted WSI retrieval candidates")
     try:
         result = Runner.run_streamed(
             _build_agent(),
