@@ -214,6 +214,24 @@ async def test_pending_proposal_requires_single_approval(agent_db):
 
 
 @pytest.mark.asyncio
+async def test_repeated_request_id_deduplicates_identical_proposals(agent_db):
+    context = make_context()
+    first = agent.AgentRunContext(
+        "user-a", "session-retry", context, request_id="request-1"
+    )
+    second = agent.AgentRunContext(
+        "user-a", "session-retry", context, request_id="request-1"
+    )
+    payload = {"action": "zoom", "parameters": {"zoom": 2}}
+
+    first_action = await agent._insert_action(first, "viewer_action", payload)
+    second_action = await agent._insert_action(second, "viewer_action", payload)
+
+    assert second_action.id == first_action.id
+    assert len(await agent._list_actions("session-retry", "user-a", "study-a")) == 1
+
+
+@pytest.mark.asyncio
 async def test_rejected_proposal_cannot_be_applied(agent_db):
     run_context = agent.AgentRunContext(
         user_sub="user-a", session_id="session-a", context=make_context()

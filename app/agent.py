@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import math
@@ -138,6 +139,9 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str = Field(pattern=r"^[A-Za-z0-9_.:-]{1,128}$")
+    request_id: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9_.:-]{1,128}$"
+    )
     message: str = Field(min_length=1, max_length=4000)
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
     context: AgentContext
@@ -180,6 +184,7 @@ class AgentRunContext:
     user_sub: str
     session_id: str
     context: AgentContext
+    request_id: str | None = None
     proposal_ids: list[str] = field(default_factory=list)
     retrieval_candidates: dict[str, dict[str, Any]] = field(default_factory=dict)
     retrieval_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -331,6 +336,27 @@ async def _insert_action(
 ) -> AgentAction:
     action_id = str(uuid.uuid4())
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    payload = dict(payload)
+    logical_payload_json = json.dumps(
+        payload, separators=(",", ":"), sort_keys=True
+    )
+    request_fingerprint = hashlib.sha256(logical_payload_json.encode()).hexdigest()
+    if run_context.request_id:
+        existing = await _find_existing_action(
+            run_context,
+            action_type,
+            run_context.request_id,
+            request_fingerprint,
+        )
+        if existing:
+            run_context.proposal_ids.append(existing.id)
+            return existing
+        payload.update(
+            {
+                "_request_id": run_context.request_id,
+                "_request_fingerprint": request_fingerprint,
+            }
+        )
     payload_json = json.dumps(payload, separators=(",", ":"))
     if _storage_kind() == "postgres":
         async with connection(_get_db_url()) as conn:
@@ -440,6 +466,27 @@ async def _list_actions(
             )
             rows = await cursor.fetchall()
     return [_row_to_action(row) for row in rows]
+
+
+async def _find_existing_action(
+    run_context: AgentRunContext,
+    action_type: str,
+    request_id: str,
+    request_fingerprint: str,
+) -> AgentAction | None:
+    actions = await _list_actions(
+        run_context.session_id,
+        run_context.user_sub,
+        run_context.context.study_id,
+    )
+    for action in actions:
+        if (
+            action.action_type == action_type
+            and action.payload.get("_request_id") == request_id
+            and action.payload.get("_request_fingerprint") == request_fingerprint
+        ):
+            return action
+    return None
 
 
 async def _store_retrieval_candidates(
@@ -1947,6 +1994,7 @@ async def _stream_bedrock(request: ChatRequest, user_sub: str):
         user_sub=user_sub,
         session_id=request.session_id,
         context=request.context,
+        request_id=request.request_id,
     )
     run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
     run_context.retrieval_runs = await _load_retrieval_runs(run_context)
@@ -2030,6 +2078,7 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
         user_sub=user_sub,
         session_id=request.session_id,
         context=request.context,
+        request_id=request.request_id,
     )
     try:
         run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
