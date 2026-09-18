@@ -16,6 +16,13 @@ def row(image_id, sample_id, match_level):
         "is_hne": False,
         "is_ihc": False,
         "can_serve_tiles": False,
+        "timeline_start_days": None,
+        "timeline_date_status": "MISSING_PROCEDURE_DATE",
+        "timeline_date_kind": "UNDATED",
+        "timeline_date_source": "NO_VERIFIED_PROCEDURE_DATE",
+        "timeline_date_reason": "MISSING_PROCEDURE_DATE",
+        "timeline_coordinate_system": "patient_first_tumor_sequencing_day_zero",
+        "timepoint_source": "MISSING_PROCEDURE_DATE",
     }
 
 

@@ -61,10 +61,11 @@ SOURCE_COLUMNS = (
     "barcode",
     "slide_type",
     # Retained only in the dev canonical table so the timeline exporter can
-    # materialize diagnosis-relative START_DATE. These are not WSI study-file
+    # materialize portal-coordinate START_DATE. These are not WSI study-file
     # columns and are never sent to cBioPortal's WSI importer.
     "timeline_start_days",
     "timeline_date_status",
+    "timeline_coordinate_system",
     "can_serve_tiles",
     "source_url",
     "tile_metadata_json",
@@ -142,8 +143,9 @@ def _source_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
             "file_size_bytes": row.get("file_size_bytes"),
             "barcode": row.get("barcode"),
             "slide_type": row.get("slide_type"),
-            "timeline_start_days": row.get("timeline_start_days", row.get("procedure_date_days")),
-            "timeline_date_status": row.get("timeline_date_status", "AVAILABLE" if row.get("procedure_date_days") is not None else None),
+            "timeline_start_days": row.get("timeline_start_days"),
+            "timeline_date_status": row.get("timeline_date_status"),
+            "timeline_coordinate_system": row.get("timeline_coordinate_system"),
             "can_serve_tiles": row.get("can_serve_tiles"),
             "source_url": row.get("slide_path"),
             "tile_metadata_json": row.get("tile_metadata_json"),
@@ -278,7 +280,7 @@ part_description STRING, subspecialty STRING, path_dx_title STRING, block_key ST
 block_number STRING, block_label STRING, match_level STRING, specimen_key STRING,
 stain_name STRING, stain_group STRING, is_hne BOOLEAN, is_ihc BOOLEAN, magnification STRING,
 file_size_bytes BIGINT, barcode STRING, slide_type STRING, timeline_start_days INT,
-timeline_date_status STRING, can_serve_tiles BOOLEAN, source_url STRING, tile_metadata_json STRING,
+timeline_date_status STRING, timeline_coordinate_system STRING, can_serve_tiles BOOLEAN, source_url STRING, tile_metadata_json STRING,
 thumbnail_url STRING, thumbnail_width INT, thumbnail_height INT, thumbnail_content_type STRING
 ) USING DELTA""",
         warehouse_id,
@@ -445,7 +447,7 @@ WITH source_rows AS (
       WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key LIKE '%fish%' THEN 'Other'
       WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(he|hematoxylin|eosin|hematoxylinandeosin|recut.*he)$' THEN 'H&E (Other)'
       WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)' THEN 'IHC'
-      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN 'Other'
+      WHEN (stain_group_clean IS NULL OR stain_group_key IN ('nan', 'null', 'na', 'unknown')) AND stain_name_key RLIKE '^(impact|molecular|rna|dna|blood|normaltissue|tumor|frozensection|slidesubmitted)' THEN NULL
       ELSE stain_group_clean
     END AS stain_group_canonical,
     CASE
@@ -477,16 +479,26 @@ WITH source_rows AS (
       OR ((stain_group_clean IS NULL OR stain_group_key IN ('', 'nan', 'null', 'na', 'unknown'))
           AND stain_name_key NOT LIKE '%fish%'
           AND stain_name_key RLIKE '^(ihc|immuno|her2|pdl1|er|pr|ki67|ck[0-9]+|cd[0-9]+|gata3|androgenreceptor|yap1|egfr|idh1|chromogranin|iga|histone|keratin|kappalightchain)')
-    ) AS metadata_is_ihc
+    ) AS metadata_is_ihc,
+    (stain_name_key LIKE '%fish%' OR stain_group_key LIKE '%fish%' OR stain_group_key = 'other') AS metadata_is_known_other
   FROM canonical_stains
 )
-SELECT 'canonical_slide_associations_v5' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
+SELECT 'canonical_slide_associations_v7' AS association_version, CURRENT_TIMESTAMP() AS updated_at,
   s.match_level, s.patient_id, s.normalized_sample_id AS sample_id,
   NULLIF(s.reference_sample_id, '') AS reference_sample_id,
   s.part_key, s.part_number, s.part_designator, s.part_type, s.part_description,
   s.subspecialty, s.path_dx_title, s.block_key, s.block_number, s.block_label,
-  s.image_id, s.stain_name_canonical AS stain_name, s.stain_group_canonical AS stain_group,
-  s.stain_name_canonical, s.stain_group_canonical,
+  s.image_id,
+  CASE WHEN s.metadata_is_hne THEN 'H&E' WHEN s.metadata_is_ihc THEN 'IHC'
+       WHEN s.metadata_is_known_other AND (s.stain_name_key LIKE '%fish%' OR s.stain_group_key LIKE '%fish%') THEN 'FISH'
+       WHEN s.metadata_is_known_other THEN 'Other' ELSE 'Unknown' END AS stain_name,
+  CASE WHEN s.metadata_is_hne THEN 'H&E' WHEN s.metadata_is_ihc THEN 'IHC'
+       WHEN s.metadata_is_known_other THEN 'Other' ELSE 'Unknown' END AS stain_group,
+  CASE WHEN s.metadata_is_hne THEN 'H&E' WHEN s.metadata_is_ihc THEN 'IHC'
+       WHEN s.metadata_is_known_other AND (s.stain_name_key LIKE '%fish%' OR s.stain_group_key LIKE '%fish%') THEN 'FISH'
+       WHEN s.metadata_is_known_other THEN 'Other' ELSE 'Unknown' END AS stain_name_canonical,
+  CASE WHEN s.metadata_is_hne THEN 'H&E' WHEN s.metadata_is_ihc THEN 'IHC'
+       WHEN s.metadata_is_known_other THEN 'Other' ELSE 'Unknown' END AS stain_group_canonical,
   s.stain_name AS stain_name_raw, s.stain_group AS stain_group_raw,
   s.metadata_is_hne AS is_hne, s.metadata_is_ihc AS is_ihc, s.magnification,
   s.file_size_bytes,
@@ -494,7 +506,11 @@ SELECT 'canonical_slide_associations_v5' AS association_version, CURRENT_TIMESTA
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> ''
     AND r.width > 0 AND r.height > 0 AND r.content_type IS NOT NULL
     AND TRIM(r.content_type) <> '' THEN TRUE ELSE FALSE END AS can_serve_tiles,
-  s.barcode, s.slide_type, s.specimen_key, s.timeline_start_days, s.timeline_date_status,
+  s.barcode,
+  CASE WHEN s.metadata_is_hne THEN 'H&E' WHEN s.metadata_is_ihc THEN 'IHC'
+       WHEN s.metadata_is_known_other THEN 'Other' ELSE 'Unknown' END AS slide_type,
+  s.specimen_key, s.timeline_start_days, s.timeline_date_status,
+  s.timeline_coordinate_system,
   s.source_url AS slide_path,
   CASE WHEN s.source_url LIKE 's3://%' AND r.artifact_uri IS NOT NULL
     AND r.tile_metadata_json IS NOT NULL AND TRIM(r.tile_metadata_json) <> '' THEN r.tile_metadata_json END AS tile_metadata_json,
@@ -510,12 +526,12 @@ LEFT JOIN ranked_registry r ON r.image_id = s.image_id AND r.rn = 1 AND r.source
         f"""CREATE TABLE {summary} USING DELTA AS
 SELECT sample_id, patient_id, MAX(association_version) AS association_version,
  MAX(updated_at) AS updated_at,
- COUNT(DISTINCT CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN image_id END) AS servable_slide_count,
+ COUNT(DISTINCT CASE WHEN can_serve_tiles THEN image_id END) AS servable_slide_count,
  COUNT(DISTINCT CASE WHEN NOT can_serve_tiles AND is_hne THEN image_id END) AS non_servable_hne_slide_count,
  COUNT(DISTINCT CASE WHEN NOT can_serve_tiles AND is_ihc THEN image_id END) AS non_servable_ihc_slide_count,
  MAX(CASE WHEN can_serve_tiles AND is_hne THEN 1 ELSE 0 END) AS has_hne,
  MAX(CASE WHEN can_serve_tiles AND is_ihc THEN 1 ELSE 0 END) AS has_ihc,
- ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles AND (is_hne OR is_ihc) THEN COALESCE(slide_type, stain_name) END)), ';') AS stain_types
+ ARRAY_JOIN(ARRAY_SORT(COLLECT_SET(CASE WHEN can_serve_tiles THEN COALESCE(slide_type, stain_name) END)), ';') AS stain_types
 FROM {canonical} WHERE sample_id IS NOT NULL GROUP BY sample_id, patient_id""",
         warehouse_id,
     )

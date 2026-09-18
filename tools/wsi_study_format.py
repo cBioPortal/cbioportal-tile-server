@@ -20,7 +20,7 @@ except ModuleNotFoundError:  # Direct execution from the tools directory.
     ALLOWED_TILE_METADATA_KEYS = set()
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 META_FILENAME = "meta_wsi.txt"
 DATA_FILENAME = "data_wsi.txt"
 GENETIC_ALTERATION_TYPE = "PATHOLOGY_SLIDES"
@@ -68,6 +68,13 @@ COLUMNS = (
     Column("THUMBNAIL_WIDTH", "Thumbnail Width", "Intrinsic thumbnail width in pixels.", "NUMBER", "thumbnail_width"),
     Column("THUMBNAIL_HEIGHT", "Thumbnail Height", "Intrinsic thumbnail height in pixels.", "NUMBER", "thumbnail_height"),
     Column("THUMBNAIL_CONTENT_TYPE", "Thumbnail Content Type", "Thumbnail media type, normally image/jpeg.", "STRING", "thumbnail_content_type"),
+    Column("TIMELINE_START_DAYS", "Timeline Start Days", "Relative offset from first tumor sequencing; empty when undated.", "NUMBER", "timeline_start_days"),
+    Column("TIMELINE_DATE_STATUS", "Timeline Date Status", "Whether the relative timing is available or why it is missing.", "STRING", "timeline_date_status"),
+    Column("TIMELINE_DATE_KIND", "Timeline Date Kind", "Recorded, estimated, or undated timing classification.", "STRING", "timeline_date_kind"),
+    Column("TIMELINE_DATE_SOURCE", "Timeline Date Source", "Timing provenance source.", "STRING", "timeline_date_source"),
+    Column("TIMELINE_DATE_REASON", "Timeline Date Reason", "Reason timing is unavailable when applicable.", "STRING", "timeline_date_reason"),
+    Column("TIMELINE_COORDINATE_SYSTEM", "Timeline Coordinate System", "Relative timing coordinate system.", "STRING", "timeline_coordinate_system"),
+    Column("TIMEPOINT_SOURCE", "Timepoint Source", "Human-readable relative timing provenance.", "STRING", "timepoint_source"),
 )
 
 COLUMN_NAMES = tuple(column.name for column in COLUMNS)
@@ -81,12 +88,17 @@ REQUIRED_VALUES = {
     "IS_HNE",
     "IS_IHC",
     "CAN_SERVE_TILES",
+    "TIMELINE_DATE_STATUS",
+    "TIMELINE_DATE_KIND",
+    "TIMELINE_DATE_SOURCE",
+    "TIMELINE_COORDINATE_SYSTEM",
 }
 BOOLEAN_COLUMNS = {"IS_HNE", "IS_IHC", "CAN_SERVE_TILES"}
 INTEGER_COLUMNS = {
     "FILE_SIZE_BYTES",
     "THUMBNAIL_WIDTH",
     "THUMBNAIL_HEIGHT",
+    "TIMELINE_START_DAYS",
 }
 
 
@@ -261,7 +273,7 @@ def read_wsi_study(meta_path: Path) -> tuple[str, list[dict]]:
         if len(row) != len(COLUMNS) or any(not value.startswith("#") for value in row):
             raise ValueError(f"Invalid WSI attribute metadata row {index}")
     if tuple(parsed_header_rows[4]) != COLUMN_NAMES:
-        raise ValueError("WSI data columns do not match format_version 2")
+        raise ValueError("WSI data columns do not match format_version 3")
 
     rows: list[dict] = []
     seen_images: set[str] = set()
@@ -308,6 +320,25 @@ def read_wsi_study(meta_path: Path) -> tuple[str, list[dict]]:
             raise ValueError(f"UNMATCHED row must have an empty SAMPLE_ID on data line {line_number}")
         if match_level != "UNMATCHED" and not sample_id:
             raise ValueError(f"matched row needs SAMPLE_ID on data line {line_number}")
+
+        timeline_start = raw["TIMELINE_START_DAYS"].strip()
+        timeline_status = raw["TIMELINE_DATE_STATUS"].strip()
+        timeline_kind = raw["TIMELINE_DATE_KIND"].strip()
+        timeline_reason = raw["TIMELINE_DATE_REASON"].strip()
+        if timeline_status not in {"AVAILABLE", "MISSING_PROCEDURE_DATE", "MISSING_REFERENCE_SEQUENCING_DATE"}:
+            raise ValueError(f"invalid TIMELINE_DATE_STATUS on data line {line_number}")
+        if timeline_kind not in {"RECORDED", "ESTIMATED", "UNDATED"}:
+            raise ValueError(f"invalid TIMELINE_DATE_KIND on data line {line_number}")
+        if raw["TIMELINE_COORDINATE_SYSTEM"].strip() != "patient_first_tumor_sequencing_day_zero":
+            raise ValueError(f"unsupported TIMELINE_COORDINATE_SYSTEM on data line {line_number}")
+        if timeline_status == "AVAILABLE" and (not timeline_start or timeline_kind == "UNDATED" or timeline_reason):
+            raise ValueError(f"inconsistent AVAILABLE timing on data line {line_number}")
+        if timeline_status != "AVAILABLE" and timeline_start:
+            raise ValueError(f"non-AVAILABLE timing has an offset on data line {line_number}")
+        if timeline_status == "MISSING_PROCEDURE_DATE" and timeline_kind != "UNDATED":
+            raise ValueError(f"missing procedure timing must be UNDATED on data line {line_number}")
+        if timeline_status == "MISSING_REFERENCE_SEQUENCING_DATE" and timeline_kind == "UNDATED":
+            raise ValueError(f"missing reference timing cannot be UNDATED on data line {line_number}")
 
         row: dict[str, object] = {}
         for column in COLUMNS:

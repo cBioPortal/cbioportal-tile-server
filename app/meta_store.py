@@ -153,6 +153,7 @@ SELECT
     specimen_key,
     timeline_start_days,
     timeline_date_status,
+    timeline_coordinate_system,
     can_serve_tiles,
     slide_path,
     tile_metadata_json,

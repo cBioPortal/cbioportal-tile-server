@@ -56,7 +56,7 @@ class Settings:
     release_id: str = field(default_factory=lambda: _env_str("WSI_RELEASE_ID"))
     image_git_sha: str = field(default_factory=lambda: _env_str("IMAGE_GIT_SHA"))
     serving_contract_version: str = field(
-        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v3")
+        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v4")
     )
     # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))

@@ -54,6 +54,7 @@ def test_association_transport_matches_pdm_canonical_contract():
     for column in (
         "timeline_start_days",
         "timeline_date_status",
+        "timeline_coordinate_system",
         "can_serve_tiles",
         "slide_path",
         "tile_metadata_json",
@@ -71,6 +72,7 @@ def test_timeline_query_uses_only_relative_timing_fields():
     query = _ASSOCIATION_QUERY.lower()
     assert "timeline_start_days" in query
     assert "timeline_date_status" in query
+    assert "timeline_coordinate_system" in query
     assert "procedure_date_days" not in query
     assert "timepoint_source" not in query
 

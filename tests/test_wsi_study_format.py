@@ -28,6 +28,13 @@ def canonical_row(**overrides):
         "thumbnail_width": 256,
         "thumbnail_height": 128,
         "thumbnail_content_type": "image/jpeg",
+        "timeline_start_days": -53,
+        "timeline_date_status": "AVAILABLE",
+        "timeline_date_kind": "RECORDED",
+        "timeline_date_source": "DATE_OF_PROCEDURE_SURGICAL",
+        "timeline_date_reason": None,
+        "timeline_coordinate_system": "patient_first_tumor_sequencing_day_zero",
+        "timepoint_source": "Recorded procedure date relative to first tumor sequencing",
     }
     row.update(overrides)
     return row
@@ -45,7 +52,7 @@ def test_writer_uses_cbioportal_attribute_rows_and_versioned_meta_file(tmp_path)
         "genetic_alteration_type: PATHOLOGY_SLIDES",
         "datatype: WSI",
         "data_filename: data_wsi.txt",
-        "format_version: 2",
+        "format_version: 3",
     ]
     lines = data_path.read_text().splitlines()
     assert all(cell.startswith("#") for line in lines[:4] for cell in line.split("\t"))
@@ -97,14 +104,14 @@ def test_reader_rejects_a_header_that_does_not_match_the_format_version(tmp_path
     contents = data_path.read_text().replace("PATIENT_ID", "PATIENT", 1)
     data_path.write_text(contents)
 
-    with pytest.raises(ValueError, match="columns do not match format_version 2"):
+    with pytest.raises(ValueError, match="columns do not match format_version 3"):
         read_wsi_study(tmp_path / "meta_wsi.txt")
 
 
 def test_reader_rejects_legacy_format_version(tmp_path):
     _, data_path = write_wsi_study_files(tmp_path, "study", [canonical_row()])
     meta_path = tmp_path / "meta_wsi.txt"
-    meta_path.write_text(meta_path.read_text().replace("format_version: 2", "format_version: 1"))
+    meta_path.write_text(meta_path.read_text().replace("format_version: 3", "format_version: 1"))
 
     with pytest.raises(ValueError, match="unsupported WSI format_version"):
         read_wsi_study(meta_path)

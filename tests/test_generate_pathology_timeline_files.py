@@ -1,5 +1,6 @@
 import csv
 from pathlib import Path
+import pytest
 
 from tools.generate_pathology_timeline_files import (
     build_pathology_timeline_rows,
@@ -157,7 +158,7 @@ def test_databricks_boolean_strings_keep_other_slides_on_timeline():
         "study_3",
     )
     assert len(rows) == 1
-    assert rows[0][5] == "Other"
+    assert rows[0][5] == "Unknown"
     assert rows[0][8:11] == ["1", "0", "1"]
 
 
@@ -232,7 +233,7 @@ def test_build_pathology_timeline_rows_uses_canonical_relative_offset():
     )
 
     assert rows[0][1] == "-17"
-    assert rows[0][11] == "Procedure date relative to first ICD-O diagnosis"
+    assert rows[0][11] == "Recorded procedure date relative to first tumor sequencing"
 
 
 def test_write_pathology_timeline_files_returns_written_pair(tmp_path: Path):
@@ -439,7 +440,7 @@ def test_build_pathology_timeline_rows_keeps_explicitly_classified_other_slides(
             "",
             "PATHOLOGY SLIDES",
             "S-1",
-            "Other",
+                "Other",
             "BLOCK",
             "Part 1 / Block A1",
             "1",
@@ -447,7 +448,7 @@ def test_build_pathology_timeline_rows_keeps_explicitly_classified_other_slides(
             "1",
             "Procedure date relative to tumor sequencing",
             '["img-1"]',
-            "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=all&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
+                "/patient/wsiHESlides?studyId=study_1&caseId=P-1&stainFilter=other&matchLevel=BLOCK&specimenKey=block%3A%3A1%3A%3AA1&sampleId=S-1",
         ]
     ]
 
@@ -493,7 +494,7 @@ def test_build_pathology_timeline_rows_sanitizes_multiline_specimen_labels():
     ]
 
 
-def test_build_pathology_timeline_rows_uses_diagnosis_relative_canonical_fields():
+def test_build_pathology_timeline_rows_uses_portal_relative_canonical_fields():
     rows = build_pathology_timeline_rows(
         [
             {
@@ -525,7 +526,7 @@ def test_build_pathology_timeline_rows_uses_diagnosis_relative_canonical_fields(
                 "is_hne": True,
                 "is_ihc": False,
                 "timeline_start_days": None,
-                "timeline_date_status": "MISSING_DIAGNOSIS_DATE",
+                "timeline_date_status": "MISSING_REFERENCE_SEQUENCING_DATE",
                 "can_serve_tiles": True,
             },
         ],
@@ -534,7 +535,25 @@ def test_build_pathology_timeline_rows_uses_diagnosis_relative_canonical_fields(
 
     assert len(rows) == 1
     assert rows[0][1] == "0"
-    assert rows[0][11] == "Procedure date relative to first ICD-O diagnosis"
+    assert rows[0][11] == "Recorded procedure date relative to first tumor sequencing"
+
+
+def test_build_pathology_timeline_rows_rejects_stale_coordinate_marker():
+    with pytest.raises(RuntimeError, match="unsupported coordinate system"):
+        build_pathology_timeline_rows(
+            [{
+                "patient_id": "P-1",
+                "sample_id": "S-1",
+                "match_level": "PART",
+                "image_id": "img-1",
+                "stain_name": "H&E",
+                "stain_group": "H&E",
+                "timeline_start_days": -5,
+                "timeline_date_status": "AVAILABLE",
+                "timeline_coordinate_system": "first_icdo_diagnosis_day_zero",
+            }],
+            "study_1",
+        )
 
 
 def test_main_writes_pathology_timeline_files(monkeypatch, tmp_path: Path):

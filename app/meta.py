@@ -268,19 +268,13 @@ diagnostic_slide_universe AS (
         CASE
             WHEN c.stain_group IN ('H&E (Initial)', 'H&E (Other)') THEN 'H&E'
             WHEN c.stain_group = 'IHC' THEN 'IHC'
-            ELSE NULL
+            WHEN LOWER(COALESCE(c.stain_group, '')) = 'other'
+              OR LOWER(COALESCE(c.stain_name, '')) LIKE '%fish%' THEN 'Other'
+            ELSE 'Unknown'
         END AS stain_bucket
     FROM {meta_store._CLEANED_TABLE} c
     INNER JOIN patient_map p ON c.mrn = p.mrn
     WHERE c.image_id IS NOT NULL
-      AND (
-        c.stain_group IN ('H&E (Initial)', 'H&E (Other)')
-        OR (
-            c.stain_group = 'IHC'
-            AND LOWER(TRIM(COALESCE(c.stain_name, ''))) NOT LIKE 'immuno recut%'
-            AND LOWER(COALESCE(c.stain_name, '')) NOT LIKE '%unstained%'
-        )
-      )
 ),
 servable_inventory AS (
     SELECT DISTINCT image_id

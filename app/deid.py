@@ -57,6 +57,7 @@ _WSI_NON_TEXT_FIELDS = {
     "file_size_bytes",
     "thumbnail_width",
     "thumbnail_height",
+    "timeline_start_days",
     "tile_metadata_json",
 }
 _THUMBNAIL_CONTENT_TYPES = {

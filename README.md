@@ -47,18 +47,21 @@ handlers. The production sequence is:
    dependency or completion watermark).
 5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
    dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`, and writes
-   the standard pathology timeline pair with diagnosis-relative offsets and
+   the standard pathology timeline pair with offsets relative to the patient's
+   first tumor-sequencing day-zero reference and
    provenance.
    Every canonical slide with an available timeline date is represented;
-   explicitly classified non-H&E/IHC slides use the `Other` timeline subtype
-   and an all-slides linkout. Rows without a usable timeline date remain in
+   explicitly classified non-H&E/IHC slides use the `Other` timeline subtype,
+   while ambiguous or missing classifications use `Unknown`; each gets a
+   matching stain-filter linkout. Rows without a usable timeline date remain in
    the WSI hierarchy but cannot be placed on the timeline. Free-text specimen
    labels are de-identified before validation so dates or MRN-like labels
    cannot leak into the timeline.
 6. cBioPortal core imports the WSI snapshot and timeline files through the
    standard study importer and is the sole ClickHouse writer. The exporter
-   reads the migrated `timeline_start_days` contract and temporarily accepts
-   the legacy timing columns while the warehouse migration is rolling out.
+   reads only the versioned `timeline_start_days` contract; legacy timing
+   columns are rejected so diagnosis-relative offsets cannot be mislabeled as
+   portal timeline coordinates.
 
 The frontend is read-only: it requests the backend access bundle and then
 requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes

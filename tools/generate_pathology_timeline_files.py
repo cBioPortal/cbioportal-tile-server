@@ -36,6 +36,13 @@ from app.deid import DeidViolation, validate_timeline_public_row  # noqa: E402
 
 _TIMELINE_META_FILENAME = "meta_clinical_timeline_pathology_slides.txt"
 _TIMELINE_DATA_FILENAME = "data_clinical_timeline_pathology_slides.txt"
+PATHOLOGY_TIMELINE_COLUMNS = (
+    "PATIENT_ID", "START_DATE", "STOP_DATE", "EVENT_TYPE", "SAMPLE_ID",
+    "SUBTYPE", "MATCH_LEVEL", "SPECIMEN", "IMAGE_COUNT",
+    "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE",
+    "IMAGE_IDS", "LINKOUT",
+)
+PORTAL_TIMELINE_COORDINATE_SYSTEM = "patient_first_tumor_sequencing_day_zero"
 
 _TIMELINE_DATE_PATTERNS = (
     re.compile(r"(?<!\d)(?:19|20)\d{2}[-_/](?:0?[1-9]|1[0-2])[-_/](?:0?[1-9]|[12]\d|3[01])(?!\d)"),
@@ -73,7 +80,11 @@ SELECT
     can_serve_tiles,
     specimen_key,
     timeline_start_days,
-    timeline_date_status
+    timeline_date_status,
+    timeline_date_kind,
+    timeline_date_source,
+    timeline_date_reason,
+    timeline_coordinate_system
 FROM {canonical_table}
 WHERE patient_id IN ({placeholders})
 ORDER BY
@@ -83,48 +94,6 @@ ORDER BY
     match_level,
     image_id
 """
-
-# Older production refreshes exposed the relative date under the retired
-# ``procedure_date_days``/``timepoint_source`` names.  Keep the public query
-# above on the versioned contract, but make the exporter able to read one of
-# those tables while the migration is rolling through the warehouse.  The
-# result aliases are deliberately the current names before they reach the
-# timeline formatter.
-_LEGACY_ASSOCIATION_QUERY = """
-SELECT
-    patient_id,
-    sample_id,
-    match_level,
-    image_id,
-    part_key,
-    part_number,
-    block_key,
-    block_number,
-    block_label,
-    part_description,
-    stain_name,
-    stain_group,
-    is_hne,
-    is_ihc,
-    slide_path,
-    can_serve_tiles,
-    specimen_key,
-    procedure_date_days AS timeline_start_days,
-    CASE
-        WHEN procedure_date_days IS NOT NULL THEN 'AVAILABLE'
-        ELSE 'MISSING_PROCEDURE_DATE'
-    END AS timeline_date_status,
-    timepoint_source AS slide_timepoint_source
-FROM {canonical_table}
-WHERE patient_id IN ({placeholders})
-ORDER BY
-    patient_id,
-    procedure_date_days,
-    sample_id,
-    match_level,
-    image_id
-"""
-
 
 @dataclass
 class _GroupedTimelineRow:
@@ -269,6 +238,7 @@ def _infer_slide_type(
     stain_name: str | None,
     is_hne: bool | None = None,
     is_ihc: bool | None = None,
+    slide_type: str | None = None,
 ) -> str | None:
     # The canonical association pipeline resolves these flags for every real
     # slide.  Preserve a third category when both are explicitly false so a
@@ -290,18 +260,32 @@ def _infer_slide_type(
 
     is_hne = as_bool(is_hne)
     is_ihc = as_bool(is_ihc)
+    group = (stain_group or "").lower()
+    name = re.sub(r"\s+", " ", (stain_name or "").lower()).strip()
     if is_ihc is True:
         return "IHC"
     if is_hne is True:
         return "H&E"
     if is_hne is False and is_ihc is False:
-        return "Other"
-    group = (stain_group or "").lower()
-    name = re.sub(r"\s+", " ", (stain_name or "").lower()).strip()
+        normalized_slide_type = (slide_type or "").strip().lower()
+        if normalized_slide_type == "other":
+            return "Other"
+        if normalized_slide_type == "unknown":
+            return "Unknown"
+        if group == "other" or "fish" in group or "fish" in name:
+            return "Other"
+        return "Unknown"
     if group == "ihc":
         return "IHC"
     if group in {"h&e", "h&e (initial)", "h&e (other)"} or name in {"h&e", "he"}:
         return "H&E"
+    if group == "other" or "fish" in group or "fish" in name:
+        return "Other"
+    normalized_slide_type = (slide_type or "").strip().lower()
+    if normalized_slide_type == "other":
+        return "Other"
+    if normalized_slide_type == "unknown":
+        return "Unknown"
     return None
 
 
@@ -384,9 +368,12 @@ def _build_linkout(
     params = {
         "studyId": study_id,
         "caseId": patient_id,
-        "stainFilter": (
-            "hne" if subtype == "H&E" else "ihc" if subtype == "IHC" else "all"
-        ),
+        "stainFilter": {
+            "H&E": "hne",
+            "IHC": "ihc",
+            "Other": "other",
+            "Unknown": "unknown",
+        }.get(subtype, "all"),
         "matchLevel": match_level,
         "specimenKey": specimen_key,
     }
@@ -406,14 +393,19 @@ def _fetch_canonical_associations(
 
     wc = WorkspaceClient()
     columns = _table_columns(wc, warehouse_id, _CANONICAL_ASSOCIATION_TABLE)
-    current_timing = {"timeline_start_days", "timeline_date_status"}.issubset(columns)
-    legacy_timing = {"procedure_date_days", "timepoint_source"}.issubset(columns)
-    if not current_timing and not legacy_timing:
+    required_timing = {
+        "timeline_start_days",
+        "timeline_date_status",
+        "timeline_date_kind",
+        "timeline_date_source",
+        "timeline_date_reason",
+        "timeline_coordinate_system",
+    }
+    if not required_timing.issubset(columns):
         raise RuntimeError(
-            f"{_CANONICAL_ASSOCIATION_TABLE} has neither the current timeline "
-            "columns nor the legacy migration columns"
+            f"{_CANONICAL_ASSOCIATION_TABLE} is missing the portal timeline "
+            "columns; rebuild the canonical association table before export"
         )
-    query_template = _ASSOCIATION_QUERY if current_timing else _LEGACY_ASSOCIATION_QUERY
 
     rows: list[dict] = []
     # Keep the IN-list below Databricks' 25 MB inline-result limit. Parallel
@@ -429,7 +421,7 @@ def _fetch_canonical_associations(
         return _run_query(
             WorkspaceClient(),
             warehouse_id,
-            query_template.format(
+            _ASSOCIATION_QUERY.format(
                 canonical_table=_CANONICAL_ASSOCIATION_TABLE,
                 placeholders=placeholders,
             ),
@@ -462,6 +454,12 @@ def build_pathology_timeline_rows(
         if slide_timepoint_days is None:
             continue
         timeline_status = str(row.get("timeline_date_status") or "").strip().upper()
+        coordinate_system = str(row.get("timeline_coordinate_system") or "").strip()
+        if "timeline_coordinate_system" in row and coordinate_system != PORTAL_TIMELINE_COORDINATE_SYSTEM:
+            raise RuntimeError(
+                "canonical pathology timeline uses an unsupported coordinate system: "
+                + coordinate_system
+            )
         if timeline_status and timeline_status != "AVAILABLE":
             continue
         try:
@@ -474,6 +472,7 @@ def build_pathology_timeline_rows(
             row.get("stain_name"),
             row.get("is_hne"),
             row.get("is_ihc"),
+            row.get("slide_type"),
         )
         if subtype is None:
             continue
@@ -533,11 +532,23 @@ def build_pathology_timeline_rows(
             )
             grouped_rows[group_key] = grouped
 
-        timepoint_source = (
-            "Procedure date relative to first ICD-O diagnosis"
-            if timeline_status == "AVAILABLE"
-            else row.get("timeline_date_status") or row.get("slide_timepoint_source")
-        )
+        date_kind = str(row.get("timeline_date_kind") or "").strip().upper()
+        if timeline_status == "AVAILABLE":
+            if date_kind == "ESTIMATED":
+                timepoint_source = (
+                    "Verified estimated procedure date relative to first tumor sequencing"
+                )
+            else:
+                timepoint_source = (
+                    "Recorded procedure date relative to first tumor sequencing"
+                )
+        else:
+            timepoint_source = (
+                row.get("timeline_date_reason")
+                or row.get("timeline_date_source")
+                or row.get("slide_timepoint_source")
+                or row.get("timeline_date_status")
+            )
         grouped.add_image(
             image_id=image_id,
             can_serve_tiles=can_serve_tiles,
@@ -604,11 +615,7 @@ def _write_timeline_meta(study_dir: Path, study_id: str) -> None:
 
 
 def _write_timeline_data(study_dir: Path, rows: list[list[str]]) -> None:
-    columns = [
-        "PATIENT_ID", "START_DATE", "STOP_DATE", "EVENT_TYPE", "SAMPLE_ID",
-        "SUBTYPE", "MATCH_LEVEL", "SPECIMEN", "IMAGE_COUNT",
-        "NON_SERVABLE_IMAGE_COUNT", "TOTAL_IMAGE_COUNT", "TIMEPOINT_SOURCE", "IMAGE_IDS", "LINKOUT",
-    ]
+    columns = list(PATHOLOGY_TIMELINE_COLUMNS)
     for row_number, row in enumerate(rows, start=1):
         try:
             validate_timeline_public_row(dict(zip(columns, row)))
