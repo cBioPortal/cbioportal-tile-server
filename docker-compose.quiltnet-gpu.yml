@@ -1,0 +1,16 @@
+services:
+  quiltnet-search:
+    build:
+      context: .
+      dockerfile: Dockerfile.quiltnet.gpu
+    environment:
+      QUILTNET_DEVICE: ${QUILTNET_DEVICE:-cuda}
+      NVIDIA_VISIBLE_DEVICES: ${QUILTNET_GPU:-0}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]

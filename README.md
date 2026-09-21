@@ -116,7 +116,24 @@ optional Redis cache:
 | `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
 | `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
+| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Dev-only compatibility for legacy seeded rows under the synthetic local-development subject |
 | `ONCOKB_API_TOKEN` | — | Optional OncoKB token for annotation enrichment |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
+| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider; `bedrock` is the production path |
+| `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
+| `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
+| `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
+| `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
+| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
+| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
+| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
+| `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
+| `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
+| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal QuiltNet retrieval worker URL; enable with the `research` Compose profile |
+| `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
+| `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
+| `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
 | `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
 | `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
 | `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
@@ -126,9 +143,21 @@ Thumbnail artifacts are generated offline by
 `tools/generate_slide_thumbnails.py` and their URL, dimensions, content type,
 and tile metadata are loaded into the cBioPortal WSI slide table. A slide is
 published with `can_serve_tiles=false` until all of those fields are present.
-The online service does not generate thumbnails, consult a manifest, or write
-the registry. Production deployments must schedule the offline batch described
+The online tile/thumbnail handlers do not generate thumbnails or write the
+registry. Production deployments must schedule the offline batch described
 above; an on-demand worker is not a substitute for registry publication.
+
+When enabled, `/research/v1` exposes only study-scoped, bounded references to
+published model assets and candidate regions. `/research/v1/mcp` provides the
+same read-only region and similar-slide tools to cBioAgent. Bedrock annotation
+tools create pending proposals in the agent action store; the browser applies
+them through `/annotations/batch` only after user approval.
+
+Semantic search is served by the optional `quiltnet-search` Compose service.
+Start it with `WSI_RESEARCH_EMBEDDING_URL=http://quiltnet-search:8080 docker
+compose --profile research up --build`; the tile server remains the
+authorization boundary and the worker receives only manifest artifact
+references and the interpreted query plan.
 
 Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
 Redis is an optimization only; a cache outage does not change authorization.
@@ -161,6 +190,14 @@ docker compose up --build
 
 The compose file is a local rehearsal. Configure the same secret, audience,
 and compatible TTL in cBioPortal and this service.
+
+The optional WSI research assistant is disabled by default. Enable it only in
+an environment with an approved secret manager or a read-only mounted key
+file, set `OPENAI_API_KEY_FILE` to the path visible inside the container, and
+set `WSI_AGENT_ENABLED=true`. The browser receives only the short-lived WSI
+capability; the OpenAI credential stays in the tile-server process. Assistant
+annotation and viewer changes are persisted as pending proposals and require
+explicit approval in the viewer before application.
 
 ## Offline preparation
 

@@ -198,7 +198,78 @@ class Settings:
     annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
     keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
     annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
+    annotation_local_development: bool = field(
+        default_factory=lambda: _env_bool("ANNOTATION_LOCAL_DEVELOPMENT", False)
+    )
     oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
+    agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
+    agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
+    agent_model: str = field(
+        default_factory=lambda: _env_str(
+            "BEDROCK_AGENT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )
+    )
+    agent_region: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_REGION", "us-east-1"))
+    agent_profile: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_PROFILE"))
+    agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    research_enabled: bool = field(default_factory=lambda: _env_bool("WSI_RESEARCH_ENABLED", False))
+    research_manifest_uri: str = field(default_factory=lambda: _env_str("WSI_RESEARCH_MANIFEST_URI"))
+    research_rate_limit_per_minute: int = field(
+        default_factory=lambda: _env_int("WSI_RESEARCH_RATE_LIMIT_PER_MINUTE", 30)
+    )
+    # QuiltNet retrieval runs in a separate process because its model and
+    # feature tensors are much larger than the pixel-serving workers.
+    research_embedding_url: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URL")
+    )
+    research_embedding_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS", 60.0)
+    )
+    research_embedding_in_process: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_EMBEDDING_IN_PROCESS", False)
+    )
+    research_static_fallback: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_STATIC_FALLBACK", True)
+    )
+    research_embedding_cache_dir: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_CACHE_DIR", "/cache/research-embeddings")
+    )
+    research_embedding_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES", 20 * 1024**3
+        )
+    )
+    quiltnet_prompt_cache_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_PROMPT_CACHE_SIZE", 4096)
+    )
+    quiltnet_score_chunk_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_SCORE_CHUNK_SIZE", 65_536)
+    )
+    quiltnet_torch_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_THREADS", 2)
+    )
+    quiltnet_torch_interop_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_INTEROP_THREADS", 1)
+    )
+    quiltnet_max_concurrent_searches: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_CONCURRENT_SEARCHES", 1)
+    )
+    quiltnet_max_queue: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_QUEUE", 8)
+    )
+    quiltnet_queue_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("QUILTNET_QUEUE_TIMEOUT_SECONDS", 30.0)
+    )
+    quiltnet_model_name: str = field(
+        default_factory=lambda: _env_str(
+            "QUILTNET_MODEL_NAME", "hf-hub:wisdomik/QuiltNet-B-16-PMB"
+        )
+    )
+    quiltnet_device: str = field(
+        default_factory=lambda: _env_str("QUILTNET_DEVICE", "auto")
+    )
+    agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
+    agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
 
     cors_origins: list[str] = field(
         default_factory=lambda: _env_csv(

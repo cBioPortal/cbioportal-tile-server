@@ -59,6 +59,29 @@ services:
       ANNOTATION_DB_PATH: /data/annotations.db
       KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
       ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
+      # Dev-only compatibility for seeded rows when cBioPortal uses its
+      # synthetic local-development capability subject.
+      ANNOTATION_LOCAL_DEVELOPMENT: ${ANNOTATION_LOCAL_DEVELOPMENT:-false}
+
+      # ── Optional WSI research assistant (server-side only) ───────────────
+      # Keep the API credential in a secret-mounted file or secret manager;
+      # never expose it to the browser or commit it to this repository.
+      WSI_AGENT_ENABLED: ${WSI_AGENT_ENABLED:-false}
+      WSI_AGENT_PROVIDER: ${WSI_AGENT_PROVIDER:-bedrock}
+      BEDROCK_AGENT_MODEL: ${BEDROCK_AGENT_MODEL:-us.anthropic.claude-sonnet-4-5-20250929-v1:0}
+      BEDROCK_AWS_REGION: ${BEDROCK_AWS_REGION:-us-east-1}
+      BEDROCK_AWS_PROFILE: ${BEDROCK_AWS_PROFILE:-}
+      BEDROCK_AWS_ENDPOINT_URL: ${BEDROCK_AWS_ENDPOINT_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      OPENAI_API_KEY_FILE: ${OPENAI_API_KEY_FILE:-}
+      WSI_AGENT_TIMEOUT_SECONDS: ${WSI_AGENT_TIMEOUT_SECONDS:-60}
+      WSI_AGENT_RATE_LIMIT_PER_MINUTE: ${WSI_AGENT_RATE_LIMIT_PER_MINUTE:-10}
+      WSI_RESEARCH_ENABLED: ${WSI_RESEARCH_ENABLED:-false}
+      WSI_RESEARCH_MANIFEST_URI: ${WSI_RESEARCH_MANIFEST_URI:-}
+      WSI_RESEARCH_RATE_LIMIT_PER_MINUTE: ${WSI_RESEARCH_RATE_LIMIT_PER_MINUTE:-30}
+      WSI_RESEARCH_EMBEDDING_URL: ${WSI_RESEARCH_EMBEDDING_URL:-}
+      WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS: ${WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS:-60}
+      WSI_RESEARCH_STATIC_FALLBACK: ${WSI_RESEARCH_STATIC_FALLBACK:-true}
 
       # ── Capacity (tune to host RAM; each open SVS ≈ 50–200 MB) ───────────
       MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
@@ -92,6 +115,50 @@ services:
       retries: 3
       start_period: 15s
 
+  # Optional profile: start with `docker compose --profile research up`.
+  # Keeping this out of the default stack prevents the large ML runtime from
+  # consuming tile-server memory when semantic search is not enabled.
+  quiltnet-search:
+    build:
+      context: .
+      dockerfile: Dockerfile.quiltnet
+    profiles: ["research"]
+    environment:
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      BEDROCK_AWS_REGION: ${BEDROCK_AWS_REGION:-us-east-1}
+      WSI_RESEARCH_EMBEDDING_CACHE_DIR: /cache/research-embeddings
+      WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES: ${WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES:-21474836480}
+      QUILTNET_MODEL_NAME: ${QUILTNET_MODEL_NAME:-hf-hub:wisdomik/QuiltNet-B-16-PMB}
+      QUILTNET_DEVICE: ${QUILTNET_DEVICE:-cpu}
+      QUILTNET_PROMPT_CACHE_SIZE: ${QUILTNET_PROMPT_CACHE_SIZE:-4096}
+      QUILTNET_SCORE_CHUNK_SIZE: ${QUILTNET_SCORE_CHUNK_SIZE:-65536}
+      QUILTNET_TORCH_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      QUILTNET_TORCH_INTEROP_THREADS: ${QUILTNET_TORCH_INTEROP_THREADS:-1}
+      QUILTNET_MAX_CONCURRENT_SEARCHES: ${QUILTNET_MAX_CONCURRENT_SEARCHES:-1}
+      QUILTNET_MAX_QUEUE: ${QUILTNET_MAX_QUEUE:-8}
+      QUILTNET_QUEUE_TIMEOUT_SECONDS: ${QUILTNET_QUEUE_TIMEOUT_SECONDS:-30}
+      OMP_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      MKL_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      OPENBLAS_NUM_THREADS: ${QUILTNET_TORCH_THREADS:-2}
+      HF_HOME: /cache/huggingface
+    volumes:
+      - research_embeddings:/cache/research-embeddings
+      - research_model_cache:/cache/huggingface
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: ${RESEARCH_WORKER_MEMORY_LIMIT:-4g}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 120s
+
   redis:
     image: redis:7.4.5-alpine
     command: >
@@ -114,3 +181,5 @@ volumes:
   redis_data:
   slide_blocks:      # default named volume for BlockCache (override with host mount for NVMe)
   annotation_data:   # persistent SQLite annotation database
+  research_embeddings:
+  research_model_cache:
