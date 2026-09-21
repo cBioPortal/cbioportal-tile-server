@@ -17,12 +17,12 @@ import uuid
 from typing import Any
 
 import aiosqlite
-import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from .auth import require_user
 from .config import settings
+from .annotation_db import close_pool, connection, migrate, open_pool
 
 logger = logging.getLogger(__name__)
 
@@ -165,32 +165,9 @@ async def _init_sqlite(path: str) -> None:
 
 
 async def _init_postgres(dsn: str) -> None:
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS annotations (
-                id          TEXT PRIMARY KEY,
-                slide_id    TEXT NOT NULL,
-                study_id    TEXT NOT NULL,
-                body        TEXT NOT NULL,
-                target      TEXT NOT NULL,
-                created_by  TEXT NOT NULL,
-                visible_to  TEXT,
-                version     INTEGER NOT NULL DEFAULT 1,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now())
-            )
-            """
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ann_slide_study ON annotations(slide_id, study_id)"
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
-        )
-    finally:
-        await conn.close()
+    await open_pool(dsn)
+    async with connection(dsn) as conn:
+        await migrate(conn)
 
 
 async def init_db(db_path: str | None = None, db_url: str | None = None) -> None:
@@ -201,8 +178,13 @@ async def init_db(db_path: str | None = None, db_url: str | None = None) -> None
         await _init_postgres(_get_db_url())
         logger.info("Annotation DB ready (postgres)")
     else:
+        await close_pool()
         await _init_sqlite(_get_db_path())
         logger.info("Annotation DB ready (sqlite): %s", _get_db_path())
+
+
+async def close_db() -> None:
+    await close_pool()
 
 
 async def _list_sqlite(slide_id: str, study_id: str, user_sub: str) -> list[dict]:
@@ -222,8 +204,7 @@ async def _list_sqlite(slide_id: str, study_id: str, user_sub: str) -> list[dict
 
 
 async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[dict]:
-    conn = await asyncpg.connect(_get_db_url())
-    try:
+    async with connection(_get_db_url()) as conn:
         rows = await conn.fetch(
             """
             SELECT
@@ -240,8 +221,6 @@ async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[di
             user_sub,
         )
         return [dict(row) for row in rows]
-    finally:
-        await conn.close()
 
 
 async def _create_sqlite(data: AnnotationIn, user_sub: str) -> dict:
@@ -278,8 +257,7 @@ async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
     visible_to_json = (
         json.dumps(data.visible_to) if data.visible_to is not None else None
     )
-    conn = await asyncpg.connect(_get_db_url())
-    try:
+    async with connection(_get_db_url()) as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
@@ -298,8 +276,6 @@ async def _create_postgres(data: AnnotationIn, user_sub: str) -> dict:
             visible_to_json,
         )
         return dict(row)
-    finally:
-        await conn.close()
 
 
 async def _get_existing_sqlite(annotation_id: str) -> dict | None:
@@ -316,8 +292,7 @@ async def _get_existing_sqlite(annotation_id: str) -> dict | None:
 
 
 async def _get_existing_postgres(annotation_id: str) -> dict | None:
-    conn = await asyncpg.connect(_get_db_url())
-    try:
+    async with connection(_get_db_url()) as conn:
         row = await conn.fetchrow(
             """
             SELECT
@@ -328,8 +303,6 @@ async def _get_existing_postgres(annotation_id: str) -> dict | None:
             annotation_id,
         )
         return dict(row) if row else None
-    finally:
-        await conn.close()
 
 
 async def _update_sqlite(
@@ -376,8 +349,7 @@ async def _update_postgres(
     expected_version: int,
     new_version: int,
 ) -> str | None:
-    conn = await asyncpg.connect(_get_db_url())
-    try:
+    async with connection(_get_db_url()) as conn:
         row = await conn.fetchrow(
             """
             UPDATE annotations
@@ -394,8 +366,6 @@ async def _update_postgres(
             expected_version,
         )
         return row["to_char"] if row else None
-    finally:
-        await conn.close()
 
 
 async def _delete_sqlite(annotation_id: str) -> None:
@@ -406,11 +376,8 @@ async def _delete_sqlite(annotation_id: str) -> None:
 
 
 async def _delete_postgres(annotation_id: str) -> None:
-    conn = await asyncpg.connect(_get_db_url())
-    try:
+    async with connection(_get_db_url()) as conn:
         await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
-    finally:
-        await conn.close()
 
 
 @router.get("", response_model=list[AnnotationOut])

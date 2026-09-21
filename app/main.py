@@ -58,6 +58,7 @@ from .metrics import (
     track_thumbnail_fetch,
 )
 from .annotations import init_db as init_annotation_db
+from .annotations import close_db as close_annotation_db
 from .annotations import router as annotation_router
 from .oncokb import router as oncokb_router
 from .slides import SlideCache
@@ -313,6 +314,7 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await blockcache_task
         _slides.close_all()
+        await close_annotation_db()
         await _in_thread(close_runtime_store)
         await tile_cache.close_cache()
 
