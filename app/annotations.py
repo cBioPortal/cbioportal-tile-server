@@ -274,14 +274,6 @@ async def _insert_sqlite_connection(
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
-    db.row_factory = aiosqlite.Row
-    await db.execute(
-        """
-        INSERT INTO annotations (id, slide_id, study_id, body, target, created_by, visible_to)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
->>>>>>> 166c575 (fix(agent): commit canonical slide annotations atomically)
             ann_id,
             data.slide_id,
             data.study_id,
