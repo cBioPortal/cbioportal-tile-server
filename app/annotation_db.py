@@ -143,4 +143,3 @@ async def migrate_agent(conn: asyncpg.Connection) -> None:
         "ON agent_actions(session_id, user_sub)"
     )
     await _mark_migration(conn, "agent_actions")
-
