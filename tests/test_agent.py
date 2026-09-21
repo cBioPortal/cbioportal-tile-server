@@ -51,6 +51,72 @@ def test_agent_input_preserves_embedding_context():
     }
 
 
+def test_viewer_action_validation_normalizes_supported_navigation():
+    assert agent._validate_viewer_action(
+        "set_filters",
+        {"stain_filter": "other", "timepoint_days": None},
+    ) == {"stain_filter": "other", "timepoint_days": None}
+    assert agent._validate_viewer_action(
+        "go_to_coordinates", {"x": 12, "y": 34}
+    ) == {"x": 12.0, "y": 34.0}
+    assert agent._validate_viewer_action("zoom", {"zoom": 2}) == {"zoom": 2.0}
+
+    with pytest.raises(ValueError):
+        agent._validate_viewer_action("set_filters", {"stain_filter": "bad"})
+    with pytest.raises(ValueError):
+        agent._validate_viewer_action("zoom", {"zoom": 0})
+
+
+def test_postgres_timestamp_conversion_returns_aware_datetime():
+    timestamp = agent._as_postgres_datetime("2026-09-21T12:34:56Z")
+    assert timestamp.tzinfo is not None
+    assert timestamp.utcoffset().total_seconds() == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_action_insert_binds_datetime(monkeypatch):
+    class FakeConnection:
+        def __init__(self):
+            self.args = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return False
+
+        async def fetchrow(self, *_args):
+            self.args = _args
+            return {
+                "id": "action-1",
+                "session_id": "session-a",
+                "action_type": "viewer_action",
+                "study_id": "study-a",
+                "slide_id": "slide-a",
+                "payload_json": "{}",
+                "status": "pending",
+                "created_at": agent._as_postgres_datetime(
+                    "2026-09-21T12:34:56Z"
+                ),
+                "decided_at": None,
+                "outcome_json": None,
+            }
+
+    connection = FakeConnection()
+    monkeypatch.setattr(agent, "_storage_kind", lambda: "postgres")
+    monkeypatch.setattr(agent, "_get_db_url", lambda: "postgres://test")
+    monkeypatch.setattr(agent, "connection", lambda _dsn: connection)
+    run_context = agent.AgentRunContext(
+        user_sub="user-a", session_id="session-a", context=make_context()
+    )
+
+    await agent._insert_action(run_context, "viewer_action", {"action": "zoom"})
+
+    assert connection.args is not None
+    assert isinstance(connection.args[-1], agent.datetime)
+    assert connection.args[-1].tzinfo is not None
+
+
 def test_bedrock_region_tool_only_advertises_live_tile_model():
     tool = next(
         item["toolSpec"]

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -334,7 +335,7 @@ async def _insert_action(
     payload: dict[str, Any],
 ) -> AgentAction:
     action_id = str(uuid.uuid4())
-    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    created_at = _utc_string()
     payload = dict(payload)
     logical_payload_json = json.dumps(
         payload, separators=(",", ":"), sort_keys=True
@@ -375,7 +376,7 @@ async def _insert_action(
                 run_context.context.slide_id,
                 action_type,
                 payload_json,
-                created_at,
+                _as_postgres_datetime(created_at),
             )
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
@@ -503,7 +504,7 @@ async def _store_retrieval_candidates(
     if not candidates:
         return
 
-    created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    created_at = _utc_string()
     values = [
         (
             run_context.session_id,
@@ -517,6 +518,9 @@ async def _store_retrieval_candidates(
         for region in candidates
     ]
     if _storage_kind() == "postgres":
+        postgres_values = [
+            (*value[:-1], _as_postgres_datetime(value[-1])) for value in values
+        ]
         async with connection(_get_db_url()) as conn:
             await conn.executemany(
                 """
@@ -528,7 +532,7 @@ async def _store_retrieval_candidates(
                 DO UPDATE SET payload_json = EXCLUDED.payload_json,
                               created_at = EXCLUDED.created_at
                 """,
-                values,
+                postgres_values,
             )
             await conn.execute(
                 """
@@ -644,9 +648,15 @@ async def _load_retrieval_candidates(
 
 
 def _utc_string(offset_seconds: int = 0) -> str:
-    return time.strftime(
-        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + offset_seconds)
-    )
+    return _utc_datetime(offset_seconds).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _utc_datetime(offset_seconds: int = 0) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)
+
+
+def _as_postgres_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 async def _store_retrieval_run(
@@ -674,6 +684,11 @@ async def _store_retrieval_run(
         expires_at,
     )
     if _storage_kind() == "postgres":
+        postgres_values = (
+            *values[:-2],
+            _as_postgres_datetime(values[-2]),
+            _as_postgres_datetime(values[-1]),
+        )
         async with connection(_get_db_url()) as conn:
             await conn.execute(
                 """
@@ -694,7 +709,7 @@ async def _store_retrieval_run(
                 ON CONFLICT (run_id) DO UPDATE SET payload_json = EXCLUDED.payload_json,
                     created_at = EXCLUDED.created_at, expires_at = EXCLUDED.expires_at
                 """,
-                *values,
+                *postgres_values,
             )
             await conn.execute(
                 """
@@ -860,7 +875,7 @@ async def _change_action_status(
     new_status: str,
     outcome: dict[str, Any] | None = None,
 ) -> AgentAction | None:
-    decided_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    decided_at = _utc_string()
     outcome_json = json.dumps(outcome) if outcome is not None else None
     if _storage_kind() == "postgres":
         async with connection(_get_db_url()) as conn:
@@ -873,7 +888,7 @@ async def _change_action_status(
                           payload_json, status, created_at, decided_at, outcome_json
                 """,
                 new_status,
-                decided_at,
+                _as_postgres_datetime(decided_at),
                 outcome_json,
                 action_id,
                 user_sub,
@@ -1035,6 +1050,75 @@ def _finite_point(value: Any) -> bool:
         and math.isfinite(float(value["x"]))
         and math.isfinite(float(value["y"]))
     )
+
+
+def _validate_viewer_action(action: Any, parameters: Any) -> dict[str, Any]:
+    if action not in {"select_slide", "set_filters", "go_to_coordinates", "zoom"}:
+        raise ValueError("Invalid viewer action")
+    if not isinstance(parameters, dict) or not parameters:
+        raise ValueError("Viewer action parameters are required")
+    if len(json.dumps(parameters, separators=(",", ":"))) > 4000:
+        raise ValueError("Viewer action parameters are too large")
+    if action == "select_slide":
+        slide_id = parameters.get("slide_id", parameters.get("slideId"))
+        if not isinstance(slide_id, str) or not slide_id.strip():
+            raise ValueError("select_slide requires a slide_id")
+        return {"slide_id": slide_id.strip()}
+    if action == "set_filters":
+        allowed = {"stain_filter", "match_filter", "timepoint_days"}
+        if set(parameters) - allowed:
+            raise ValueError("set_filters contains an unsupported field")
+        normalized: dict[str, Any] = {}
+        if "stain_filter" in parameters:
+            if parameters["stain_filter"] not in {
+                "all",
+                "hne",
+                "ihc",
+                "other",
+                "unknown",
+            }:
+                raise ValueError("set_filters has an unsupported stain_filter")
+            normalized["stain_filter"] = parameters["stain_filter"]
+        if "match_filter" in parameters:
+            if parameters["match_filter"] not in {
+                "all",
+                "part",
+                "block",
+                "unmatched",
+            }:
+                raise ValueError("set_filters has an unsupported match_filter")
+            normalized["match_filter"] = parameters["match_filter"]
+        if "timepoint_days" in parameters:
+            timepoint_days = parameters["timepoint_days"]
+            if timepoint_days is not None and timepoint_days != "undated":
+                if (
+                    not isinstance(timepoint_days, (int, float))
+                    or isinstance(timepoint_days, bool)
+                    or not math.isfinite(float(timepoint_days))
+                ):
+                    raise ValueError("set_filters has an invalid timepoint_days")
+            normalized["timepoint_days"] = timepoint_days
+        if not normalized:
+            raise ValueError("set_filters requires a supported filter")
+        return normalized
+    if action == "go_to_coordinates":
+        if not all(
+            isinstance(parameters.get(name), (int, float))
+            and not isinstance(parameters.get(name), bool)
+            and math.isfinite(float(parameters[name]))
+            for name in ("x", "y")
+        ):
+            raise ValueError("go_to_coordinates requires finite x and y")
+        return {"x": float(parameters["x"]), "y": float(parameters["y"])}
+    zoom = parameters.get("zoom")
+    if (
+        not isinstance(zoom, (int, float))
+        or isinstance(zoom, bool)
+        or not math.isfinite(float(zoom))
+        or zoom <= 0
+    ):
+        raise ValueError("zoom requires a positive finite zoom")
+    return {"zoom": float(zoom)}
 
 
 def _canonicalize_annotation(
@@ -1438,46 +1522,7 @@ async def propose_viewer_action(
         parameters = json.loads(parameters_json)
     except json.JSONDecodeError as exc:
         raise ValueError("Viewer action parameters must be a JSON object") from exc
-    if not isinstance(parameters, dict):
-        raise TypeError("Viewer action parameters must be a JSON object")
-    if len(json.dumps(parameters, separators=(",", ":"))) > 4000:
-        raise ValueError("Viewer action parameters are too large")
-    if not parameters:
-        raise ValueError("Viewer action parameters are required")
-    if action == "select_slide":
-        slide_id = parameters.get("slide_id", parameters.get("slideId"))
-        if not isinstance(slide_id, str) or not slide_id.strip():
-            raise ValueError("select_slide requires a slide_id")
-    elif action == "set_filters":
-        timepoint_days = parameters.get("timepoint_days")
-        valid_filter = (
-            parameters.get("stain_filter") in {"all", "hne", "ihc"}
-            or parameters.get("match_filter") in {"all", "part", "block", "unmatched"}
-            or (
-                isinstance(timepoint_days, (int, float))
-                and not isinstance(timepoint_days, bool)
-                and math.isfinite(timepoint_days)
-            )
-        )
-        if not valid_filter:
-            raise ValueError("set_filters requires a supported filter")
-    elif action == "go_to_coordinates":
-        if not all(
-            isinstance(parameters.get(name), (int, float))
-            and not isinstance(parameters.get(name), bool)
-            and math.isfinite(parameters[name])
-            for name in ("x", "y")
-        ):
-            raise ValueError("go_to_coordinates requires finite x and y")
-    elif action == "zoom":
-        zoom = parameters.get("zoom")
-        if (
-            not isinstance(zoom, (int, float))
-            or isinstance(zoom, bool)
-            or not math.isfinite(zoom)
-            or zoom <= 0
-        ):
-            raise ValueError("zoom requires a positive finite zoom")
+    parameters = _validate_viewer_action(action, parameters)
     proposal = {
         "action": action,
         "parameters": parameters,
@@ -1939,9 +1984,7 @@ async def _bedrock_tool(
         return {"proposal_id": action.id, "status": action.status}
     if name == "wsi_propose_viewer_action":
         action_name = arguments.get("action")
-        parameters = arguments.get("parameters")
-        if action_name not in {"select_slide", "set_filters", "go_to_coordinates", "zoom"} or not isinstance(parameters, dict):
-            raise ValueError("Invalid viewer action")
+        parameters = _validate_viewer_action(action_name, arguments.get("parameters"))
         payload = {
             "action": action_name,
             "parameters": parameters,
@@ -2290,7 +2333,7 @@ async def _commit_annotations(
                     )
                 )
         ids = [str(row["id"]) for row in rows]
-        decided_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        decided_at = _utc_string()
         outcome = {"success": True, "detail": "Annotations committed", "annotation_ids": ids}
         if isinstance(db, aiosqlite.Connection):
             await db.execute(
@@ -2314,7 +2357,7 @@ async def _commit_annotations(
                 RETURNING id, session_id, action_type, study_id, slide_id,
                           payload_json, status, created_at, decided_at, outcome_json
                 """,
-                decided_at,
+                _as_postgres_datetime(decided_at),
                 json.dumps(outcome),
                 action_id,
                 user_sub,
