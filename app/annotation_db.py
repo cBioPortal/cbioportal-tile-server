@@ -118,28 +118,49 @@ async def migrate(conn: asyncpg.Connection) -> None:
 async def migrate_agent(conn: asyncpg.Connection) -> None:
     """Create the durable proposal audit table in the same database."""
     await _ensure_migration_table(conn)
-    if await _migration_complete(conn, "agent_actions"):
+    if not await _migration_complete(conn, "agent_actions"):
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_actions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_sub TEXT NOT NULL,
+                study_id TEXT NOT NULL,
+                slide_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
+                decided_at TIMESTAMPTZ,
+                outcome_json TEXT
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_actions_session "
+            "ON agent_actions(session_id, user_sub)"
+        )
+        await _mark_migration(conn, "agent_actions")
+
+    if await _migration_complete(conn, "agent_retrieval_candidates"):
         return
 
     await conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS agent_actions (
-            id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS agent_retrieval_candidates (
             session_id TEXT NOT NULL,
             user_sub TEXT NOT NULL,
             study_id TEXT NOT NULL,
             slide_id TEXT NOT NULL,
-            action_type TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
             payload_json TEXT NOT NULL,
-            status TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
-            decided_at TIMESTAMPTZ,
-            outcome_json TEXT
+            PRIMARY KEY (session_id, user_sub, study_id, slide_id, candidate_id)
         )
         """
     )
     await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_agent_actions_session "
-        "ON agent_actions(session_id, user_sub)"
+        "CREATE INDEX IF NOT EXISTS idx_agent_retrieval_candidates_session "
+        "ON agent_retrieval_candidates(session_id, user_sub, study_id, slide_id)"
     )
-    await _mark_migration(conn, "agent_actions")
+    await _mark_migration(conn, "agent_retrieval_candidates")
