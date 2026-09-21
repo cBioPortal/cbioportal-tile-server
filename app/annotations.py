@@ -17,6 +17,7 @@ import uuid
 from typing import Any
 
 import aiosqlite
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 

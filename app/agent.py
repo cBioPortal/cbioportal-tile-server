@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
-import asyncpg
 import boto3
 from botocore.exceptions import ClientError
 try:
@@ -518,8 +517,7 @@ async def _store_retrieval_candidates(
         for region in candidates
     ]
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             await conn.executemany(
                 """
                 INSERT INTO agent_retrieval_candidates
@@ -551,8 +549,6 @@ async def _store_retrieval_candidates(
                 run_context.context.study_id,
                 run_context.context.slide_id,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -600,8 +596,7 @@ async def _load_retrieval_candidates(
     run_context: AgentRunContext,
 ) -> dict[str, dict[str, Any]]:
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             rows = await conn.fetch(
                 """
                 SELECT candidate_id, payload_json
@@ -616,8 +611,6 @@ async def _load_retrieval_candidates(
                 run_context.context.study_id,
                 run_context.context.slide_id,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -681,8 +674,7 @@ async def _store_retrieval_run(
         expires_at,
     )
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             await conn.execute(
                 """
                 DELETE FROM agent_retrieval_runs
@@ -721,8 +713,6 @@ async def _store_retrieval_run(
                 run_context.context.study_id,
                 run_context.context.slide_id,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -772,8 +762,7 @@ async def _load_retrieval_runs(
     run_context: AgentRunContext,
 ) -> dict[str, dict[str, Any]]:
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             rows = await conn.fetch(
                 """
                 SELECT run_id, source_fingerprint, viewer_generation, model,
@@ -788,8 +777,6 @@ async def _load_retrieval_runs(
                 run_context.context.study_id,
                 run_context.context.slide_id,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -2342,8 +2329,7 @@ async def _commit_annotations(
         )
 
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     f"SELECT {columns} FROM agent_actions WHERE id = $1 AND user_sub = $2 FOR UPDATE",
@@ -2353,8 +2339,6 @@ async def _commit_annotations(
                 if row is None:
                     raise HTTPException(status_code=404, detail="Agent proposal not found")
                 return await finish(conn, row, commit=False)
-        finally:
-            await conn.close()
     db = await aiosqlite.connect(_get_db_path())
     try:
         await annotation_store._apply_sqlite_pragmas(db)
