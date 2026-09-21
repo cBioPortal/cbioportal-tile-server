@@ -23,13 +23,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 import aiosqlite
-import asyncpg
 from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_tool
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import scoped_user_dependency
+from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -182,31 +182,9 @@ async def _init_sqlite(path: str) -> None:
 
 
 async def _init_postgres(dsn: str) -> None:
-    conn = await asyncpg.connect(dsn)
-    try:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agent_actions (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                user_sub TEXT NOT NULL,
-                study_id TEXT NOT NULL,
-                slide_id TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
-                decided_at TIMESTAMPTZ,
-                outcome_json TEXT
-            )
-            """
-        )
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_agent_actions_session "
-            "ON agent_actions(session_id, user_sub)"
-        )
-    finally:
-        await conn.close()
+    await open_pool(dsn)
+    async with connection(dsn) as conn:
+        await migrate_agent(conn)
 
 
 async def init_db(db_path: str | None = None, db_url: str | None = None) -> None:
@@ -257,8 +235,7 @@ async def _insert_action(
     created_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     payload_json = json.dumps(payload, separators=(",", ":"))
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO agent_actions
@@ -277,8 +254,6 @@ async def _insert_action(
                 payload_json,
                 created_at,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -320,15 +295,12 @@ async def _get_action(action_id: str, user_sub: str) -> AgentAction | None:
         "created_at, decided_at, outcome_json"
     )
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             row = await conn.fetchrow(
                 f"SELECT {columns} FROM agent_actions WHERE id = $1 AND user_sub = $2",
                 action_id,
                 user_sub,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -349,8 +321,7 @@ async def _list_actions(
         "created_at, decided_at, outcome_json"
     )
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             rows = await conn.fetch(
                 f"SELECT {columns} FROM agent_actions "
                 "WHERE session_id = $1 AND user_sub = $2 AND study_id = $3 "
@@ -359,8 +330,6 @@ async def _list_actions(
                 user_sub,
                 study_id,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)
@@ -385,8 +354,7 @@ async def _change_action_status(
     decided_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     outcome_json = json.dumps(outcome) if outcome is not None else None
     if _storage_kind() == "postgres":
-        conn = await asyncpg.connect(_get_db_url())
-        try:
+        async with connection(_get_db_url()) as conn:
             row = await conn.fetchrow(
                 """
                 UPDATE agent_actions
@@ -402,8 +370,6 @@ async def _change_action_status(
                 user_sub,
                 expected_status,
             )
-        finally:
-            await conn.close()
     else:
         async with aiosqlite.connect(_get_db_path()) as db:
             await _apply_sqlite_pragmas(db)

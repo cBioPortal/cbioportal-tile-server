@@ -29,9 +29,7 @@ async def open_pool(dsn: str) -> asyncpg.Pool:
         dsn,
         min_size=_pool_size("ANNOTATION_DB_POOL_MIN_SIZE", 1),
         max_size=_pool_size("ANNOTATION_DB_POOL_MAX_SIZE", 8),
-        command_timeout=float(
-            os.environ.get("ANNOTATION_DB_COMMAND_TIMEOUT", "30")
-        ),
+        command_timeout=float(os.environ.get("ANNOTATION_DB_COMMAND_TIMEOUT", "30")),
     )
     _pool_dsn = dsn
     return _pool
@@ -52,8 +50,7 @@ async def connection(dsn: str) -> AsyncIterator[asyncpg.Connection]:
         yield conn
 
 
-async def migrate(conn: asyncpg.Connection) -> None:
-    """Apply idempotent schema version 1 without destructive table rewrites."""
+async def _ensure_migration_table(conn: asyncpg.Connection) -> None:
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS annotation_schema_migrations (
@@ -63,10 +60,34 @@ async def migrate(conn: asyncpg.Connection) -> None:
         )
         """
     )
+
+
+async def _migration_complete(
+    conn: asyncpg.Connection, component: str
+) -> bool:
     current = await conn.fetchval(
-        "SELECT version FROM annotation_schema_migrations WHERE component = 'annotations'"
+        "SELECT version FROM annotation_schema_migrations WHERE component = $1",
+        component,
     )
-    if current is not None and int(current) >= 1:
+    return current is not None and int(current) >= 1
+
+
+async def _mark_migration(conn: asyncpg.Connection, component: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO annotation_schema_migrations(component, version)
+        VALUES ($1, 1)
+        ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version,
+                                               applied_at = timezone('utc', now())
+        """,
+        component,
+    )
+
+
+async def migrate(conn: asyncpg.Connection) -> None:
+    """Apply the annotation schema without destructive table rewrites."""
+    await _ensure_migration_table(conn)
+    if await _migration_complete(conn, "annotations"):
         return
 
     await conn.execute(
@@ -88,12 +109,38 @@ async def migrate(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ann_slide_study ON annotations(slide_id, study_id)"
     )
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
+    )
+    await _mark_migration(conn, "annotations")
+
+
+async def migrate_agent(conn: asyncpg.Connection) -> None:
+    """Create the durable proposal audit table in the same database."""
+    await _ensure_migration_table(conn)
+    if await _migration_complete(conn, "agent_actions"):
+        return
+
     await conn.execute(
         """
-        INSERT INTO annotation_schema_migrations(component, version)
-        VALUES ('annotations', 1)
-        ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version,
-                                               applied_at = timezone('utc', now())
+        CREATE TABLE IF NOT EXISTS agent_actions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            user_sub TEXT NOT NULL,
+            study_id TEXT NOT NULL,
+            slide_id TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc', now()),
+            decided_at TIMESTAMPTZ,
+            outcome_json TEXT
+        )
         """
     )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_actions_session "
+        "ON agent_actions(session_id, user_sub)"
+    )
+    await _mark_migration(conn, "agent_actions")
+
