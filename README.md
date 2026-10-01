@@ -1,8 +1,20 @@
 # cbioportal-tile-server
 
-The cBioPortal WSI pixel service. This process serves only JPEG tiles and
-pre-rendered thumbnail artifacts; it does not know about patients, samples,
-studies, slide hierarchy, or image IDs.
+The cBioPortal WSI pixel service. It reads whole-slide images from object
+storage and serves JPEG tiles and pre-rendered thumbnail artifacts; it does not
+know about patients, samples, studies, slide hierarchy, or image IDs.
+
+- **Source slides:** the server reads slides with
+  [`tiffslide`](https://github.com/Bayer-Group/tiffslide). At MSK the sources
+  are Aperio SVS files, but any format `tiffslide` supports can be served.
+- **Tiles:** a source slide stores tiled pyramid levels, but not necessarily
+  one for every zoom level the viewer requests. Tiles are rendered on demand
+  at request time from the closest available level of the source slide,
+  encoded as JPEG, and cached (in Redis, when configured) for subsequent
+  requests.
+- **Thumbnails:** thumbnails are pre-rendered offline (see
+  [Production WSI artifact dataflow](#production-wsi-artifact-dataflow)); the
+  server only fetches and resizes those artifacts.
 
 ## Request flow
 
