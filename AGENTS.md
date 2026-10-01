@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`app/` contains the FastAPI service code. `app/main.py` is the entrypoint, while modules such as `tiles.py`, `slides.py`, `meta.py`, and `cache.py` hold tile serving, slide access, Databricks metadata, and Redis cache logic. `tests/` contains pytest coverage for API and unit behavior; keep new tests close to the feature they validate. `tools/` holds operational and data-migration scripts, `bench/` contains benchmarking utilities, and `docs/runbook.md` documents deployment and operations.
+`app/` contains the FastAPI service code. `app/main.py` is the entrypoint, while modules such as `tiles.py`, `slides.py`, and `cache.py` hold tile serving, slide access, and Redis cache logic. `tests/` contains pytest coverage for API and unit behavior; keep new tests close to the feature they validate. `tools/` holds local development helpers (offline thumbnail, export, and Databricks tooling lives in `pdm_databricks_pipelines/pathology_data_mining/wsi_tools`, which imports this package's rendering and de-identification code), `bench/` contains benchmarking utilities, and `docs/runbook.md` documents deployment and operations.
 
 ## Build, Test, and Development Commands
 Use `uv` for local Python workflows.

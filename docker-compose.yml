@@ -28,11 +28,7 @@ services:
       WSI_ALLOWED_SOURCE_PREFIXES: ${WSI_ALLOWED_SOURCE_PREFIXES:?WSI_ALLOWED_SOURCE_PREFIXES must be set}
       WSI_ALLOWED_THUMBNAIL_PREFIXES: ${WSI_ALLOWED_THUMBNAIL_PREFIXES:?WSI_ALLOWED_THUMBNAIL_PREFIXES must be set}
       CACHE_MISS_RATE_LIMIT_PER_MINUTE: ${CACHE_MISS_RATE_LIMIT_PER_MINUTE:-1200}
-      # ── Databricks / thumbnail namespace (dev overrides only) ───────────
-      WSI_THUMBNAIL_REGISTRY_TABLE: ${WSI_THUMBNAIL_REGISTRY_TABLE:-cdsi_prod.pathology_data_mining.slide_thumbnail_registry}
-      WSI_CANONICAL_ASSOCIATION_TABLE: ${WSI_CANONICAL_ASSOCIATION_TABLE:-cdsi_prod.pathology_data_mining.canonical_slide_associations}
-      WSI_SUMMARY_TABLE: ${WSI_SUMMARY_TABLE:-cdsi_prod.pathology_data_mining.sample_wsi_summary}
-      WSI_STAIN_CLASSIFICATION_TABLE: ${WSI_STAIN_CLASSIFICATION_TABLE:-cdsi_prod.pathology_data_mining.slide_stain_classification}
+      # ── Thumbnail namespace (dev overrides only) ────────────────────────
       THUMBNAIL_MANIFEST_URI: ${THUMBNAIL_MANIFEST_URI:-}
 
       # ── Tile settings ─────────────────────────────────────────────────────

@@ -4,8 +4,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .constants import DEFAULT_WAREHOUSE_ID as _DEFAULT_WAREHOUSE_ID
-
 
 def _aws_profile(key: str, fallback: str = "") -> str:
     """Read a value from the [ecs] section of ~/.aws/credentials, if present."""
@@ -192,11 +190,6 @@ class Settings:
             "CACHE_MISS_RATE_LIMIT_PER_MINUTE",
             _env_int("RATE_LIMIT_PER_MINUTE", 120),
         )
-    )
-
-    # Offline preparation tooling only (never read by the FastAPI runtime).
-    databricks_warehouse_id: str = field(
-        default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
     )
 
     # Block cache

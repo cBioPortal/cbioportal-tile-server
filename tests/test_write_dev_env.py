@@ -33,10 +33,8 @@ def test_main_writes_credentials_without_printing_them(tmp_path, monkeypatch, ca
     assert "token" not in captured.out + captured.err
     contents = output.read_text(encoding="utf-8")
     assert "AWS_SECRET_ACCESS_KEY=secret" in contents
-    assert "DATABRICKS_CONFIG_PROFILE=dev" in contents
-    assert "WSI_SUMMARY_TABLE=cdsi_dev.wsi_test.sample_wsi_summary" in contents
-    assert "WSI_STAIN_CLASSIFICATION_TABLE=cdsi_dev.wsi_test.slide_stain_classification" in contents
+    assert "DATABRICKS" not in contents
     assert (
-        "THUMBNAIL_ARTIFACT_ROOT_URI=s3://mskmind-bkt/wsi-thumbnails-dev/masters"
+        "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json"
         in contents
     )
