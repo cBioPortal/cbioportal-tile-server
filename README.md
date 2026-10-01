@@ -9,8 +9,9 @@ know about patients, samples, studies, slide hierarchy, or image IDs.
   files or any other format `tiffslide` supports.
 - **Tiles:** a source slide stores tiled pyramid levels, but not necessarily
   one for every zoom level the viewer requests. Tiles are rendered on demand
-  at request time from the closest available level of the source slide,
-  encoded as JPEG, and cached (in Redis, when configured) for subsequent
+  at request time: the server reads the region from the coarsest source level
+  that still meets the requested resolution, downscales it to the tile size,
+  encodes it as JPEG, and caches it (in Redis, when configured) for subsequent
   requests.
 - **Thumbnails:** thumbnails are pre-rendered offline (see
   [Production WSI artifact dataflow](#production-wsi-artifact-dataflow)); the
