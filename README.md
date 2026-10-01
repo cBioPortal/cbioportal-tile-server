@@ -5,8 +5,8 @@ storage and serves JPEG tiles and pre-rendered thumbnail artifacts; it does not
 know about patients, samples, studies, slide hierarchy, or image IDs.
 
 - **Source slides:** the server reads slides with
-  [`tiffslide`](https://github.com/Bayer-Group/tiffslide). At MSK the sources
-  are Aperio SVS files, but any format `tiffslide` supports can be served.
+  [`tiffslide`](https://github.com/Bayer-Group/tiffslide), e.g. Aperio SVS
+  files or any other format `tiffslide` supports.
 - **Tiles:** a source slide stores tiled pyramid levels, but not necessarily
   one for every zoom level the viewer requests. Tiles are rendered on demand
   at request time from the closest available level of the source slide,
