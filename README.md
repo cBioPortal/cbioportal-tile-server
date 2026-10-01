@@ -42,9 +42,8 @@ handlers. The production sequence is:
    The batch retries every missing, failed, or stale slide and refuses to
    publish a manifest until the complete inventory has current assets.
 2. The batch reads eligible `slide_inventory` rows and source slides from the
-   S3/Dell ECS-compatible store, writes immutable master JPEGs back to that
-   store, and upserts
-   `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
+   S3-compatible store, writes immutable master JPEGs back to that store, and
+   upserts the thumbnail registry table (`WSI_THUMBNAIL_REGISTRY_TABLE`) with
    `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
    `content_type`.
 3. The thumbnail publisher automatically runs
@@ -73,9 +72,9 @@ handlers. The production sequence is:
    the legacy timing columns while the warehouse migration is rolling out.
 
 The frontend is read-only: it requests the backend access bundle and then
-requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes
+requests `/thumbnails`; it has no S3 upload credentials and never writes
 Databricks tables. `app/thumbnail_worker.py` is a controlled on-demand CLI
-that can write a generated JPEG to the configured S3/ECS-compatible location,
+that can write a generated JPEG to the configured S3-compatible location,
 but it does not update `slide_thumbnail_registry` and is not a production
 publication mechanism. Keep it limited to development, rehearsal, or explicit
 remediation.
@@ -202,7 +201,7 @@ master publication. For a standalone backfill or repair, run:
 ```bash
 python3 tools/generate_thumbnail_variants.py \
   --warehouse-id "$DATABRICKS_WAREHOUSE_ID" \
-  --variant-root-uri s3://mskmind-bkt/wsi-thumbnails/variants/nav-128x96
+  --variant-root-uri s3://<bucket>/wsi-thumbnails/variants/nav-128x96
 ```
 
 A successful run must publish both the object-store artifacts and the matching
@@ -295,11 +294,11 @@ against the source tables to inspect coverage, conflicts, and the ranked
 non-binary queue before publishing a release.
 
 For development or rehearsal, use the Databricks `dev` profile and its
-warehouse, and point the WSI tables at an isolated `cdsi_dev.wsi_test`
-schema. The dev materializer loads only the supplied snapshot and master
+warehouse, and point the WSI tables at an isolated dev schema such as
+`<dev_catalog>.wsi_test`. The dev materializer loads only the supplied snapshot and master
 thumbnail registry; it does not generate or publish thumbnail variants. Set
 `THUMBNAIL_MANIFEST_URI` to a separate object-store prefix such as
-`s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does
+`s3://<bucket>/wsi-thumbnails-dev/manifest.json`. The dev workspace does
 not expose the production PHI catalogs, so load a validated study snapshot and
 the offline registry with:
 
@@ -308,10 +307,10 @@ DATABRICKS_CONFIG_PROFILE=dev PYTHONPATH=. .venv/bin/python \
   tools/materialize_dev_wsi_snapshot.py \
   --meta-wsi /path/to/meta_wsi.txt \
   --registry-jsonl /path/to/thumbnail-results.jsonl \
-  --namespace cdsi_dev.wsi_test \
-  --warehouse-id a52519fa662ce69d \
-  --artifact-root-uri s3://mskmind-bkt/wsi-thumbnails-dev/masters \
-  --manifest-uri s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json
+  --namespace <dev_catalog>.wsi_test \
+  --warehouse-id "$DATABRICKS_WAREHOUSE_ID" \
+  --artifact-root-uri s3://<bucket>/wsi-thumbnails-dev/masters \
+  --manifest-uri s3://<bucket>/wsi-thumbnails-dev/manifest.json
 ```
 
 This writes only the dev source, registry, canonical, and summary tables and
