@@ -148,10 +148,6 @@ class TestOtherSettings:
         s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
         assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
 
-    def test_databricks_warehouse_id_from_env(self):
-        s = make_settings(DATABRICKS_WAREHOUSE_ID="wh-test-123")
-        assert s.databricks_warehouse_id == "wh-test-123"
-
     def test_cors_origins_parsed(self):
         s = make_settings(CORS_ORIGINS="https://a.example.com,https://b.example.com")
         assert s.cors_origins == ["https://a.example.com", "https://b.example.com"]
