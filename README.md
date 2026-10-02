@@ -1,8 +1,41 @@
 # cbioportal-tile-server
 
-The cBioPortal WSI pixel service. This process serves only JPEG tiles and
-pre-rendered thumbnail artifacts; it does not know about patients, samples,
-studies, slide hierarchy, or image IDs.
+A tile server that lets cBioPortal display large images, such as digitized
+pathology slides, in a pan-and-zoom viewer. It reads images from S3-compatible
+object storage and serves deep-zoom JPEG tiles (`z/x/y`) and thumbnails to the
+cBioPortal frontend.
+
+At MSK, cBioPortal uses this service to show H&E and IHC whole-slide images
+alongside the patients and samples they were taken from.
+
+The service only handles pixels. It does not know about patients, samples,
+studies, slide hierarchy, or image IDs; cBioPortal owns that metadata and
+authorizes every request (see [Request flow](#request-flow)).
+
+## What it serves
+
+- **Image formats:** anything
+  [`tiffslide`](https://github.com/Bayer-Group/tiffslide) can open. That
+  includes whole-slide image formats such as Aperio SVS and Leica SCN, and
+  generic tiled/pyramidal TIFF, so the server is not limited to pathology
+  slides. Tiles are encoded as RGB JPEG, so RGB images are the best fit.
+  Formats `tiffslide` cannot open (for example DICOM and MIRAX) are not
+  supported.
+- **Tiles are generated on the fly.** No tile pyramid is precomputed. A source
+  image stores some resolution levels, but not necessarily one for every zoom
+  level the viewer requests. For each tile request, the server reads the
+  region from the coarsest source level that still meets the requested
+  resolution, downscales it to the tile size, encodes it as JPEG, and caches
+  it (in Redis, when configured) for subsequent requests.
+- **The only preprocessing is a one-time offline step per image** that
+  renders a thumbnail and records the image's tile metadata (dimensions and
+  resolution levels). cBioPortal marks an image as servable only after both
+  exist (see [Offline preparation](#offline-preparation)). The
+  server fetches those thumbnails and resizes them on request; it never
+  renders a thumbnail from the source image.
+- **Limit:** if an image lacks low-resolution levels, the most zoomed-out
+  tiles can exceed `MAX_DECODE_PIXELS`, and the server rejects them with HTTP
+  422 rather than decoding the full-resolution image.
 
 ## Request flow
 
