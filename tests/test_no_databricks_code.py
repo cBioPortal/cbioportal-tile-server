@@ -5,8 +5,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_tile_server_has_no_databricks_code():
-    # Databricks pipelines and offline WSI tools live in pdm_databricks_pipelines
-    # (pathology_data_mining/wsi_summary and pathology_data_mining/wsi_tools).
+    # Offline preparation (warehouse queries, thumbnail batches, study export)
+    # is maintained outside this repository; the service must not depend on it.
     assert not (ROOT / "databricks.yml").exists()
     for module in ("constants.py", "meta.py", "meta_store.py", "associations.py"):
         assert not (ROOT / "app" / module).exists()

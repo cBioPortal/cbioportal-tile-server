@@ -18,26 +18,46 @@ The tile server never resolves an image ID, queries cBioPortal metadata, or
 loads portal data files. A URL without a matching capability is
 rejected, even when the URL is otherwise reachable.
 
-## Production WSI artifact dataflow
+## Offline preparation
 
-Thumbnail generation, registry publication, and study-file export are offline
-prerequisites to the API, owned by
-[`pdm_databricks_pipelines`](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining):
-the [`wsi_tools`](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_tools) project renders and publishes thumbnails and
-exports the cBioPortal WSI and timeline study files, and the
-[`wsi_summary`](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary) bundle builds the serving manifest,
-canonical associations, and summary tables. cBioPortal core imports the study
-files and is the sole ClickHouse writer. The tile server holds no Databricks
-code or credentials; `wsi_tools` imports this package's slide reader,
-renderer, tile metadata, and de-identification checks (pinned by commit) so
-published artifacts match what this service serves.
+Thumbnail generation and study-file export happen offline, before a slide can
+be served. Each deployment supplies its own preparation pipeline; this
+repository contains only the online service. Whatever produces the data, the
+tile server relies on this contract:
+
+1. Thumbnail JPEGs are written to object storage under a prefix listed in
+   `WSI_ALLOWED_THUMBNAIL_PREFIXES`; source slides live under
+   `WSI_ALLOWED_SOURCE_PREFIXES`.
+2. Each slide row in the cBioPortal WSI study files (`meta_wsi.txt`/
+   `data_wsi.txt`) carries `source_url`, `tile_metadata_json`,
+   `thumbnail_url`, `thumbnail_width`, `thumbnail_height`, and
+   `thumbnail_content_type`. `tile_metadata_json` must pass
+   `app.metadata_contract.validate_tile_metadata`.
+3. cBioPortal core imports those files and is the sole ClickHouse writer. It
+   publishes `can_serve_tiles=true` only when every field is present, and
+   returns the URLs and metadata in the per-slide access bundle.
+
+The tile server never reads the pipeline's tables, registries, manifests, or
+credentials; it sees only what the access bundle and capability token carry.
+A slide becomes servable after thumbnails are published, study files are
+exported, and cBioPortal core has imported them.
+
+### Modules shared with offline tooling
+
+Preparation pipelines may import `app.tiles`, `app.slide_store`,
+`app.identity`, `app.metadata_contract`, and `app.deid` so their thumbnails,
+tile metadata, and de-identification checks match what this service renders
+and enforces. Treat changes to those modules as contract changes: bump
+`IDENTITY_VERSION` or `TILE_METADATA_SCHEMA_VERSION` in `app/identity.py` when
+the rendered output or metadata shape changes, and call the change out in the
+pull request.
 
 The frontend is read-only: it requests the backend access bundle and then
-requests `/thumbnails`; it has no ECS/S3 upload credentials. `app/thumbnail_worker.py`
-is a controlled on-demand CLI that can write a generated JPEG to the
-configured S3/ECS-compatible location, but it does not update the thumbnail
-registry and is not a production publication mechanism. Keep it limited to
-development, rehearsal, or explicit remediation.
+requests `/thumbnails`; it has no object-store upload credentials.
+`app/thumbnail_worker.py` is a controlled on-demand CLI that can write a
+generated JPEG to the configured S3-compatible location, but it is not a
+production publication mechanism. Keep it limited to development, rehearsal,
+or explicit remediation.
 
 ## Endpoints
 
@@ -101,13 +121,14 @@ optional Redis cache:
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 
-Thumbnail artifacts are generated offline by the `pdm_databricks_pipelines`
-`wsi_tools` thumbnail batch and their URL, dimensions, content type,
-and tile metadata are loaded into the cBioPortal WSI slide table. A slide is
+Thumbnail artifacts are generated offline (see
+[Offline preparation](#offline-preparation)) and their URL, dimensions,
+content type, and tile metadata are loaded into the cBioPortal WSI slide
+table. A slide is
 published with `can_serve_tiles=false` until all of those fields are present.
 The online service does not generate thumbnails, consult a manifest, or write
-the registry. Production deployments must schedule the offline batch described
-above; an on-demand worker is not a substitute for registry publication.
+the registry. Production deployments must run an offline thumbnail batch; the
+on-demand worker is not a substitute.
 
 Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
 Redis is an optimization only; a cache outage does not change authorization.
@@ -141,14 +162,7 @@ docker compose up --build
 The compose file is a local rehearsal. Configure the same secret, audience,
 and compatible TTL in cBioPortal and this service.
 
-## Offline preparation
-
-The offline tools, their runbooks, and the dev snapshot workflow are
-documented in the [`wsi_tools` README](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_tools). Changes here to
-`app/tiles.py`, `app/slide_store.py`, `app/identity.py`,
-`app/metadata_contract.py`, or `app/deid.py` change what those tools publish;
-bump the `cbioportal-tile-server` pin in `wsi_tools/pyproject.toml` when they
-do.
+## Local slide tests
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
 issue a v2 capability whose source URL is the mounted file URI. The normal

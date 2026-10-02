@@ -80,19 +80,16 @@ The cBioPortal core importer publishes `can_serve_tiles=true` only when all
 fields are complete; otherwise the hierarchy reports the slide as unavailable.
 No registry or manifest is mounted into the online tile-server pod.
 
-Thumbnail generation and publication, study snapshot export and refresh, and
-the Slurm batch operations (status, resume, repair) are owned by
-[`pdm_databricks_pipelines/pathology_data_mining/wsi_tools`](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_tools);
-the canonical-association and summary refresh is the
-[`wsi_summary`](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary) bundle. A slide becomes servable only after
-the thumbnail batch, the `wsi_summary` refresh, study-file export, and the
-cBioPortal core study import have all completed.
+Thumbnail generation, study-file export, and any batch scheduling are owned by
+the deployment's offline preparation pipeline, not this repository. A slide
+becomes servable only after its thumbnail is published, the study files are
+exported, and cBioPortal core has imported them. See the README's
+"Offline preparation" section for the full contract.
 
 The frontend only requests `/thumbnails` and never uploads artifacts. The
 tile-server `app/thumbnail_worker.py` CLI can be used for development,
 rehearsal, or controlled remediation, but it writes only an object-store
-artifact and does not populate the registry. It must not be used as the
-production source of truth.
+artifact. It must not be used as the production source of truth.
 
 ## Response and cache policy
 
