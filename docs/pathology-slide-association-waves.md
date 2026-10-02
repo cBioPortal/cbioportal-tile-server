@@ -34,21 +34,18 @@ source URLs in the per-slide access bundle.
 
 ## Thumbnail artifact prerequisite
 
-The thumbnail artifact is prepared before the canonical association refresh by
-a separate scheduled batch process. The batch reads the slide inventory and
-source slides, writes master JPEGs to the S3/Dell ECS-compatible store, and
-populates `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
-artifact URI, `tile_metadata_json`, dimensions, content type, and a
-fingerprint embedded in the metadata JSON. The production canonical SQL is
-owned by the [`pdm_databricks_pipelines` WSI bundle](https://github.com/pathology-data-mining/pdm_databricks_pipelines/tree/main/pathology_data_mining/wsi_summary)
-and consumes the manifest's serving pointer only when the source URI and
-fingerprint match the current preferred inventory. A rewritten
-object with the same ECS URL is consequently uncertified until it has been
-re-audited and its thumbnail regenerated.
+The thumbnail artifact is prepared before the association export by a
+separate scheduled batch outside this repository. The batch reads source
+slides, writes master JPEGs to the S3-compatible store, and records the
+artifact URI, `tile_metadata_json`, dimensions, content type, and a source
+fingerprint embedded in the metadata JSON. The export should use a thumbnail
+only when its source URI and fingerprint match the current source object, so
+an object rewritten in place at the same URL is treated as uncertified until
+its thumbnail is regenerated.
 
 The frontend is read-only and does not upload thumbnails. The tile-server
 on-demand worker is limited to development/rehearsal or controlled remediation;
-it does not publish registry rows and is not the production path.
+it is not the production path.
 
 Import the validated cBioPortal WSI study files through cBioPortal core:
 
