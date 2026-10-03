@@ -2,8 +2,9 @@
 """Benchmark one authenticated WSI viewer session.
 
 The access JSON is the response from cBioPortal's slide access endpoint. It
-must contain ``accessToken``, ``sourceUrl``, and ``tileMetadata``. The token is
-read only in memory and is never included in the benchmark output.
+must contain ``accessToken`` and ``tileMetadata``; the tile source travels
+encrypted inside the v3 token. The token is read only in memory and is never
+included in the benchmark output.
 
 Example::
 
@@ -53,18 +54,15 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
-def read_access(path: Path) -> tuple[str, str, dict[str, Any]]:
+def read_access(path: Path) -> tuple[str, dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     token = payload.get("accessToken")
-    source = payload.get("sourceUrl")
     metadata = payload.get("tileMetadata")
     if not isinstance(token, str) or not token:
         raise ValueError("access JSON is missing accessToken")
-    if not isinstance(source, str) or not source:
-        raise ValueError("access JSON is missing sourceUrl")
     if not isinstance(metadata, dict):
         raise ValueError("access JSON is missing tileMetadata")
-    return token, source, metadata
+    return token, metadata
 
 
 def viewport_tiles(
@@ -201,12 +199,11 @@ async def main() -> None:
         args.concurrency,
     ) < 1:
         raise SystemExit("viewport dimensions, tile counts, and concurrency must be positive")
-    token, source, metadata = read_access(args.access_json)
+    token, metadata = read_access(args.access_json)
     fit_zoom, fit_tiles, maximum_tiles, pan_bands = build_workload(args, metadata)
     base_url = args.base_url.rstrip("/")
     headers = {
         "Authorization": f"Bearer {token}",
-        "X-WSI-Source": source,
         "Origin": "https://beta.cbioportal.mskcc.org",
     }
     print(

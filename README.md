@@ -40,16 +40,18 @@ authorizes every request (see [Request flow](#request-flow)).
 ## Request flow
 
 1. cBioPortal authenticates the user and checks study permissions.
-2. `GET /api/wsi/v2/slides/{studyId}/{imageId}/access` reads the materialized
-   slide row from the cBioPortal database and returns the exact tile source URL,
-   thumbnail artifact URL, tile metadata, and a short-lived Bearer capability.
-3. The browser sends that URL and capability to this service.
-4. The service verifies the capability's SHA-256 binding to the exact URL and
-   reads pixels from object storage.
+2. `GET /api/wsi/v2/slides/{studyId}/{slideKey}/access` reads the materialized
+   slide row from the cBioPortal database and returns tile metadata, thumbnail
+   dimensions, and a short-lived Bearer capability. The exact tile source URL
+   and thumbnail artifact URL are sealed inside the capability's encrypted
+   `enc` claim; the response carries no `imageId` or source URL.
+3. The browser sends only that capability to this service.
+4. The service verifies and decrypts the capability and reads pixels from the
+   sealed URLs in object storage.
 
 The tile server never resolves an image ID, queries cBioPortal metadata, or
-loads portal data files. A URL without a matching capability is
-rejected, even when the URL is otherwise reachable.
+loads portal data files. Client-supplied source URLs (`?source=` or
+`X-WSI-Source`) are rejected.
 
 ## Offline preparation
 
@@ -99,8 +101,8 @@ or explicit remediation.
 | GET | `/health` | Public liveness probe |
 | GET | `/ready` | Public readiness probe (auth and artifact-policy configuration) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
-| GET | `/tiles/zxy/{z}/{x}/{y}?source=...` | Source-bound JPEG tile |
-| GET | `/thumbnails?source=...&width=...&height=...` | Source-bound thumbnail resize |
+| GET | `/tiles/zxy/{z}/{x}/{y}` | Capability-bound JPEG tile |
+| GET | `/thumbnails?width=...&height=...` | Capability-bound thumbnail resize |
 
 The same routes are available under `/wsi`. Every pixel request requires:
 
@@ -109,8 +111,13 @@ Authorization: Bearer <cBioPortal slide capability>
 ```
 
 Capabilities are HMAC-SHA256 JWTs with `scope=wsi:read`,
-`wsi_auth_version=2`, `study_id`, `image_id`, exact source URL digests, bounded
-thumbnail dimensions, and an expiry no longer than `WSI_AUTH_MAX_TTL`.
+`wsi_auth_version=3`, `study_id`, an opaque `slide_key`, bounded thumbnail
+dimensions, an expiry no longer than `WSI_AUTH_MAX_TTL`, and an `enc` claim.
+`enc` is AES-256-GCM (key = HKDF-SHA256 of `WSI_AUTH_SECRET`, info
+`wsi-claim-enc-v3`, AAD = `slide_key`) over the real `image_id` and the exact
+tile and thumbnail source URLs, so the browser never sees them. Requests that
+supply a source themselves (`?source=` or `X-WSI-Source`) are rejected with
+`400`. See `../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v5`).
 `/health` and `/ready` intentionally remain public for orchestration probes.
 
 ## Runtime configuration
