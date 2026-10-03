@@ -28,6 +28,9 @@ _NAMED_MONTH_DATE = re.compile(
 )
 _COMPACT_DATE = re.compile(r"(?<!\d)(?:19|20)\d{6}(?!\d)")
 _LABELLED_MRN = re.compile(r"(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}")
+# Specimen accession numbers (S##-#####, MSK:S...); contract wsi-serving-v5.
+ACCESSION_PATTERN = re.compile(r"(?i)(\bS\d{2}-\d{3,}|MSK:S\d)")
+SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _URI_EXTENSION = {
     "source": {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"},
     "thumbnail": {".jpg", ".jpeg", ".png"},
@@ -44,11 +47,14 @@ _FORBIDDEN_FIELDS = {
     "release_id",
     "procedure_date_days",
 }
+# Identifiers allowed to reach the browser without date/MRN text scanning.
+# image_id is server-side only (contract wsi-serving-v5) and is scanned like
+# any other text; slide_key is opaque hex and validated by SLIDE_KEY_PATTERN.
 _APPROVED_IDENTIFIER_FIELDS = {
     "patient_id",
     "reference_sample_id",
     "sample_id",
-    "image_id",
+    "slide_key",
 }
 _WSI_NON_TEXT_FIELDS = {
     "is_hne",
@@ -84,6 +90,30 @@ _TILE_METADATA_FIELDS = {
 }
 
 
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+# Columns that stay server-side under wsi_auth_version 3: image_id lives only
+# in ClickHouse and the encrypted token claim; source/thumbnail URIs are sealed
+# in that claim and validated by validate_artifact_uri. They are still scanned
+# for accessions, labelled MRNs and delimited dates, but not for the compact
+# YYYYMMDD heuristic, which 8-digit ids and object paths trip without being
+# browser-facing text.
+_SERVER_ONLY_FIELDS = {"image_id", "source_url", "thumbnail_url"}
+# Canonical opaque keys from the v10 pipeline are built from slide_key hex,
+# which can contain YYYYMMDD-looking runs.
+_OPAQUE_KEY_PATTERNS = {
+    "part_key": re.compile(r"^part:[0-9a-f]{32}$"),
+    "block_key": re.compile(r"^block:[0-9a-f]{32}$"),
+    "specimen_key": re.compile(r"^(?:block|part|unmatched)::part:[0-9a-f]{32}::block:[0-9a-f]{32}$"),
+}
+
+
+def _skips_date_scan(field: str, value: object) -> bool:
+    if field in _SERVER_ONLY_FIELDS:
+        return not _contains_absolute_date(_text(value))
+    pattern = _OPAQUE_KEY_PATTERNS.get(field)
+    return bool(pattern and pattern.fullmatch(_text(value)))
+
+
 class DeidViolation(ValueError):
     """Raised when a public WSI/timeline row would violate the contract."""
 
@@ -104,6 +134,16 @@ def _contains_absolute_date(value: str) -> bool:
     )
 
 
+def contains_accession(value: object) -> bool:
+    """Return whether text contains a specimen accession number."""
+    return bool(ACCESSION_PATTERN.search(_text(value)))
+
+
+def _assert_no_accession(field: str, value: object) -> None:
+    if contains_accession(value):
+        raise DeidViolation(f"accession number in {field}")
+
+
 def _assert_safe_text(field: str, value: object) -> None:
     text = _text(value)
     normalized_field = re.sub(r"[^a-z0-9]+", "_", field.lower()).strip("_")
@@ -118,6 +158,7 @@ def _assert_safe_text(field: str, value: object) -> None:
         return
     if _LABELLED_MRN.search(text):
         raise DeidViolation(f"labelled MRN in {field}")
+    _assert_no_accession(field, text)
     if _contains_absolute_date(text) or _COMPACT_DATE.search(text):
         raise DeidViolation(f"absolute date in {field}")
 
@@ -128,6 +169,12 @@ def _assert_safe_metadata_text(value: object, field: str = "TILE_METADATA_JSON")
         _assert_safe_text(field, value)
     elif isinstance(value, Mapping):
         for key, child in value.items():
+            if key == "source_fingerprint":
+                # A SHA-256 identity digest, not free text: its hex can
+                # contain an eight-digit run that looks like YYYYMMDD.
+                if not isinstance(child, str) or not _SHA256_HEX.fullmatch(child):
+                    raise DeidViolation(f"invalid {field}.{key}")
+                continue
             _assert_safe_metadata_text(child, f"{field}.{key}")
     elif isinstance(value, list):
         for index, child in enumerate(value):
@@ -229,10 +276,23 @@ def validate_wsi_public_row(
     image_id = _text(row.get("IMAGE_ID"))
     if not image_id:
         raise DeidViolation("IMAGE_ID is required")
+    slide_key = _text(row.get("SLIDE_KEY"))
+    if not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+        raise DeidViolation("SLIDE_KEY must be 32 lowercase hex characters")
     for field, value in row.items():
         normalized_field = field.lower()
-        if normalized_field not in _APPROVED_IDENTIFIER_FIELDS and normalized_field not in _WSI_NON_TEXT_FIELDS:
+        if normalized_field not in _WSI_NON_TEXT_FIELDS:
+            # Accessions are rejected in every text column, including
+            # approved identifiers and artifact URIs.
+            _assert_no_accession(field, value)
+        if (
+            normalized_field not in _APPROVED_IDENTIFIER_FIELDS
+            and normalized_field not in _WSI_NON_TEXT_FIELDS
+            and not _skips_date_scan(normalized_field, value)
+        ):
             _assert_safe_text(field, value)
+        elif _LABELLED_MRN.search(_text(value)):
+            raise DeidViolation(f"labelled MRN in {field}")
         if field.upper() == "TILE_METADATA_JSON" and _text(value):
             try:
                 metadata = json.loads(_text(value))
@@ -275,19 +335,10 @@ def validate_timeline_public_row(row: Mapping[str, object]) -> None:
     for field, value in row.items():
         if field.upper() in forbidden or field.lower() in _FORBIDDEN_FIELDS:
             raise DeidViolation(f"forbidden timeline field: {field}")
-        if field.upper() == "IMAGE_IDS":
-            try:
-                image_ids = json.loads(_text(value))
-            except (TypeError, ValueError) as error:
-                raise DeidViolation("IMAGE_IDS must be a JSON array") from error
-            if (
-                not isinstance(image_ids, list)
-                or not image_ids
-                or any(not isinstance(image_id, str) or not image_id.strip() for image_id in image_ids)
-                or image_ids != sorted(set(image_ids))
-            ):
-                raise DeidViolation("IMAGE_IDS must be a sorted, unique string array")
-            continue
+        if field.upper() in {"IMAGE_ID", "IMAGE_IDS"}:
+            # Real slide identifiers are server-side only (wsi-serving-v5).
+            raise DeidViolation(f"forbidden timeline field: {field}")
+        _assert_no_accession(field, value)
         if field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
             _assert_safe_text(field, value)
     for field in ("START_DATE", "STOP_DATE"):

@@ -1,6 +1,6 @@
 # cBioPortal WSI tile-server runbook
 
-This service is a source-bound pixel reader. cBioPortal owns authentication,
+This service is a capability-bound pixel reader. cBioPortal owns authentication,
 study authorization, hierarchy, and the slide access bundle. The tile server
 does not resolve image IDs, query Databricks, read a resource index, search,
 or expose clinical metadata.
@@ -8,15 +8,20 @@ or expose clinical metadata.
 ## Source of truth
 
 - `../cbioportal` serves `/api/wsi/v2/hierarchy/{studyId}/{patientId}` and
-  `/api/wsi/v2/slides/{studyId}/{imageId}/access` from ClickHouse.
-- `../cbioportal-frontend` requests that access bundle and sends its exact
-  URLs plus the returned Bearer capability to this service.
+  `/api/wsi/v2/slides/{studyId}/{slideKey}/access` from ClickHouse.
+- `../cbioportal-frontend` requests that access bundle and sends only the
+  returned Bearer capability to this service; it never sees or sends a
+  source URL.
 - The deployment repository owns ingress, probes, secrets, and rollout
   resources.
 
 The backend access response is the only online input needed beyond the shared
-secret. It contains `sourceUrl`, `thumbnail.sourceUrl`, dimensions, intrinsic
-tile metadata, and a v2 token. The token binds both URLs by SHA-256.
+secret. It contains `slideKey`, thumbnail dimensions, intrinsic tile metadata,
+and a `wsi_auth_version=3` token. The token's `enc` claim carries the real
+`image_id` and both source URLs encrypted with AES-256-GCM (HKDF-SHA256 of the
+shared secret, info `wsi-claim-enc-v3`, AAD = `slide_key`); the tile server
+decrypts it and reads only those URLs. v2 tokens are rejected. Contract:
+`wsi-serving-v5` (`../docs/wsi-deid-slide-key-contract.md`).
 
 ## Production topology
 
@@ -51,21 +56,21 @@ only for an isolated non-publishing unit test.
 ```bash
 curl -fsS https://cbioportal.example.org/wsi/health
 curl -fsS https://cbioportal.example.org/wsi/ready
-curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs
+curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0
 ```
 
 The final command must return `401` without `Authorization`. With a fresh
-bundle from cBioPortal, use the returned source URL and token:
+bundle from cBioPortal, use only the returned token:
 
 ```bash
 curl -fsS \
   -H "Authorization: Bearer ${WSI_TOKEN}" \
-  "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0?source=$(python -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$WSI_SOURCE")"
+  "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0"
 ```
 
-Also verify that changing one character of the source URL returns `403`, that
-an expired token returns `401`, and that the thumbnail endpoint accepts only
-the artifact URL bound in the same token.
+Also verify that adding `?source=...` or an `X-WSI-Source` header returns
+`400`, that changing one character of the token returns `401`, that an
+expired token returns `401`, and that a v2 token returns `401`.
 
 ## Data preparation
 

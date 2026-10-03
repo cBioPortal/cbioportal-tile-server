@@ -1,6 +1,10 @@
+import json
+
 import pytest
 
 from app.deid import DeidViolation, validate_artifact_uri, validate_timeline_public_row, validate_wsi_public_row
+
+SLIDE_KEY = "0123456789abcdef0123456789abcdef"
 
 
 @pytest.mark.parametrize(
@@ -9,7 +13,7 @@ from app.deid import DeidViolation, validate_artifact_uri, validate_timeline_pub
 )
 def test_public_wsi_row_rejects_common_absolute_date_formats(value):
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "PATH_DX_TITLE": value})
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": value})
 
 
 def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
@@ -38,24 +42,20 @@ def test_artifact_uri_allows_pipeline_date_under_approved_prefix():
     )
 
 
-def test_timeline_rows_require_sorted_unique_image_ids():
+@pytest.mark.parametrize("field", ["IMAGE_IDS", "IMAGE_ID"])
+def test_timeline_rows_reject_real_image_id_columns(field):
     validate_timeline_public_row(
         {
             "PATIENT_ID": "P-1",
             "IMAGE_COUNT": "1",
             "NON_SERVABLE_IMAGE_COUNT": "1",
             "TOTAL_IMAGE_COUNT": "2",
-            "IMAGE_IDS": '["slide-1","slide-2"]',
             "START_DATE": "-14",
         }
     )
-    with pytest.raises(DeidViolation):
+    with pytest.raises(DeidViolation, match="forbidden timeline field"):
         validate_timeline_public_row(
-            {
-                "PATIENT_ID": "P-1",
-                "IMAGE_IDS": '["slide-2","slide-1"]',
-                "START_DATE": "-14",
-            }
+            {"PATIENT_ID": "P-1", field: '["slide-1"]', "START_DATE": "-14"}
         )
 
 
@@ -64,7 +64,7 @@ def test_public_wsi_row_rejects_mrn_and_absolute_date_but_keeps_pseudonyms():
         "PATIENT_ID": "P-1",
         "REFERENCE_SAMPLE_ID": "S-REF",
         "SAMPLE_ID": "S-1",
-        "IMAGE_ID": "slide-1",
+        "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
         "BARCODE": "S-1",
         "PATH_DX_TITLE": "MRN: 123456",
         "SOURCE_URL": "s3://slides/slide-1.svs",
@@ -102,7 +102,7 @@ def test_timeline_rows_only_allow_relative_start_dates():
 
 def test_public_wsi_row_rejects_compact_absolute_dates_and_encoded_identifiers():
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "PATH_DX_TITLE": "20240131"})
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": "20240131"})
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
             "s3://slides/P-1%2FMRN%3A123456.svs",
@@ -117,7 +117,7 @@ def test_public_wsi_row_rejects_unknown_tile_metadata_fields():
     with pytest.raises(DeidViolation):
         validate_wsi_public_row(
             {
-                "IMAGE_ID": "slide-1",
+                "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
                 "TILE_METADATA_JSON": '{"dimensions": {}, "patient_name": "Alice"}',
             }
         )
@@ -126,7 +126,7 @@ def test_public_wsi_row_rejects_unknown_tile_metadata_fields():
 def test_public_wsi_row_allows_large_numeric_geometry_and_file_size_values():
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "slide-1",
+            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
             "FILE_SIZE_BYTES": "2012345678",
             "TILE_METADATA_JSON": '{"dimensions":{"width":20240101,"height":256}}',
         }
@@ -135,7 +135,7 @@ def test_public_wsi_row_allows_large_numeric_geometry_and_file_size_values():
 
 def test_public_wsi_row_requires_thumbnail_mime_to_match_extension():
     row = {
-        "IMAGE_ID": "slide-1",
+        "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
         "THUMBNAIL_URL": "s3://thumbs/slide-1.jpg",
         "THUMBNAIL_CONTENT_TYPE": "image/png",
     }
@@ -148,14 +148,91 @@ def test_public_wsi_row_requires_thumbnail_mime_to_match_extension():
 def test_public_wsi_row_allows_identity_metadata_from_thumbnail_registry():
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "slide-1",
+            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
             "TILE_METADATA_JSON": '{"dimensions": {}, "identity_version": "v2"}',
         }
     )
 
 
+def test_public_wsi_row_allows_date_like_hex_source_fingerprint():
+    # Eight-digit runs such as 20190412 occur naturally in SHA-256 hex.
+    fingerprint = "ab20190412" + "c" * 54
+    validate_wsi_public_row(
+        {
+            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+            "TILE_METADATA_JSON": json.dumps({"dimensions": {}, "source_fingerprint": fingerprint}),
+        }
+    )
+    for bad in ("2019-04-12", "not-a-digest", 123):
+        with pytest.raises(DeidViolation):
+            validate_wsi_public_row(
+                {
+                    "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+                    "TILE_METADATA_JSON": json.dumps({"dimensions": {}, "source_fingerprint": bad}),
+                }
+            )
+
+
 def test_public_rows_reject_identifier_field_names_even_without_labelled_values():
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "MRN_ID": "123456"})
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "MRN_ID": "123456"})
     with pytest.raises(DeidViolation):
         validate_timeline_public_row({"PATIENT_MRN": "123456", "START_DATE": "-1"})
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["S12-34567", "s99-123", "Part S20-1234 A1", "MSK:S1234", "msk:s9"],
+)
+def test_public_rows_reject_accession_numbers_in_every_text_column(value):
+    for field in ("PATH_DX_TITLE", "IMAGE_ID", "SAMPLE_ID", "PATIENT_ID", "BARCODE"):
+        row = {"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, field: value}
+        with pytest.raises(DeidViolation, match="accession") as exc_info:
+            validate_wsi_public_row(row)
+        assert value not in str(exc_info.value)
+    for field in ("SPECIMEN", "LINKOUT", "PATIENT_ID", "SAMPLE_ID"):
+        with pytest.raises(DeidViolation, match="accession"):
+            validate_timeline_public_row({"PATIENT_ID": "P-1", field: value, "START_DATE": "-1"})
+
+
+@pytest.mark.parametrize("value", ["S-1", "AS12-345", "S1-2345", "S12-34"])
+def test_accession_pattern_does_not_flag_pseudonyms(value):
+    validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "SAMPLE_ID": value})
+
+
+@pytest.mark.parametrize(
+    "slide_key",
+    ["", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef", "g" * 32, SLIDE_KEY + "0"],
+)
+def test_public_wsi_row_requires_opaque_slide_key(slide_key):
+    with pytest.raises(DeidViolation, match="SLIDE_KEY"):
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": slide_key})
+
+
+def test_slide_key_hex_is_not_mistaken_for_a_compact_date():
+    validate_wsi_public_row(
+        {"IMAGE_ID": "slide-1", "SLIDE_KEY": "abc20210314def0123456789abcdef01"}
+    )
+
+
+def test_image_id_is_no_longer_an_unscanned_identifier():
+    with pytest.raises(DeidViolation, match="absolute date"):
+        validate_wsi_public_row({"IMAGE_ID": "2021-03-14", "SLIDE_KEY": SLIDE_KEY})
+
+
+def test_public_wsi_row_allows_date_like_hex_in_opaque_keys_and_server_only_fields():
+    key = "20190412" + "a" * 24
+    validate_wsi_public_row(
+        {
+            "IMAGE_ID": "20190412", "SLIDE_KEY": SLIDE_KEY,
+            "PART_KEY": f"part:{key}", "BLOCK_KEY": f"block:{key}",
+            "SPECIMEN_KEY": f"block::part:{key}::block:{key}",
+        }
+    )
+    # Non-canonical keys are still scanned as text.
+    with pytest.raises(DeidViolation):
+        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PART_KEY": "part:20190412"})
+    # Server-only fields still reject accessions and labelled MRNs.
+    for bad in ("s3://bucket/S12-34567.svs", "s3://bucket/mrn 1234567.svs"):
+        with pytest.raises(DeidViolation):
+            validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "SOURCE_URL": bad})
