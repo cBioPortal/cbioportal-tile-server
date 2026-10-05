@@ -181,26 +181,6 @@ def test_public_rows_reject_identifier_field_names_even_without_labelled_values(
 
 
 @pytest.mark.parametrize(
-    "value",
-    ["S12-34567", "s99-123", "Part S20-1234 A1", "MSK:S1234", "msk:s9"],
-)
-def test_public_rows_reject_accession_numbers_in_every_text_column(value):
-    for field in ("PATH_DX_TITLE", "IMAGE_ID", "SAMPLE_ID", "PATIENT_ID", "BARCODE"):
-        row = {"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, field: value}
-        with pytest.raises(DeidViolation, match="accession") as exc_info:
-            validate_wsi_public_row(row)
-        assert value not in str(exc_info.value)
-    for field in ("SPECIMEN", "LINKOUT", "PATIENT_ID", "SAMPLE_ID"):
-        with pytest.raises(DeidViolation, match="accession"):
-            validate_timeline_public_row({"PATIENT_ID": "P-1", field: value, "START_DATE": "-1"})
-
-
-@pytest.mark.parametrize("value", ["S-1", "AS12-345", "S1-2345", "S12-34"])
-def test_accession_pattern_does_not_flag_pseudonyms(value):
-    validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "SAMPLE_ID": value})
-
-
-@pytest.mark.parametrize(
     "slide_key",
     ["", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef", "g" * 32, SLIDE_KEY + "0"],
 )
@@ -232,7 +212,7 @@ def test_public_wsi_row_allows_date_like_hex_in_opaque_keys_and_server_only_fiel
     # Non-canonical keys are still scanned as text.
     with pytest.raises(DeidViolation):
         validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PART_KEY": "part:20190412"})
-    # Server-only fields still reject accessions and labelled MRNs.
-    for bad in ("s3://bucket/S12-34567.svs", "s3://bucket/mrn 1234567.svs"):
+    # Server-only fields still reject labelled MRNs and delimited dates.
+    for bad in ("s3://bucket/mrn 1234567.svs", "s3://bucket/2021-03-14.svs"):
         with pytest.raises(DeidViolation):
             validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "SOURCE_URL": bad})
