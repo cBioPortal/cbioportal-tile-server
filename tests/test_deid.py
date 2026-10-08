@@ -94,6 +94,36 @@ def test_timeline_rows_only_allow_relative_start_dates():
     validate_timeline_public_row({"PATIENT_ID": "P-1", "START_DATE": "-14"})
 
 
+def test_timeline_linkout_allows_opaque_keys_with_date_like_hex():
+    # Opaque hex keys can contain YYYYMMDD-looking runs; they must not be rejected.
+    hex_with_date = "20190412" + "a" * 24
+    specimen_key = f"part::part:{hex_with_date}::block:{'b' * 32}"
+    linkout = (
+        "/patient/wsiHESlides?studyId=s&caseId=P-1&sampleId=P-1-T01"
+        "&stainFilter=hne&matchLevel=PART"
+        f"&specimenKey={specimen_key.replace(':', '%3A')}"
+        f"&slideKey={hex_with_date}"
+    )
+    validate_timeline_public_row({"PATIENT_ID": "P-1", "START_DATE": "-14", "LINKOUT": linkout})
+
+
+@pytest.mark.parametrize(
+    "linkout",
+    [
+        # a date in an ordinary parameter is still rejected
+        "/patient/wsiHESlides?studyId=s&caseId=P-1&note=2019-04-12",
+        # a specimenKey that is not a well-formed opaque key is scanned like any value
+        "/patient/wsiHESlides?studyId=s&caseId=P-1&specimenKey=20190412",
+        "/patient/wsiHESlides?studyId=s&caseId=P-1&slideKey=MRN%3A123456",
+        # dates in the path are rejected
+        "/patient/2019-04-12/wsiHESlides?studyId=s",
+    ],
+)
+def test_timeline_linkout_still_rejects_dates_and_mrns(linkout):
+    with pytest.raises(DeidViolation):
+        validate_timeline_public_row({"PATIENT_ID": "P-1", "START_DATE": "-14", "LINKOUT": linkout})
+
+
 def test_public_wsi_row_rejects_compact_absolute_dates_and_encoded_identifiers():
     with pytest.raises(DeidViolation):
         validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": "20240131"})

@@ -12,7 +12,7 @@ import binascii
 import json
 import re
 from collections.abc import Iterable, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 _ABSOLUTE_DATE = re.compile(
@@ -112,6 +112,34 @@ _OPAQUE_KEY_PATTERNS = {
     "block_key": re.compile(r"^block:[0-9a-f]{32}$"),
     "specimen_key": re.compile(r"^(?:block|part|unmatched)::part:[0-9a-f]{32}::block:[0-9a-f]{32}$"),
 }
+
+
+# Opaque keys a timeline LINKOUT may carry as query parameters.
+_LINKOUT_OPAQUE_PARAMS = {
+    "specimenKey": _OPAQUE_KEY_PATTERNS["specimen_key"],
+    "slideKey": re.compile(r"^[0-9a-f]{32}$"),
+}
+
+
+def _assert_safe_linkout(field: str, value: object) -> None:
+    """Scan a link's path and each query value; skip only well-formed opaque keys.
+
+    An opaque hex key can contain a run that looks like a compact date
+    (e.g. ``...20190412...``), so scanning the whole URL rejects valid links.
+    Keys that do not match their exact opaque pattern are scanned like any
+    other value.
+    """
+    text = _text(value)
+    if not text:
+        return
+    parts = urlsplit(text)
+    _assert_safe_text(f"{field} path", unquote(parts.path))
+    _assert_safe_text(f"{field} fragment", unquote(parts.fragment))
+    for name, param in parse_qsl(parts.query, keep_blank_values=True):
+        pattern = _LINKOUT_OPAQUE_PARAMS.get(name)
+        if pattern and pattern.fullmatch(param):
+            continue
+        _assert_safe_text(f"{field} {name}", param)
 
 
 def _skips_date_scan(field: str, value: object) -> bool:
@@ -334,7 +362,9 @@ def validate_timeline_public_row(row: Mapping[str, object]) -> None:
         if field.upper() in {"IMAGE_ID", "IMAGE_IDS"}:
             # Real slide identifiers are server-side only (wsi-serving-v6).
             raise DeidViolation(f"forbidden timeline field: {field}")
-        if field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
+        if field.upper() == "LINKOUT":
+            _assert_safe_linkout(field, value)
+        elif field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
             _assert_safe_text(field, value)
     for field in ("START_DATE", "STOP_DATE"):
         value = _text(row.get(field))
