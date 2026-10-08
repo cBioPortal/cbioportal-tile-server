@@ -51,7 +51,7 @@ _FORBIDDEN_FIELDS = {
     "procedure_date_days",
 }
 # Identifiers allowed to reach the browser without date/MRN text scanning.
-# image_id is server-side only (contract wsi-serving-v5) and is scanned like
+# image_id is server-side only (contract wsi-serving-v6) and is scanned like
 # any other text; slide_key is opaque hex and validated by SLIDE_KEY_PATTERN.
 _APPROVED_IDENTIFIER_FIELDS = {
     "patient_id",
@@ -94,10 +94,10 @@ _TILE_METADATA_FIELDS = {
 
 
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
-# Columns that stay server-side under wsi_auth_version 3: image_id lives only
-# in ClickHouse and the encrypted token claim; source/thumbnail URIs are sealed
-# in that claim and validated by validate_artifact_uri. They are still scanned
-# for labelled MRNs and delimited dates, but not for the compact
+# Columns that never reach cBioPortal under wsi_auth_version 4: image_id and the
+# source/thumbnail URIs travel only inside the sealed `enc` claim and are
+# validated by validate_artifact_uri when the tile server opens it. They are
+# still scanned for labelled MRNs and delimited dates, but not for the compact
 # YYYYMMDD heuristic, which 8-digit ids and object paths trip without being
 # browser-facing text.
 _SERVER_ONLY_FIELDS = {"image_id", "source_url", "thumbnail_url"}
@@ -324,7 +324,7 @@ def validate_timeline_public_row(row: Mapping[str, object]) -> None:
         if field.upper() in forbidden or field.lower() in _FORBIDDEN_FIELDS:
             raise DeidViolation(f"forbidden timeline field: {field}")
         if field.upper() in {"IMAGE_ID", "IMAGE_IDS"}:
-            # Real slide identifiers are server-side only (wsi-serving-v5).
+            # Real slide identifiers are server-side only (wsi-serving-v6).
             raise DeidViolation(f"forbidden timeline field: {field}")
         if field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
             _assert_safe_text(field, value)

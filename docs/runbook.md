@@ -16,12 +16,16 @@ or expose clinical metadata.
   resources.
 
 The backend access response is the only online input needed beyond the shared
-secret. It contains `slideKey`, thumbnail dimensions, intrinsic tile metadata,
-and a `wsi_auth_version=3` token. The token's `enc` claim carries the real
-`image_id` and both source URLs encrypted with AES-256-GCM (HKDF-SHA256 of the
-shared secret, info `wsi-claim-enc-v3`, AAD = `slide_key`); the tile server
-decrypts it and reads only those URLs. v2 tokens are rejected. Contract:
-`wsi-serving-v5` (`../docs/wsi-deid-slide-key-contract.md`).
+secret and the source seal key. It contains `slideKey`, thumbnail dimensions,
+intrinsic tile metadata, and a `wsi_auth_version=4` token signed with
+`WSI_AUTH_SECRET`. The token's `enc` claim is the slide's sealed source: the
+real `image_id` and both source URLs encrypted by the data provider with
+AES-256-GCM under the raw 32-byte `WSI_SOURCE_SEAL_KEY` (AAD = `slide_key`).
+cBioPortal stores and forwards it verbatim and cannot decrypt it. The tile
+server opens it, applies `validate_artifact_uri` (scheme, approved prefix,
+extension, identifier checks), and reads only those URLs. v2 and v3 tokens are
+rejected. Contract: `wsi-serving-v6`
+(`../docs/wsi-deid-slide-key-contract.md`).
 
 ## Production topology
 
@@ -37,6 +41,7 @@ AWS_ENDPOINT_URL=<S3-compatible endpoint>
 AWS_ACCESS_KEY_ID=<object-store key>
 AWS_SECRET_ACCESS_KEY=<object-store secret>
 WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
+WSI_SOURCE_SEAL_KEY=<standard base64 of the 32-byte key the data provider seals sources with>
 WSI_AUTH_AUDIENCE=cbioportal-wsi
 WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
@@ -70,16 +75,25 @@ curl -fsS \
 
 Also verify that adding `?source=...` or an `X-WSI-Source` header returns
 `400`, that changing one character of the token returns `401`, that an
-expired token returns `401`, and that a v2 token returns `401`.
+expired token returns `401`, and that a v2 or v3 token returns `401`.
+
+`WSI_SOURCE_SEAL_KEY` is required: the process refuses to start, `/ready`
+returns `503`, and every pixel request returns `401` unless it decodes to
+exactly 32 bytes. It is held only by the data provider that seals sources and
+by this service; never give it to cBioPortal. Rotating it means re-sealing
+every published `sealed_source` and re-importing the study files.
 
 ## Data preparation
 
 The offline pipeline loads each WSI slide row with:
 
 ```text
-source_url, tile_metadata_json, thumbnail_url,
+slide_key, sealed_source, tile_metadata_json,
 thumbnail_width, thumbnail_height, thumbnail_content_type
 ```
+
+`sealed_source` seals the `image_id`, source URL, and thumbnail URL with
+`WSI_SOURCE_SEAL_KEY`; the study files never carry them in clear.
 
 The cBioPortal core importer publishes `can_serve_tiles=true` only when all
 fields are complete; otherwise the hierarchy reports the slide as unavailable.
@@ -110,8 +124,10 @@ IDs. Keep operation type, dimensions, status, timing, and exception class.
 ## Local integration
 
 The local cBioPortal compose rehearsal should pass the same
-`WSI_AUTH_SECRET`/audience to the backend and tile server. For mounted local
+`WSI_AUTH_SECRET`/audience to the backend and tile server, and give the tile
+server the `WSI_SOURCE_SEAL_KEY` the local study's sealed sources were
+produced with. For mounted local
 slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and include
 `file:///app/testdata/` in both URI prefix allowlists; production should remain
-`s3` only. Generate a v2 access bundle through the backend before
+`s3` only. Generate a v4 access bundle through the backend before
 testing a pixel request.

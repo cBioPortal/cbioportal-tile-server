@@ -10,19 +10,17 @@ import time
 from functools import lru_cache
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from app.deid import SLIDE_KEY_PATTERN
 
 
-WSI_AUTH_VERSION = 3
-CLAIM_ENCRYPTION_INFO = b"wsi-claim-enc-v3"
+WSI_AUTH_VERSION = 4
+SOURCE_SEAL_KEY_BYTES = 32
 _GCM_NONCE_BYTES = 12
 _GCM_TAG_BYTES = 16
 _BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
-# Claims that carry real slide identifiers or source bindings.  A v3 JWT
+# Claims that carry real slide identifiers or source bindings.  A JWT
 # payload is readable by the browser, so these may only travel inside `enc`.
 _PLAINTEXT_FORBIDDEN_CLAIMS = (
     "image_id",
@@ -66,33 +64,43 @@ def _b64decode(value: str) -> bytes:
         raise InvalidWsiToken("invalid token encoding") from exc
 
 
-@lru_cache(maxsize=4)
-def _claim_encryption_key(secret: str) -> bytes:
-    """Derive the AES-256-GCM key for sealed claims (contract section 4)."""
-    return HKDF(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=None,
-        info=CLAIM_ENCRYPTION_INFO,
-    ).derive(secret.encode("utf-8"))
+def decode_source_seal_key(value: str) -> bytes:
+    """Decode `WSI_SOURCE_SEAL_KEY`: standard base64 of exactly 32 random bytes.
+
+    The key seals `enc` at the data provider and is never derived from
+    `WSI_AUTH_SECRET`.  Failures never echo the configured value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidWsiToken("WSI source seal key is not configured")
+    try:
+        key = base64.b64decode(value.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidWsiToken("WSI source seal key is not configured") from exc
+    if len(key) != SOURCE_SEAL_KEY_BYTES:
+        raise InvalidWsiToken("WSI source seal key is not configured")
+    return key
 
 
-def decrypt_sealed_claims(enc: object, secret: str, slide_key: str) -> dict:
-    """Decrypt the `enc` claim bound to `slide_key`.
+def decrypt_sealed_claims(enc: object, seal_key: bytes, slide_key: str) -> dict:
+    """Decrypt the `enc` claim with the raw source seal key, bound to `slide_key`.
 
-    Failures never echo the ciphertext, plaintext, or slide key.
+    `enc` is base64url-without-padding of nonce(12) || ciphertext || tag(16)
+    from AES-256-GCM with AAD = UTF-8 `slide_key`.  Failures never echo the
+    ciphertext, plaintext, or slide key.
     """
     if not isinstance(enc, str) or not _BASE64URL.fullmatch(enc):
         raise InvalidWsiToken("invalid token source binding")
-    return dict(_decrypt_sealed_claims_cached(enc, secret, slide_key))
+    if not isinstance(seal_key, bytes) or len(seal_key) != SOURCE_SEAL_KEY_BYTES:
+        raise InvalidWsiToken("WSI source seal key is not configured")
+    return dict(_decrypt_sealed_claims_cached(enc, seal_key, slide_key))
 
 
 # One token authorizes hundreds of tile requests; decrypt its `enc` once. The
 # cache is consulted only after the signature/expiry checks pass on every
-# request, ciphertexts are unique per token (random nonce), and failures raise
-# and are therefore never cached.
+# request. `enc` is sealed once per slide (random nonce), so every token for a
+# slide shares one entry; failures raise and are therefore never cached.
 @lru_cache(maxsize=4096)
-def _decrypt_sealed_claims_cached(enc: str, secret: str, slide_key: str) -> tuple[tuple[str, str], ...]:
+def _decrypt_sealed_claims_cached(enc: str, seal_key: bytes, slide_key: str) -> tuple[tuple[str, str], ...]:
     try:
         sealed = base64.urlsafe_b64decode(enc + "=" * (-len(enc) % 4))
     except (binascii.Error, ValueError) as exc:
@@ -100,7 +108,7 @@ def _decrypt_sealed_claims_cached(enc: str, secret: str, slide_key: str) -> tupl
     if len(sealed) <= _GCM_NONCE_BYTES + _GCM_TAG_BYTES:
         raise InvalidWsiToken("invalid token source binding")
     try:
-        plaintext = AESGCM(_claim_encryption_key(secret)).decrypt(
+        plaintext = AESGCM(seal_key).decrypt(
             sealed[:_GCM_NONCE_BYTES],
             sealed[_GCM_NONCE_BYTES:],
             slide_key.encode("utf-8"),
@@ -117,17 +125,22 @@ def _decrypt_sealed_claims_cached(enc: str, secret: str, slide_key: str) -> tupl
     return tuple((claim, claims[claim]) for claim in _SEALED_CLAIMS)
 
 
-def validate_wsi_auth_configuration(secret: str, audience: str, max_ttl: int) -> None:
+def validate_wsi_auth_configuration(
+    secret: str, audience: str, max_ttl: int, seal_key: bytes
+) -> None:
     if not secret or len(secret.encode()) < 32:
         raise InvalidWsiToken("WSI authentication is not configured")
     if not audience or not audience.strip() or not 1 <= max_ttl <= 300:
         raise InvalidWsiToken("WSI authentication is not configured")
+    if not isinstance(seal_key, bytes) or len(seal_key) != SOURCE_SEAL_KEY_BYTES:
+        raise InvalidWsiToken("WSI source seal key is not configured")
 
 
 def validate_wsi_token(
-    token: str, secret: str, audience: str, max_ttl: int = 300
+    token: str, secret: str, audience: str, max_ttl: int = 300, *, seal_key: bytes
 ) -> dict:
-    validate_wsi_auth_configuration(secret, audience, max_ttl)
+    """Verify a capability signed with `secret` and open its sealed source."""
+    validate_wsi_auth_configuration(secret, audience, max_ttl, seal_key)
 
     parts = token.split(".")
     if len(parts) != 3:
@@ -187,7 +200,7 @@ def validate_wsi_token(
         raise InvalidWsiToken("token lifetime exceeds configured maximum")
 
     # Decrypt last so expired or mis-scoped tokens never reach the cipher.
-    sealed = decrypt_sealed_claims(payload.get("enc"), secret, slide_key)
+    sealed = decrypt_sealed_claims(payload.get("enc"), seal_key, slide_key)
     claims = {key: value for key, value in payload.items() if key != "enc"}
     claims.update(sealed)
     return claims

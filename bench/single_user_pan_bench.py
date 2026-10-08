@@ -3,7 +3,7 @@
 
 The access JSON is the response from cBioPortal's slide access endpoint. It
 must contain ``accessToken`` and ``tileMetadata``; the tile source travels
-encrypted inside the v3 token. The token is read only in memory and is never
+sealed inside the v4 token. The token is read only in memory and is never
 included in the benchmark output.
 
 Example::

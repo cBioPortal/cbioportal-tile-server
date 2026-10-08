@@ -43,11 +43,13 @@ authorizes every request (see [Request flow](#request-flow)).
 2. `GET /api/wsi/v2/slides/{studyId}/{slideKey}/access` reads the materialized
    slide row from the cBioPortal database and returns tile metadata, thumbnail
    dimensions, and a short-lived Bearer capability. The exact tile source URL
-   and thumbnail artifact URL are sealed inside the capability's encrypted
-   `enc` claim; the response carries no `imageId` or source URL.
+   and thumbnail artifact URL are in the capability's `enc` claim, sealed by
+   the data provider with a key cBioPortal does not hold; neither the database
+   nor the response carries an `imageId` or source URL.
 3. The browser sends only that capability to this service.
-4. The service verifies and decrypts the capability and reads pixels from the
-   sealed URLs in object storage.
+4. The service verifies the capability, opens `enc` with
+   `WSI_SOURCE_SEAL_KEY`, checks the URLs against the artifact policy, and
+   reads pixels from them in object storage.
 
 The tile server never resolves an image ID, queries cBioPortal metadata, or
 loads portal data files. Client-supplied source URLs (`?source=` or
@@ -63,14 +65,18 @@ tile server relies on this contract:
 1. Thumbnail JPEGs are written to object storage under a prefix listed in
    `WSI_ALLOWED_THUMBNAIL_PREFIXES`; source slides live under
    `WSI_ALLOWED_SOURCE_PREFIXES`.
-2. Each slide row in the cBioPortal WSI study files (`meta_wsi.txt`/
-   `data_wsi.txt`) carries `source_url`, `tile_metadata_json`,
-   `thumbnail_url`, `thumbnail_width`, `thumbnail_height`, and
-   `thumbnail_content_type`. `tile_metadata_json` must pass
+2. The pipeline seals each servable slide's `image_id`, tile source URL, and
+   thumbnail URL into `sealed_source` (the `enc` format above, keyed with
+   `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`).
+3. Each slide row in the cBioPortal WSI study files (`meta_wsi.txt`/
+   `data_wsi.txt`) carries `slide_key`, `sealed_source`,
+   `tile_metadata_json`, `thumbnail_width`, `thumbnail_height`, and
+   `thumbnail_content_type`, and never the `image_id` or URLs.
+   `tile_metadata_json` must pass
    `app.metadata_contract.validate_tile_metadata`.
-3. cBioPortal core imports those files and is the sole ClickHouse writer. It
+4. cBioPortal core imports those files and is the sole ClickHouse writer. It
    publishes `can_serve_tiles=true` only when every field is present, and
-   returns the URLs and metadata in the per-slide access bundle.
+   forwards `sealed_source` as the capability's `enc` claim.
 
 The tile server never reads the pipeline's tables, registries, manifests, or
 credentials; it sees only what the access bundle and capability token carry.
@@ -110,20 +116,26 @@ The same routes are available under `/wsi`. Every pixel request requires:
 Authorization: Bearer <cBioPortal slide capability>
 ```
 
-Capabilities are HMAC-SHA256 JWTs with `scope=wsi:read`,
-`wsi_auth_version=3`, `study_id`, an opaque `slide_key`, bounded thumbnail
-dimensions, an expiry no longer than `WSI_AUTH_MAX_TTL`, and an `enc` claim.
-`enc` is AES-256-GCM (key = HKDF-SHA256 of `WSI_AUTH_SECRET`, info
-`wsi-claim-enc-v3`, AAD = `slide_key`) over the real `image_id` and the exact
-tile and thumbnail source URLs, so the browser never sees them. Requests that
-supply a source themselves (`?source=` or `X-WSI-Source`) are rejected with
-`400`. See `../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v5`).
+Capabilities are HMAC-SHA256 JWTs (signed with `WSI_AUTH_SECRET`) with
+`scope=wsi:read`, `wsi_auth_version=4`, `study_id`, an opaque `slide_key`,
+bounded thumbnail dimensions, an expiry no longer than `WSI_AUTH_MAX_TTL`, and
+an `enc` claim. `enc` is the slide's sealed source: base64url (no padding) of
+nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes), keyed with the raw
+32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`, over JSON
+`{"image_id":…,"tile_source":…,"thumbnail_source":…}`. The data provider seals
+it when it publishes the slide; cBioPortal stores and forwards it verbatim and
+cannot open it, so neither cBioPortal nor the browser sees the `image_id` or
+source URLs. The tile server decrypts it and applies the source/thumbnail URI
+policy (scheme, approved prefix, extension, identifier checks) before any read.
+Requests that supply a source themselves (`?source=` or `X-WSI-Source`) are
+rejected with `400`. See `../docs/wsi-deid-slide-key-contract.md`
+(`wsi-serving-v6`).
 `/health` and `/ready` intentionally remain public for orchestration probes.
 
 ## Runtime configuration
 
-The service needs only pixel storage, the shared capability secret, and an
-optional Redis cache:
+The service needs only pixel storage, the shared capability secret, the source
+seal key, and an optional Redis cache:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -132,6 +144,7 @@ optional Redis cache:
 | `AWS_SECRET_ACCESS_KEY` | — | Object-store secret key |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with cBioPortal |
 | `WSI_AUTH_PREVIOUS_SECRET` | — | Optional prior secret during a bounded signing-key rotation |
+| `WSI_SOURCE_SEAL_KEY` | — | Required. Standard base64 of exactly 32 random bytes; opens the `enc` claim. Shared with the data provider that seals sources, never with cBioPortal. Startup fails without it |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
@@ -162,9 +175,9 @@ optional Redis cache:
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 
 Thumbnail artifacts are generated offline (see
-[Offline preparation](#offline-preparation)) and their URL, dimensions,
-content type, and tile metadata are loaded into the cBioPortal WSI slide
-table. A slide is
+[Offline preparation](#offline-preparation)); their dimensions, content
+type, tile metadata, and sealed source (which carries the URL) are loaded into
+the cBioPortal WSI slide table. A slide is
 published with `can_serve_tiles=false` until all of those fields are present.
 The online service does not generate thumbnails, consult a manifest, or write
 the registry. Production deployments must run an offline thumbnail batch; the
@@ -195,17 +208,21 @@ miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ```bash
 python3 tools/write_dev_env.py
-printf 'WSI_AUTH_SECRET=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 24)" >> .env
+printf 'WSI_AUTH_SECRET=%s\nWSI_SOURCE_SEAL_KEY=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -base64 32)" "$(openssl rand -hex 24)" >> .env
 docker compose up --build
 ```
 
 The compose file is a local rehearsal. Configure the same secret, audience,
-and compatible TTL in cBioPortal and this service.
+and compatible TTL in cBioPortal and this service, and the same
+`WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
+produced.
 
 ## Local slide tests
 
-For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
-issue a v2 capability whose source URL is the mounted file URI. The normal
+For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`,
+include `file:///app/testdata/` in both prefix allowlists, and issue a v4
+capability whose `enc` seals the mounted file URIs with `WSI_SOURCE_SEAL_KEY`
+(see `seal_claims` in `tests/test_auth.py`). The normal
 production default accepts only `s3` URLs.
 
 ## PHI-safe operation

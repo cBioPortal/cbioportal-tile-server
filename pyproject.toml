@@ -32,7 +32,7 @@ dependencies = [
     # Tile cache (asyncio support is built-in since redis 5)
     "redis>=5.0.0",
 
-    # Sealed WSI capability claims (AES-256-GCM + HKDF-SHA256)
+    # Sealed WSI capability claims (AES-256-GCM)
     "cryptography>=42.0.0",
 
     # Observability (optional but useful)

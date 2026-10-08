@@ -36,6 +36,7 @@ from . import cache as tile_cache
 from .auth import (
     WSI_AUTH_VERSION,
     InvalidWsiToken,
+    decode_source_seal_key,
     source_cache_identity,
     source_digest,
     validate_wsi_auth_configuration,
@@ -301,6 +302,11 @@ async def _run_with_miss_lock_lease(cache_key: str, token: str, producer):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore
+    try:
+        decode_source_seal_key(settings.wsi_source_seal_key)
+    except InvalidWsiToken:
+        logger.error("WSI_SOURCE_SEAL_KEY must be standard base64 of exactly 32 bytes")
+        raise RuntimeError("WSI source seal key is not configured") from None
     _slides = SlideCache(capacity=settings.max_open_slides)
     _image_operation_semaphore = asyncio.Semaphore(settings.max_image_operations)
     _thumbnail_fetch_semaphore = asyncio.Semaphore(settings.thumbnail_fetch_concurrency)
@@ -369,11 +375,16 @@ async def require_wsi_capability(request: Request, call_next):
     if not authorization.startswith("Bearer "):
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
     try:
+        seal_key = decode_source_seal_key(settings.wsi_source_seal_key)
+    except InvalidWsiToken:
+        return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    try:
         claims = validate_wsi_token(
             authorization[7:].strip(),
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
+            seal_key=seal_key,
         )
     except InvalidWsiToken:
         if not settings.wsi_auth_previous_secret:
@@ -384,6 +395,7 @@ async def require_wsi_capability(request: Request, call_next):
                 settings.wsi_auth_previous_secret,
                 settings.wsi_auth_audience,
                 settings.wsi_auth_max_ttl,
+                seal_key=seal_key,
             )
         except InvalidWsiToken:
             # Preserve the same response for an invalid token regardless of
@@ -730,6 +742,7 @@ def _readiness_status() -> tuple[int, dict]:
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
+            decode_source_seal_key(settings.wsi_source_seal_key),
         )
         if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
             raise InvalidWsiToken("WSI artifact allowlists are not configured")
@@ -738,7 +751,7 @@ def _readiness_status() -> tuple[int, dict]:
                 raise InvalidWsiToken("WSI release ID is not configured")
             if not re.fullmatch(r"[0-9a-fA-F]{40}", settings.image_git_sha):
                 raise InvalidWsiToken("WSI image git SHA is not a full commit")
-            if settings.serving_contract_version != "wsi-serving-v5":
+            if settings.serving_contract_version != "wsi-serving-v6":
                 raise InvalidWsiToken("unsupported WSI serving contract version")
         return 200, payload
     except InvalidWsiToken:

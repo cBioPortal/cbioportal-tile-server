@@ -1,6 +1,6 @@
 """Read-only smoke test for the capability-bound WSI pixel service.
 
-The v3 Bearer capability carries the encrypted tile and thumbnail sources, so
+The v4 Bearer capability carries the sealed tile and thumbnail sources, so
 no source URL is passed to the service.
 
 Example:
