@@ -5,6 +5,12 @@ import pytest
 from app.deid import DeidViolation, validate_artifact_uri, validate_timeline_public_row, validate_wsi_public_row
 
 SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+# Contract V6.1 test vector: a well-formed sealed source.
+SEALED_SOURCE = (
+    "AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85"
+    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa"
+    "9qfr9t209wS7V-LhGl8i"
+)
 
 
 @pytest.mark.parametrize(
@@ -13,7 +19,7 @@ SLIDE_KEY = "0123456789abcdef0123456789abcdef"
 )
 def test_public_wsi_row_rejects_common_absolute_date_formats(value):
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": value})
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": value})
 
 
 def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
@@ -64,32 +70,20 @@ def test_public_wsi_row_rejects_mrn_and_absolute_date_but_keeps_pseudonyms():
         "PATIENT_ID": "P-1",
         "REFERENCE_SAMPLE_ID": "S-REF",
         "SAMPLE_ID": "S-1",
-        "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+        "SLIDE_KEY": SLIDE_KEY,
         "BARCODE": "S-1",
         "PATH_DX_TITLE": "MRN: 123456",
-        "SOURCE_URL": "s3://slides/slide-1.svs",
-        "THUMBNAIL_URL": "s3://thumbs/slide-1.jpg",
+        "CAN_SERVE_TILES": "TRUE",
+        "SEALED_SOURCE": SEALED_SOURCE,
     }
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row(
-            row,
-            source_prefixes=("s3://slides/",),
-            thumbnail_prefixes=("s3://thumbs/",),
-        )
+        validate_wsi_public_row(row)
     row["PATH_DX_TITLE"] = "Diagnosis"
     row["BARCODE"] = "MRN: 123456"
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row(
-            row,
-            source_prefixes=("s3://slides/",),
-            thumbnail_prefixes=("s3://thumbs/",),
-        )
+        validate_wsi_public_row(row)
     row["BARCODE"] = "S-1"
-    validate_wsi_public_row(
-        row,
-        source_prefixes=("s3://slides/",),
-        thumbnail_prefixes=("s3://thumbs/",),
-    )
+    validate_wsi_public_row(row)
 
 
 def test_timeline_rows_only_allow_relative_start_dates():
@@ -102,7 +96,7 @@ def test_timeline_rows_only_allow_relative_start_dates():
 
 def test_public_wsi_row_rejects_compact_absolute_dates_and_encoded_identifiers():
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": "20240131"})
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "PATH_DX_TITLE": "20240131"})
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
             "s3://slides/P-1%2FMRN%3A123456.svs",
@@ -117,7 +111,7 @@ def test_public_wsi_row_rejects_unknown_tile_metadata_fields():
     with pytest.raises(DeidViolation):
         validate_wsi_public_row(
             {
-                "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+                "SLIDE_KEY": SLIDE_KEY,
                 "TILE_METADATA_JSON": '{"dimensions": {}, "patient_name": "Alice"}',
             }
         )
@@ -126,29 +120,28 @@ def test_public_wsi_row_rejects_unknown_tile_metadata_fields():
 def test_public_wsi_row_allows_large_numeric_geometry_and_file_size_values():
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+            "SLIDE_KEY": SLIDE_KEY,
             "FILE_SIZE_BYTES": "2012345678",
             "TILE_METADATA_JSON": '{"dimensions":{"width":20240101,"height":256}}',
         }
     )
 
 
-def test_public_wsi_row_requires_thumbnail_mime_to_match_extension():
-    row = {
-        "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
-        "THUMBNAIL_URL": "s3://thumbs/slide-1.jpg",
-        "THUMBNAIL_CONTENT_TYPE": "image/png",
-    }
-    with pytest.raises(DeidViolation):
-        validate_wsi_public_row(row, thumbnail_prefixes=("s3://thumbs/",))
-    row["THUMBNAIL_CONTENT_TYPE"] = "image/jpeg"
-    validate_wsi_public_row(row, thumbnail_prefixes=("s3://thumbs/",))
+@pytest.mark.parametrize("content_type", ["image/jpeg", "image/png", "IMAGE/JPEG", ""])
+def test_public_wsi_row_accepts_supported_thumbnail_content_types(content_type):
+    validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "THUMBNAIL_CONTENT_TYPE": content_type})
+
+
+@pytest.mark.parametrize("content_type", ["image/gif", "text/html", "image/svg+xml"])
+def test_public_wsi_row_rejects_unsupported_thumbnail_content_types(content_type):
+    with pytest.raises(DeidViolation, match="THUMBNAIL_CONTENT_TYPE"):
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "THUMBNAIL_CONTENT_TYPE": content_type})
 
 
 def test_public_wsi_row_allows_identity_metadata_from_thumbnail_registry():
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+            "SLIDE_KEY": SLIDE_KEY,
             "TILE_METADATA_JSON": '{"dimensions": {}, "identity_version": "v2"}',
         }
     )
@@ -159,7 +152,7 @@ def test_public_wsi_row_allows_date_like_hex_source_fingerprint():
     fingerprint = "ab20190412" + "c" * 54
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+            "SLIDE_KEY": SLIDE_KEY,
             "TILE_METADATA_JSON": json.dumps({"dimensions": {}, "source_fingerprint": fingerprint}),
         }
     )
@@ -167,7 +160,7 @@ def test_public_wsi_row_allows_date_like_hex_source_fingerprint():
         with pytest.raises(DeidViolation):
             validate_wsi_public_row(
                 {
-                    "IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY,
+                    "SLIDE_KEY": SLIDE_KEY,
                     "TILE_METADATA_JSON": json.dumps({"dimensions": {}, "source_fingerprint": bad}),
                 }
             )
@@ -175,7 +168,7 @@ def test_public_wsi_row_allows_date_like_hex_source_fingerprint():
 
 def test_public_rows_reject_identifier_field_names_even_without_labelled_values():
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "MRN_ID": "123456"})
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "MRN_ID": "123456"})
     with pytest.raises(DeidViolation):
         validate_timeline_public_row({"PATIENT_MRN": "123456", "START_DATE": "-1"})
 
@@ -186,33 +179,131 @@ def test_public_rows_reject_identifier_field_names_even_without_labelled_values(
 )
 def test_public_wsi_row_requires_opaque_slide_key(slide_key):
     with pytest.raises(DeidViolation, match="SLIDE_KEY"):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": slide_key})
+        validate_wsi_public_row({"SLIDE_KEY": slide_key})
+
+
+def test_public_wsi_row_requires_slide_key_column():
+    with pytest.raises(DeidViolation, match="SLIDE_KEY"):
+        validate_wsi_public_row({"PATIENT_ID": "P-1"})
 
 
 def test_slide_key_hex_is_not_mistaken_for_a_compact_date():
-    validate_wsi_public_row(
-        {"IMAGE_ID": "slide-1", "SLIDE_KEY": "abc20210314def0123456789abcdef01"}
-    )
+    validate_wsi_public_row({"SLIDE_KEY": "abc20210314def0123456789abcdef01"})
 
 
-def test_image_id_is_no_longer_an_unscanned_identifier():
-    with pytest.raises(DeidViolation, match="absolute date"):
-        validate_wsi_public_row({"IMAGE_ID": "2021-03-14", "SLIDE_KEY": SLIDE_KEY})
-
-
-def test_public_wsi_row_allows_date_like_hex_in_opaque_keys_and_server_only_fields():
+def test_public_wsi_row_allows_date_like_hex_in_opaque_keys():
     key = "20190412" + "a" * 24
     validate_wsi_public_row(
         {
-            "IMAGE_ID": "20190412", "SLIDE_KEY": SLIDE_KEY,
+            "SLIDE_KEY": SLIDE_KEY,
             "PART_KEY": f"part:{key}", "BLOCK_KEY": f"block:{key}",
             "SPECIMEN_KEY": f"block::part:{key}::block:{key}",
         }
     )
     # Non-canonical keys are still scanned as text.
     with pytest.raises(DeidViolation):
-        validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "PART_KEY": "part:20190412"})
-    # Server-only fields still reject labelled MRNs and delimited dates.
-    for bad in ("s3://bucket/mrn 1234567.svs", "s3://bucket/2021-03-14.svs"):
-        with pytest.raises(DeidViolation):
-            validate_wsi_public_row({"IMAGE_ID": "slide-1", "SLIDE_KEY": SLIDE_KEY, "SOURCE_URL": bad})
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "PART_KEY": "part:20190412"})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("IMAGE_ID", "1645553"),
+        ("SOURCE_URL", "s3://slides/1645553.svs"),
+        ("THUMBNAIL_URL", "s3://thumbs/1645553.jpg"),
+        ("image_id", "1645553"),
+    ],
+)
+def test_public_wsi_row_rejects_plaintext_sources_without_echo(field, value):
+    row = {
+        "SLIDE_KEY": SLIDE_KEY,
+        "CAN_SERVE_TILES": "TRUE",
+        "SEALED_SOURCE": SEALED_SOURCE,
+        field: value,
+    }
+    with pytest.raises(DeidViolation, match=field.upper()) as exc_info:
+        validate_wsi_public_row(row)
+    assert "1645553" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("field", ["IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL"])
+def test_public_wsi_row_tolerates_empty_legacy_columns(field):
+    validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, field: ""})
+
+
+@pytest.mark.parametrize("can_serve", ["TRUE", "true", True])
+def test_servable_row_requires_sealed_source(can_serve):
+    validate_wsi_public_row(
+        {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": can_serve, "SEALED_SOURCE": SEALED_SOURCE}
+    )
+    with pytest.raises(DeidViolation, match="SEALED_SOURCE is required"):
+        validate_wsi_public_row(
+            {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": can_serve, "SEALED_SOURCE": ""}
+        )
+    with pytest.raises(DeidViolation, match="SEALED_SOURCE is required"):
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": can_serve})
+
+
+@pytest.mark.parametrize("can_serve", ["FALSE", "false", "", False, None])
+def test_unservable_row_must_not_carry_sealed_source(can_serve):
+    row = {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": can_serve, "SEALED_SOURCE": ""}
+    validate_wsi_public_row(row)
+    row["SEALED_SOURCE"] = SEALED_SOURCE
+    with pytest.raises(DeidViolation, match="SEALED_SOURCE must be empty"):
+        validate_wsi_public_row(row)
+
+
+def test_sealed_source_without_can_serve_tiles_column_is_rejected():
+    with pytest.raises(DeidViolation, match="SEALED_SOURCE must be empty"):
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "SEALED_SOURCE": SEALED_SOURCE})
+
+
+@pytest.mark.parametrize("can_serve", ["yes", "1", "Y"])
+def test_can_serve_tiles_must_be_boolean(can_serve):
+    with pytest.raises(DeidViolation, match="CAN_SERVE_TILES"):
+        validate_wsi_public_row({"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": can_serve})
+
+
+@pytest.mark.parametrize(
+    "sealed_source",
+    [
+        SEALED_SOURCE + "==",
+        SEALED_SOURCE.replace("-", "+"),
+        SEALED_SOURCE.replace("_", "/"),
+        SEALED_SOURCE[:20] + " " + SEALED_SOURCE[20:],
+        "A" * 38,
+        "A" * 4097,
+        "A" * 37 + "B",
+    ],
+)
+def test_malformed_sealed_source_is_rejected_without_echo(sealed_source):
+    with pytest.raises(DeidViolation, match="SEALED_SOURCE") as exc_info:
+        validate_wsi_public_row(
+            {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": "TRUE", "SEALED_SOURCE": sealed_source}
+        )
+    assert sealed_source[:24] not in str(exc_info.value)
+
+
+def test_sealed_source_length_bounds():
+    # 39 base64url chars decode to 29 bytes: nonce + tag + one ciphertext byte.
+    validate_wsi_public_row(
+        {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": "TRUE", "SEALED_SOURCE": "A" * 39}
+    )
+    validate_wsi_public_row(
+        {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": "TRUE", "SEALED_SOURCE": "A" * 4096}
+    )
+
+
+@pytest.mark.parametrize(
+    "sealed_source",
+    [
+        # Random ciphertext can contain date- or MRN-shaped runs.
+        "AAAA2021-03-14AAAA" + "A" * 30,
+        "AAAA20210314AAAA" + "A" * 30,
+        "AAAA-MRN-12345678" + "A" * 30,
+    ],
+)
+def test_sealed_source_is_not_text_scanned(sealed_source):
+    validate_wsi_public_row(
+        {"SLIDE_KEY": SLIDE_KEY, "CAN_SERVE_TILES": "TRUE", "SEALED_SOURCE": sealed_source}
+    )
