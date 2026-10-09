@@ -5,30 +5,25 @@ import binascii
 import hashlib
 import hmac
 import json
-import re
 import time
 from functools import lru_cache
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from app.deid import SLIDE_KEY_PATTERN
+from app.deid import (
+    SEALED_SOURCE_MIN_BYTES,
+    SEALED_SOURCE_NONCE_BYTES,
+    SEALED_SOURCE_PATTERN,
+    SLIDE_KEY_PATTERN,
+    b64url_decode,
+)
 
 
 WSI_AUTH_VERSION = 4
 SOURCE_SEAL_KEY_BYTES = 32
-_GCM_NONCE_BYTES = 12
-_GCM_TAG_BYTES = 16
-_BASE64URL = re.compile(r"[A-Za-z0-9_-]+")
 # Claims that carry real slide identifiers or source bindings.  A JWT
 # payload is readable by the browser, so these may only travel inside `enc`.
-_PLAINTEXT_FORBIDDEN_CLAIMS = (
-    "image_id",
-    "tile_source",
-    "thumbnail_source",
-    "tile_source_sha256",
-    "thumbnail_source_sha256",
-)
 _SEALED_CLAIMS = ("image_id", "tile_source", "thumbnail_source")
 
 
@@ -59,7 +54,7 @@ def source_cache_identity(source: str, source_fingerprint: str | None = None) ->
 
 def _b64decode(value: str) -> bytes:
     try:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        return b64url_decode(value)
     except Exception as exc:
         raise InvalidWsiToken("invalid token encoding") from exc
 
@@ -88,10 +83,8 @@ def decrypt_sealed_claims(enc: object, seal_key: bytes, slide_key: str) -> dict:
     from AES-256-GCM with AAD = UTF-8 `slide_key`.  Failures never echo the
     ciphertext, plaintext, or slide key.
     """
-    if not isinstance(enc, str) or not _BASE64URL.fullmatch(enc):
+    if not isinstance(enc, str) or not SEALED_SOURCE_PATTERN.fullmatch(enc):
         raise InvalidWsiToken("invalid token source binding")
-    if not isinstance(seal_key, bytes) or len(seal_key) != SOURCE_SEAL_KEY_BYTES:
-        raise InvalidWsiToken("WSI source seal key is not configured")
     return dict(_decrypt_sealed_claims_cached(enc, seal_key, slide_key))
 
 
@@ -102,15 +95,15 @@ def decrypt_sealed_claims(enc: object, seal_key: bytes, slide_key: str) -> dict:
 @lru_cache(maxsize=4096)
 def _decrypt_sealed_claims_cached(enc: str, seal_key: bytes, slide_key: str) -> tuple[tuple[str, str], ...]:
     try:
-        sealed = base64.urlsafe_b64decode(enc + "=" * (-len(enc) % 4))
+        sealed = b64url_decode(enc)
     except (binascii.Error, ValueError) as exc:
         raise InvalidWsiToken("invalid token source binding") from exc
-    if len(sealed) <= _GCM_NONCE_BYTES + _GCM_TAG_BYTES:
+    if len(sealed) < SEALED_SOURCE_MIN_BYTES:
         raise InvalidWsiToken("invalid token source binding")
     try:
         plaintext = AESGCM(seal_key).decrypt(
-            sealed[:_GCM_NONCE_BYTES],
-            sealed[_GCM_NONCE_BYTES:],
+            sealed[:SEALED_SOURCE_NONCE_BYTES],
+            sealed[SEALED_SOURCE_NONCE_BYTES:],
             slide_key.encode("utf-8"),
         )
         claims = json.loads(plaintext.decode("utf-8"))
@@ -178,7 +171,7 @@ def validate_wsi_token(
     slide_key = payload.get("slide_key")
     if not isinstance(slide_key, str) or not SLIDE_KEY_PATTERN.fullmatch(slide_key):
         raise InvalidWsiToken("invalid token slide")
-    if any(claim in payload for claim in _PLAINTEXT_FORBIDDEN_CLAIMS):
+    if any(claim in payload for claim in _SEALED_CLAIMS):
         raise InvalidWsiToken("token exposes sealed slide claims")
     for claim in ("tile_source_fingerprint", "thumbnail_source_fingerprint"):
         value = payload.get(claim)

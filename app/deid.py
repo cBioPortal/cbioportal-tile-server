@@ -41,7 +41,9 @@ SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 # `enc` claim.
 SEALED_SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 SEALED_SOURCE_MAX_CHARS = 4096
-SEALED_SOURCE_MIN_BYTES = 12 + 16 + 1
+SEALED_SOURCE_NONCE_BYTES = 12
+SEALED_SOURCE_TAG_BYTES = 16
+SEALED_SOURCE_MIN_BYTES = SEALED_SOURCE_NONCE_BYTES + SEALED_SOURCE_TAG_BYTES + 1
 _URI_EXTENSION = {
     "source": {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"},
     "thumbnail": {".jpg", ".jpeg", ".png"},
@@ -226,11 +228,16 @@ def _validate_sealed_source(value: object, *, servable: bool) -> None:
     if len(text) > SEALED_SOURCE_MAX_CHARS or not SEALED_SOURCE_PATTERN.fullmatch(text):
         raise DeidViolation("SEALED_SOURCE must be base64url without padding")
     try:
-        decoded = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+        decoded = b64url_decode(text)
     except (binascii.Error, ValueError) as error:
         raise DeidViolation("SEALED_SOURCE must be base64url without padding") from error
     if len(decoded) < SEALED_SOURCE_MIN_BYTES:
         raise DeidViolation("SEALED_SOURCE is too short to be a sealed source")
+
+
+def b64url_decode(value: str) -> bytes:
+    """Decode base64url with or without padding; raises binascii.Error/ValueError."""
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _uri_is_under_prefix(uri: str, prefixes: Iterable[str]) -> bool:

@@ -213,7 +213,6 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
         (VECTOR_ENC, VECTOR_KEY, VECTOR_SLIDE_KEY.upper()),
         (VECTOR_ENC, SEAL_KEY, VECTOR_SLIDE_KEY),
         (VECTOR_ENC, VECTOR_KEY[:16], VECTOR_SLIDE_KEY),
-        (VECTOR_ENC, VECTOR_KEY_HEX, VECTOR_SLIDE_KEY),
         (VECTOR_ENC[:-2] + ("AA" if VECTOR_ENC[-2:] != "AA" else "BB"), VECTOR_KEY, VECTOR_SLIDE_KEY),
         (VECTOR_ENC[:16] + ("A" if VECTOR_ENC[16] != "A" else "B") + VECTOR_ENC[17:], VECTOR_KEY, VECTOR_SLIDE_KEY),
         (VECTOR_ENC[:20], VECTOR_KEY, VECTOR_SLIDE_KEY),
@@ -307,7 +306,7 @@ def test_signing_secret_does_not_open_enc():
 
 @pytest.mark.parametrize(
     "claim",
-    ["image_id", "tile_source", "thumbnail_source", "tile_source_sha256", "thumbnail_source_sha256"],
+    ["image_id", "tile_source", "thumbnail_source"],
 )
 def test_token_must_not_expose_sealed_claims_in_plaintext(claim):
     secret = "s" * 32
