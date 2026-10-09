@@ -22,7 +22,7 @@ import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import aiosqlite
 import boto3
@@ -57,6 +57,7 @@ from . import annotations as annotation_store
 from .auth import scoped_user_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
+from .deid import SLIDE_KEY_PATTERN
 from .research import _load_manifest, _similar_slides_for_model, search_regions_for_agent
 
 logger = logging.getLogger(__name__)
@@ -108,12 +109,18 @@ class ViewportContext(BaseModel):
     viewer_generation: int | None = Field(default=None, ge=0)
 
 
+# The assistant addresses slides only by opaque slide key (the service's
+# slide_id field); an image ID is rejected before it can reach a model prompt,
+# a stored proposal or the annotation store.
+SlideKey = Annotated[str, Field(pattern=SLIDE_KEY_PATTERN.pattern)]
+
+
 class EmbeddingContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: Literal["quiltnet"]
     scope: Literal["study"]
-    slide_ids: list[str] = Field(default_factory=list, max_length=200)
+    slide_ids: list[SlideKey] = Field(default_factory=list, max_length=200)
 
 
 class AgentContext(BaseModel):
@@ -122,7 +129,7 @@ class AgentContext(BaseModel):
     study_id: str = Field(min_length=1, max_length=200)
     patient_id: str = Field(min_length=1, max_length=200)
     sample_id: str | None = Field(default=None, max_length=200)
-    slide_id: str = Field(min_length=1, max_length=200)
+    slide_id: SlideKey
     stain_name: str | None = Field(default=None, max_length=100)
     match_level: str | None = Field(default=None, max_length=100)
     filters: dict[str, Any] = Field(default_factory=dict)
@@ -176,7 +183,7 @@ class ActionOutcome(BaseModel):
 class CommitAnnotationsRequest(BaseModel):
     source_fingerprint: str = Field(min_length=8, max_length=512)
     viewer_generation: int | None = Field(default=None, ge=0)
-    slide_id: str = Field(min_length=1, max_length=200)
+    slide_id: SlideKey
 
 
 @dataclass

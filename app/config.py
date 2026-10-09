@@ -4,8 +4,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .constants import DEFAULT_WAREHOUSE_ID as _DEFAULT_WAREHOUSE_ID
-
 
 def _aws_profile(key: str, fallback: str = "") -> str:
     """Read a value from the [ecs] section of ~/.aws/credentials, if present."""
@@ -53,16 +51,39 @@ def _env_json_file_map(name: str) -> dict[str, str]:
 
 @dataclass
 class Settings:
+    release_id: str = field(default_factory=lambda: _env_str("WSI_RELEASE_ID"))
+    image_git_sha: str = field(default_factory=lambda: _env_str("IMAGE_GIT_SHA"))
+    serving_contract_version: str = field(
+        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v6")
+    )
+    # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
+    wsi_auth_previous_secret: str = field(
+        default_factory=lambda: _env_str("WSI_AUTH_PREVIOUS_SECRET")
+    )
+    # Standard base64 of the 32-byte AES-256-GCM key that opens the `enc`
+    # claim. Shared only with the data provider that seals slide sources; the
+    # cBioPortal backend never holds it. Required: startup fails without it.
+    wsi_source_seal_key: str = field(
+        default_factory=lambda: _env_str("WSI_SOURCE_SEAL_KEY"), repr=False
+    )
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
-    # Deprecated compatibility setting. Pixel routes always require a v2
+    # Deprecated compatibility setting. Pixel routes always require a
     # capability; this value is intentionally ignored by app.main.
     wsi_auth_required: bool = field(default_factory=lambda: _env_bool("WSI_AUTH_REQUIRED", True))
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )
-    wsi_study_mapping_table: str = field(default_factory=lambda: _env_str("WSI_STUDY_MAPPING_TABLE"))
+    # URI prefixes are an additional publication/privacy boundary. Keep these
+    # empty for generic local development; production deployments must set
+    # both allowlists explicitly before serving tiles.
+    wsi_allowed_source_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_PREFIXES", "")
+    )
+    wsi_allowed_thumbnail_prefixes: list[str] = field(
+        default_factory=lambda: _env_csv("WSI_ALLOWED_THUMBNAIL_PREFIXES", "")
+    )
 
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
     aws_access_key_id: str = field(default_factory=lambda: _env_str("AWS_ACCESS_KEY_ID", _aws_profile("aws_access_key_id")))
@@ -119,6 +140,9 @@ class Settings:
     thumbnail_prewarm_uri: str = field(
         default_factory=lambda: _env_str("THUMBNAIL_PREWARM_URI")
     )
+    thumbnail_prewarm_required: bool = field(
+        default_factory=lambda: _env_bool("THUMBNAIL_PREWARM_REQUIRED", False)
+    )
 
     # Redis tile cache
     redis_url: str = field(default_factory=lambda: _env_str("REDIS_URL", "redis://redis:6379"))
@@ -172,17 +196,7 @@ class Settings:
         )
     )
 
-    # Offline preparation tooling only (never read by the FastAPI runtime).
-    databricks_warehouse_id: str = field(
-        default_factory=lambda: _env_str("DATABRICKS_WAREHOUSE_ID", _DEFAULT_WAREHOUSE_ID)
-    )
-    use_canonical_association_table: bool = field(
-        default_factory=lambda: _env_bool("USE_CANONICAL_ASSOCIATION_TABLE", True)
-    )
-    allow_legacy_association_fallback: bool = field(
-        default_factory=lambda: _env_bool("ALLOW_LEGACY_ASSOCIATION_FALLBACK", False)
-    )
-    patient_cache_ttl: int = field(default_factory=lambda: _env_int("PATIENT_CACHE_TTL", 86_400))
+    # Block cache
     blockcache_path: str = field(default_factory=lambda: _env_str("BLOCKCACHE_PATH", ""))
     blockcache_block_size: int = field(default_factory=lambda: _env_int("BLOCKCACHE_BLOCK_SIZE", 8 * 1024 * 1024))
     blockcache_max_bytes: int = field(default_factory=lambda: _env_int("BLOCKCACHE_MAX_BYTES", 0))
@@ -196,12 +210,10 @@ class Settings:
 
     annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
     annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
-    keycloak_jwks_url: str = field(default_factory=lambda: _env_str("KEYCLOAK_JWKS_URL"))
     annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
     annotation_local_development: bool = field(
         default_factory=lambda: _env_bool("ANNOTATION_LOCAL_DEVELOPMENT", False)
     )
-    oncokb_api_token: str = field(default_factory=lambda: _env_str("ONCOKB_API_TOKEN"))
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
     agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
     agent_model: str = field(

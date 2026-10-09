@@ -31,9 +31,12 @@ jobs:
           set -euo pipefail
           container_id="$(docker run --detach --rm \
             --env WSI_AUTH_SECRET=0123456789abcdef0123456789abcdef \
+            --env WSI_SOURCE_SEAL_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= \
             --env REDIS_URL= \
             --env N_WORKERS=1 \
             --env CORS_ORIGINS=https://triage-beta.cbioportal.aws.mskcc.org \
+            --env WSI_ALLOWED_SOURCE_PREFIXES=s3://example.invalid/reef-slides/ \
+            --env WSI_ALLOWED_THUMBNAIL_PREFIXES=s3://example.invalid/wsi-thumbnails/ \
             --publish 18080:8080 tile-server:ci)"
           cleanup() {
             docker logs "$container_id" || true
@@ -66,9 +69,7 @@ jobs:
   # See: https://docs.docker.com/build/ci/github-actions/multi-platform/
   build:
     needs: container-smoke
-    if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      github.repository == 'cBioPortal/cbioportal-tile-server'
+    if: github.event_name == 'push' && github.repository == 'cBioPortal/cbioportal-tile-server'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -127,9 +128,7 @@ jobs:
   # it. latest is generated automatically for a valid semver tag push.
   publish:
     needs: build
-    if: >-
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      github.repository == 'cBioPortal/cbioportal-tile-server'
+    if: github.event_name == 'push' && github.repository == 'cBioPortal/cbioportal-tile-server'
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
@@ -145,7 +144,6 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=sha,format=long
             type=ref,event=branch
             type=ref,event=tag
             type=semver,pattern={{version}}

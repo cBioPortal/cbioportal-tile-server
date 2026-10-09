@@ -1,6 +1,6 @@
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from app.slides import SlideCache
 
@@ -70,6 +70,22 @@ def test_same_slide_operations_are_serialized():
 
     assert all(not thread.is_alive() for thread in threads)
     assert peak == 1
+
+
+def test_run_uncached_uses_a_fresh_direct_reader():
+    slide = MagicMock()
+    with patch(
+        "app.slides._open_slide",
+        return_value=(slide, None),
+    ) as open_slide:
+        cache = SlideCache(1)
+        assert cache.run_uncached("s3://bucket/slide.svs", lambda value: value) is slide
+
+    open_slide.assert_called_once_with(
+        "s3://bucket/slide.svs",
+        ANY,
+        use_block_cache=False,
+    )
 
 
 def test_concurrent_cold_open_calls_opener_once():

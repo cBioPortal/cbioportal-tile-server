@@ -5,9 +5,13 @@ from types import SimpleNamespace
 import pytest
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app import agent
 from app import annotations as annotation_store
+
+SLIDE_A = "a" * 32
+SLIDE_B = "b" * 32
 
 
 def make_context() -> agent.AgentContext:
@@ -15,12 +19,12 @@ def make_context() -> agent.AgentContext:
         study_id="study-a",
         patient_id="patient-a",
         sample_id="sample-a",
-        slide_id="slide-a",
+        slide_id=SLIDE_A,
         filters={"stain_filter": "hne"},
         slide_metadata={"magnification": "20x"},
         patient_context={"sample": {"sample_id": "sample-a"}},
         embedding_context=agent.EmbeddingContext(
-            provider="quiltnet", scope="study", slide_ids=["slide-a", "slide-b"]
+            provider="quiltnet", scope="study", slide_ids=[SLIDE_A, SLIDE_B]
         ),
         viewport=agent.ViewportContext(
             slide_width=1000,
@@ -37,6 +41,18 @@ def make_context() -> agent.AgentContext:
     )
 
 
+
+@pytest.mark.parametrize("image_id", ["470775", "slide-a", "S12-34567"])
+def test_agent_accepts_only_opaque_slide_keys(image_id):
+    context = make_context().model_dump()
+    with pytest.raises(ValidationError):
+        agent.AgentContext(**{**context, "slide_id": image_id})
+    with pytest.raises(ValidationError):
+        agent.EmbeddingContext(provider="quiltnet", scope="study", slide_ids=[SLIDE_A, image_id])
+    with pytest.raises(ValidationError):
+        agent.CommitAnnotationsRequest(source_fingerprint="source-v2", slide_id=image_id)
+
+
 def test_agent_input_preserves_embedding_context():
     request = agent.ChatRequest(
         session_id="session-a", message="Summarize this", context=make_context()
@@ -47,7 +63,7 @@ def test_agent_input_preserves_embedding_context():
     assert prompt["current_context"]["embedding_context"] == {
         "provider": "quiltnet",
         "scope": "study",
-        "slide_ids": ["slide-a", "slide-b"],
+        "slide_ids": [SLIDE_A, SLIDE_B],
     }
 
 
@@ -92,7 +108,7 @@ async def test_postgres_action_insert_binds_datetime(monkeypatch):
                 "session_id": "session-a",
                 "action_type": "viewer_action",
                 "study_id": "study-a",
-                "slide_id": "slide-a",
+                "slide_id": SLIDE_A,
                 "payload_json": "{}",
                 "status": "pending",
                 "created_at": agent._as_postgres_datetime(
@@ -136,7 +152,7 @@ async def test_bedrock_similar_slides_does_not_relabel_another_model(monkeypatch
             "slides": [
                 {
                     "study_id": "study-a",
-                    "slide_id": "slide-a",
+                    "slide_id": SLIDE_A,
                     "similar_slides": [
                         {"slide_id": "titan-slide", "model": "reef_v2_titan"},
                     ],
@@ -561,7 +577,7 @@ async def test_annotation_commit_is_atomic_and_idempotent(agent_db):
     request = agent.CommitAnnotationsRequest(
         source_fingerprint="source-v2-fingerprint",
         viewer_generation=3,
-        slide_id="slide-a",
+        slide_id=SLIDE_A,
     )
     first = await agent._commit_annotations(result["proposal_id"], "user-a", request)
     second = await agent._commit_annotations(result["proposal_id"], "user-a", request)
@@ -570,7 +586,7 @@ async def test_annotation_commit_is_atomic_and_idempotent(agent_db):
     assert second.idempotent is True
     assert first.action.status == "completed"
     assert [item.id for item in first.annotations] == [item.id for item in second.annotations]
-    assert len(await annotation_store._list_sqlite("slide-a", "study-a", "user-a")) == 1
+    assert len(await annotation_store._list_sqlite(SLIDE_A, "study-a", "user-a")) == 1
 
 
 @pytest.mark.asyncio
@@ -594,14 +610,14 @@ async def test_annotation_commit_rejects_stale_source_without_writing(agent_db):
     request = agent.CommitAnnotationsRequest(
         source_fingerprint="different-source-v2",
         viewer_generation=3,
-        slide_id="slide-a",
+        slide_id=SLIDE_A,
     )
 
     with pytest.raises(HTTPException) as error:
         await agent._commit_annotations(result["proposal_id"], "user-a", request)
 
     assert error.value.status_code == 409
-    assert await annotation_store._list_sqlite("slide-a", "study-a", "user-a") == []
+    assert await annotation_store._list_sqlite(SLIDE_A, "study-a", "user-a") == []
     proposal = await agent._get_action(result["proposal_id"], "user-a")
     assert proposal is not None and proposal.status == "pending"
 
@@ -650,10 +666,10 @@ async def test_annotation_commit_rolls_back_all_rows_on_failure(agent_db, monkey
     request = agent.CommitAnnotationsRequest(
         source_fingerprint="source-v2-fingerprint",
         viewer_generation=3,
-        slide_id="slide-a",
+        slide_id=SLIDE_A,
     )
     with pytest.raises(RuntimeError, match="simulated"):
         await agent._commit_annotations(result["proposal_id"], "user-a", request)
-    assert await annotation_store._list_sqlite("slide-a", "study-a", "user-a") == []
+    assert await annotation_store._list_sqlite(SLIDE_A, "study-a", "user-a") == []
     proposal = await agent._get_action(result["proposal_id"], "user-a")
     assert proposal is not None and proposal.status == "pending"

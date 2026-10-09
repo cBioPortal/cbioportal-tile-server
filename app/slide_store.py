@@ -38,15 +38,20 @@ def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     The source URL must be a full s3:// URI supplied by cBioPortal.
     """
     if not slide_id.startswith("s3://"):
-        raise FileNotFoundError(f"Slide not found: {slide_id!r} (expected s3:// URI)")
+        raise FileNotFoundError("Slide not found (expected s3:// URI)")
     without_scheme = slide_id[5:]
     bucket, _, key = without_scheme.partition("/")
     if not bucket or not key:
-        raise FileNotFoundError(f"Malformed slide URI: {slide_id!r}")
+        raise FileNotFoundError("Malformed slide URI")
     return bucket, key, s3_opts()
 
 
-def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
+def open_slide(
+    slide_id: str,
+    logger: Any,
+    cache_identity: str | None = None,
+    use_block_cache: bool = True,
+) -> tuple[TiffSlide, Any]:
     """
     Open a TiffSlide and return (slide, fileobj).
 
@@ -56,7 +61,7 @@ def open_slide(slide_id: str, logger: Any) -> tuple[TiffSlide, Any]:
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        cache_dir = cache_directory_for_slide(slide_id)
+        cache_dir = cache_directory_for_slide(slide_id, cache_identity) if use_block_cache else None
         if cache_dir is not None:
             cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)

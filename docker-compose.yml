@@ -20,15 +20,17 @@ services:
 
       # ── WSI capability authentication ────────────────────────────────────
       WSI_AUTH_SECRET: ${WSI_AUTH_SECRET:?WSI_AUTH_SECRET must be set}
+      # Opens the capability's sealed source; standard base64 of 32 bytes.
+      WSI_SOURCE_SEAL_KEY: ${WSI_SOURCE_SEAL_KEY:?WSI_SOURCE_SEAL_KEY must be set}
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
       WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
       WSI_ALLOWED_SOURCE_SCHEMES: ${WSI_ALLOWED_SOURCE_SCHEMES:-s3}
+      # Keep the online service on the same de-identification boundary as the
+      # study-file exporter. Every deployment must provide both allowlists.
+      WSI_ALLOWED_SOURCE_PREFIXES: ${WSI_ALLOWED_SOURCE_PREFIXES:?WSI_ALLOWED_SOURCE_PREFIXES must be set}
+      WSI_ALLOWED_THUMBNAIL_PREFIXES: ${WSI_ALLOWED_THUMBNAIL_PREFIXES:?WSI_ALLOWED_THUMBNAIL_PREFIXES must be set}
       CACHE_MISS_RATE_LIMIT_PER_MINUTE: ${CACHE_MISS_RATE_LIMIT_PER_MINUTE:-1200}
-      # ── Databricks / thumbnail namespace (dev overrides only) ───────────
-      WSI_THUMBNAIL_REGISTRY_TABLE: ${WSI_THUMBNAIL_REGISTRY_TABLE:-cdsi_prod.pathology_data_mining.slide_thumbnail_registry}
-      WSI_CANONICAL_ASSOCIATION_TABLE: ${WSI_CANONICAL_ASSOCIATION_TABLE:-cdsi_prod.pathology_data_mining.canonical_slide_associations}
-      WSI_SUMMARY_TABLE: ${WSI_SUMMARY_TABLE:-cdsi_prod.pathology_data_mining.sample_wsi_summary}
-      WSI_STAIN_CLASSIFICATION_TABLE: ${WSI_STAIN_CLASSIFICATION_TABLE:-cdsi_prod.pathology_data_mining.slide_stain_classification}
+      # ── Thumbnail namespace (dev overrides only) ────────────────────────
       THUMBNAIL_MANIFEST_URI: ${THUMBNAIL_MANIFEST_URI:-}
 
       # ── Tile settings ─────────────────────────────────────────────────────
@@ -51,13 +53,9 @@ services:
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
 
-      # ── OncoKB — register at oncokb.org/account/settings to get a token ──
-      ONCOKB_API_TOKEN: ${ONCOKB_API_TOKEN:-}
-
       # ── Annotation API ────────────────────────────────────────────────────
       ANNOTATION_DATABASE_URL: ${ANNOTATION_DATABASE_URL:-}
       ANNOTATION_DB_PATH: /data/annotations.db
-      KEYCLOAK_JWKS_URL: ${KEYCLOAK_JWKS_URL:-}
       ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
       # Dev-only compatibility for seeded rows when cBioPortal uses its
       # synthetic local-development capability subject.
@@ -109,7 +107,7 @@ services:
         limits:
           memory: ${APP_MEMORY_LIMIT:-4g}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
       interval: 30s
       timeout: 5s
       retries: 3

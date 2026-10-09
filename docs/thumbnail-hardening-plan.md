@@ -84,14 +84,16 @@ Add a batch generator that:
 4. uploads that JPEG to object storage
 5. writes the manifest after the batch completes
 
-Failures should be recorded separately so the manifest contains only valid,
-published artifacts. Slurm workers should render into bounded task shards and
-write result files only; a dependent publisher should serialize registry
-updates and publish the manifest after all workers reach a terminal state.
+Failures should be recorded separately, but any failure must keep the prior
+manifest in place: a reduced manifest is never an accepted release. Slurm
+workers should render into bounded task shards and write result files only; a
+dependent publisher should serialize registry updates and publish a new
+manifest only after every inventory row has a current, complete asset.
 
 The default operational shape is 2,000 slides per task, at most 480 array
-tasks, two concurrent tasks, and a 600-second timeout per slide. Use an
-explicit retry run for rows whose registry status is `failed`.
+tasks, two concurrent tasks, and a 600-second timeout per slide. Missing,
+failed, and stale registry rows are retried automatically; a canary `--limit`
+run cannot publish a manifest.
 
 ### 4. Runtime serving rules (historical proposal only)
 
