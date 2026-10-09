@@ -548,7 +548,6 @@ def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
     try:
         validate_artifact_uri(
             source,
-            image_id=str(claims.get("image_id") or ""),
             kind="source" if operation == "tile" else "thumbnail",
             prefixes=(
                 settings.wsi_allowed_source_prefixes

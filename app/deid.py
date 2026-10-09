@@ -105,8 +105,8 @@ _PLAINTEXT_SOURCE_FIELDS = ("IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL")
 # Ciphertext columns: random base64url can look like a date or labelled MRN, so
 # they are shape-checked instead of text-scanned.
 _CIPHERTEXT_FIELDS = {"sealed_source"}
-# Canonical opaque keys from the v10 pipeline are built from slide_key hex,
-# which can contain YYYYMMDD-looking runs.
+# Canonical opaque keys are built from slide_key hex, which can contain
+# YYYYMMDD-looking runs.
 _OPAQUE_KEY_PATTERNS = {
     "part_key": re.compile(r"^part:[0-9a-f]{32}$"),
     "block_key": re.compile(r"^block:[0-9a-f]{32}$"),
@@ -117,7 +117,7 @@ _OPAQUE_KEY_PATTERNS = {
 # Opaque keys a timeline LINKOUT may carry as query parameters.
 _LINKOUT_OPAQUE_PARAMS = {
     "specimenKey": _OPAQUE_KEY_PATTERNS["specimen_key"],
-    "slideKey": re.compile(r"^[0-9a-f]{32}$"),
+    "slideKey": SLIDE_KEY_PATTERN,
 }
 
 
@@ -241,10 +241,8 @@ def _uri_is_under_prefix(uri: str, prefixes: Iterable[str]) -> bool:
 def validate_artifact_uri(
     uri: object,
     *,
-    image_id: str,
     kind: str,
     prefixes: Iterable[str] = (),
-    related_identifiers: Iterable[str] = (),
 ) -> None:
     """Validate a source/thumbnail URI without exposing source identifiers."""
     value = _text(uri)
@@ -282,7 +280,6 @@ def validate_artifact_uri(
     # may use a different artifact key. The approved prefix and identifier
     # checks below are the privacy boundary; they must not be bypassed by a
     # user-controlled query or path traversal.
-    lowered = (value + " " + decoded_path).lower()
     # Approved object-store roots are deployment-controlled release boundaries;
     # their folder names may contain pipeline dates. Identifiers remain
     # forbidden regardless of prefix.
@@ -297,10 +294,6 @@ def validate_artifact_uri(
         or _LABELLED_MRN.search(decoded_path)
     ):
         raise DeidViolation(f"identifier/date in {kind} URI")
-    for identifier in related_identifiers:
-        token = _text(identifier)
-        if token and token.lower() in lowered:
-            raise DeidViolation(f"related identifier in {kind} URI")
 
 
 def validate_wsi_public_row(row: Mapping[str, object]) -> None:

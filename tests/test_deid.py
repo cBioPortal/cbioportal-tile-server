@@ -26,14 +26,12 @@ def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
             "s3://slides/../patient-123.svs",
-            image_id="slide-1",
             kind="source",
             prefixes=("s3://slides/",),
         )
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
             "s3://other/slide-1.svs",
-            image_id="slide-1",
             kind="source",
             prefixes=("s3://slides/",),
         )
@@ -42,7 +40,6 @@ def test_artifact_uri_requires_an_approved_prefix_and_rejects_traversal():
 def test_artifact_uri_allows_pipeline_date_under_approved_prefix():
     validate_artifact_uri(
         "s3://pathology/2026-08-19/slide-1.svs",
-        image_id="slide-1",
         kind="source",
         prefixes=("s3://pathology/",),
     )
@@ -130,10 +127,8 @@ def test_public_wsi_row_rejects_compact_absolute_dates_and_encoded_identifiers()
     with pytest.raises(DeidViolation):
         validate_artifact_uri(
             "s3://slides/P-1%2FMRN%3A123456.svs",
-            image_id="slide-1",
             kind="source",
             prefixes=("s3://slides/",),
-            related_identifiers=("P-1",),
         )
 
 
