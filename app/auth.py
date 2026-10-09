@@ -253,22 +253,17 @@ def validate_scoped_capability(
 _bearer = HTTPBearer(auto_error=False)
 
 
-async def require_user(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+def _authenticate_scoped(
+    creds: HTTPAuthorizationCredentials | None, required_scopes: set[str]
 ) -> dict:
-    """Return the subject and study scope from an annotation capability."""
     if not settings.annotation_auth_enabled:
-        return {"sub": "dev-user", "groups": []}
+        return {"sub": "dev-user", "groups": [], "study_id": None, "scopes": set(required_scopes)}
     if creds is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing Authorization header",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    required_scopes = {"annotations:read"}
-    if request.method in {"POST", "PUT", "DELETE"}:
-        required_scopes.add("annotations:write")
     capability = None
     for secret in (settings.wsi_auth_secret, settings.wsi_auth_previous_secret):
         if not secret:
@@ -287,7 +282,34 @@ async def require_user(
     if capability is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid annotation capability",
+            detail="Invalid study capability",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return {"sub": capability["sub"], "groups": [], "study_id": capability["study_id"]}
+    return {
+        "sub": capability["sub"],
+        "groups": [],
+        "study_id": capability["study_id"],
+        "scopes": set(str(capability["scope"]).split()),
+    }
+
+
+def scoped_user_dependency(required_scopes: set[str]):
+    """FastAPI dependency requiring a study capability with ``required_scopes``."""
+
+    async def dependency(
+        creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    ) -> dict:
+        return _authenticate_scoped(creds, required_scopes)
+
+    return dependency
+
+
+async def require_user(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> dict:
+    """Return the subject and study scope from an annotation capability."""
+    required_scopes = {"annotations:read"}
+    if request.method in {"POST", "PUT", "DELETE"}:
+        required_scopes.add("annotations:write")
+    return _authenticate_scoped(creds, required_scopes)

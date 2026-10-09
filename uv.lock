@@ -2,7 +2,8 @@ version = 1
 revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
-    "python_full_version >= '3.12'",
+    "python_full_version >= '3.14'",
+    "python_full_version >= '3.12' and python_full_version < '3.14'",
     "python_full_version < '3.12'",
 ]
 
@@ -375,6 +376,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "fsspec" },
     { name = "gunicorn" },
+    { name = "httpx" },
     { name = "pillow" },
     { name = "prometheus-fastapi-instrumentator" },
     { name = "redis" },
@@ -387,7 +389,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pip-audit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -402,6 +403,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.111.0" },
     { name = "fsspec", specifier = ">=2024.3.0" },
     { name = "gunicorn", specifier = ">=22.0.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "prometheus-fastapi-instrumentator", specifier = ">=7.0.0" },
     { name = "redis", specifier = ">=5.0.0" },
@@ -414,7 +416,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.27" },
     { name = "pip-audit", specifier = ">=2.7" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = ">=0.23" },
@@ -1018,7 +1019,8 @@ name = "imagecodecs"
 version = "2026.6.6"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.12'",
+    "python_full_version >= '3.14'",
+    "python_full_version >= '3.12' and python_full_version < '3.14'",
 ]
 dependencies = [
     { name = "numpy", marker = "python_full_version >= '3.12'" },

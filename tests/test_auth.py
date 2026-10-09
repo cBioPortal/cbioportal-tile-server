@@ -496,7 +496,12 @@ def annotation_auth(monkeypatch):
 async def test_require_user_returns_the_capability_study(annotation_auth):
     token = make_token(annotation_auth, **scoped_claims())
     user = await require_user(_annotation_request("POST"), _bearer(token))
-    assert user == {"sub": "user@example.org", "groups": [], "study_id": "study-a"}
+    assert user == {
+        "sub": "user@example.org",
+        "groups": [],
+        "study_id": "study-a",
+        "scopes": {"annotations:read", "annotations:write"},
+    }
 
 
 async def test_require_user_needs_write_scope_to_modify(annotation_auth):
