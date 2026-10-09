@@ -54,15 +54,21 @@ class Settings:
     release_id: str = field(default_factory=lambda: _env_str("WSI_RELEASE_ID"))
     image_git_sha: str = field(default_factory=lambda: _env_str("IMAGE_GIT_SHA"))
     serving_contract_version: str = field(
-        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v3")
+        default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v6")
     )
     # WSI request authentication
     wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
     wsi_auth_previous_secret: str = field(
         default_factory=lambda: _env_str("WSI_AUTH_PREVIOUS_SECRET")
     )
+    # Standard base64 of the 32-byte AES-256-GCM key that opens the `enc`
+    # claim. Shared only with the data provider that seals slide sources; the
+    # cBioPortal backend never holds it. Required: startup fails without it.
+    wsi_source_seal_key: str = field(
+        default_factory=lambda: _env_str("WSI_SOURCE_SEAL_KEY"), repr=False
+    )
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
-    # Deprecated compatibility setting. Pixel routes always require a v2
+    # Deprecated compatibility setting. Pixel routes always require a
     # capability; this value is intentionally ignored by app.main.
     wsi_auth_required: bool = field(default_factory=lambda: _env_bool("WSI_AUTH_REQUIRED", True))
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
@@ -79,12 +85,10 @@ class Settings:
         default_factory=lambda: _env_csv("WSI_ALLOWED_THUMBNAIL_PREFIXES", "")
     )
 
-    # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
     aws_access_key_id: str = field(default_factory=lambda: _env_str("AWS_ACCESS_KEY_ID", _aws_profile("aws_access_key_id")))
     aws_secret_access_key: str = field(default_factory=lambda: _env_str("AWS_SECRET_ACCESS_KEY", _aws_profile("aws_secret_access_key")))
 
-    # Tile settings
     tile_size: int = field(default_factory=lambda: _env_int("TILE_SIZE", 256))
     jpeg_quality: int = field(default_factory=lambda: _env_int("JPEG_QUALITY", 85))
     max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 16_777_216))
@@ -204,7 +208,10 @@ class Settings:
     test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
     test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
 
-    # CORS
+    annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
+    annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
+    annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
+
     cors_origins: list[str] = field(
         default_factory=lambda: _env_csv(
             "CORS_ORIGINS",

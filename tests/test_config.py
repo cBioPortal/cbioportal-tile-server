@@ -20,7 +20,8 @@ def make_settings(**env):
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
                                    "CORS_", "CACHE_", "PATIENT_", "WSI_",
-                                   "IMAGE_", "SLIDE_S3_"))}
+                                   "IMAGE_", "SLIDE_S3_", "ANNOTATION_",
+                                   "KEYCLOAK_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -93,11 +94,23 @@ class TestOtherSettings:
         s = make_settings(
             WSI_RELEASE_ID="candidate-1",
             IMAGE_GIT_SHA="a" * 40,
-            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v3",
+            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v6",
         )
         assert s.release_id == "candidate-1"
         assert s.image_git_sha == "a" * 40
-        assert s.serving_contract_version == "wsi-serving-v3"
+        assert s.serving_contract_version == "wsi-serving-v6"
+
+    def test_serving_contract_version_default(self):
+        assert make_settings().serving_contract_version == "wsi-serving-v6"
+
+    def test_source_seal_key_reads_environment(self):
+        key = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
+        s = make_settings(WSI_SOURCE_SEAL_KEY=key)
+        assert s.wsi_source_seal_key == key
+        assert key not in repr(s)
+
+    def test_source_seal_key_defaults_empty(self):
+        assert make_settings().wsi_source_seal_key == ""
 
     def test_wsi_artifact_prefixes_read_environment(self):
         s = make_settings(
@@ -147,6 +160,10 @@ class TestOtherSettings:
         map_file.write_text('{"slide-a":"/app/testdata/slide-a.svs"}')
         s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
         assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
+
+    def test_annotation_database_url_from_env(self):
+        s = make_settings(ANNOTATION_DATABASE_URL="postgresql://user:pass@host/db")
+        assert s.annotation_database_url == "postgresql://user:pass@host/db"
 
     def test_cors_origins_parsed(self):
         s = make_settings(CORS_ORIGINS="https://a.example.com,https://b.example.com")

@@ -27,8 +27,9 @@ ENV PATH="/app/.venv/bin:$PATH"
 
 RUN groupadd --gid 1000 appuser \
     && useradd --uid 1000 --gid 1000 --no-create-home --shell /bin/false appuser
-# A fresh named volume mounted at this path inherits this ownership.
-RUN mkdir -p /cache/slide-blocks /cache/prometheus && chown -R appuser:appuser /cache
+# Fresh named volumes mounted at these paths inherit this ownership.
+RUN mkdir -p /cache/slide-blocks /cache/prometheus /data \
+    && chown -R appuser:appuser /cache /data
 ENV PROMETHEUS_MULTIPROC_DIR=/cache/prometheus
 USER appuser
 

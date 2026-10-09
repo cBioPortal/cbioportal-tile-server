@@ -16,6 +16,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Contract test-vector key (docs/wsi-deid-slide-key-contract.md, V6.1). Local
+# development only: sources sealed with it are readable by anyone.
+DEV_SOURCE_SEAL_KEY = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
+
 
 def _write_secure(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,10 +79,15 @@ def main(argv: list[str] | None = None) -> None:
         "WSI_AUTH_AUDIENCE=cbioportal-wsi",
         "WSI_AUTH_MAX_TTL=300",
         f"WSI_AUTH_SECRET={os.environ.get('WSI_AUTH_SECRET', 'local-dev-wsi-secret-change-me-32chars')}",
+        f"WSI_SOURCE_SEAL_KEY={os.environ.get('WSI_SOURCE_SEAL_KEY', DEV_SOURCE_SEAL_KEY)}",
         f"REDIS_PASSWORD={os.environ.get('REDIS_PASSWORD', 'local-dev-redis-password')}",
         "",
         "# ── Isolated S3 thumbnail namespace for development ────────────────",
         "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json",
+        "ANNOTATION_DB_PATH=/data/annotations.db",
+        "# Optional: point annotations at Lakebase/Postgres instead of local SQLite.",
+        "# ANNOTATION_DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>?sslmode=require",
+        "ANNOTATION_AUTH_ENABLED=true",
     ]
     output = args.output.expanduser().resolve()
     _write_secure(output, "\n".join(lines) + "\n")

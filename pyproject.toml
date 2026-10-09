@@ -32,8 +32,15 @@ dependencies = [
     # Tile cache (asyncio support is built-in since redis 5)
     "redis>=5.0.0",
 
+    # Sealed WSI capability claims (AES-256-GCM)
+    "cryptography>=42.0.0",
+
     # Observability (optional but useful)
     "prometheus-fastapi-instrumentator>=7.0.0",
+
+    # Annotation API storage
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
 ]
 
 [dependency-groups]
