@@ -31,6 +31,7 @@ jobs:
           set -euo pipefail
           container_id="$(docker run --detach --rm \
             --env WSI_AUTH_SECRET=0123456789abcdef0123456789abcdef \
+            --env WSI_SOURCE_SEAL_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= \
             --env REDIS_URL= \
             --env N_WORKERS=1 \
             --env CORS_ORIGINS=https://triage-beta.cbioportal.aws.mskcc.org \

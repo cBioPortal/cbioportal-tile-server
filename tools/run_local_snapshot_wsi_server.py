@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the source-bound local WSI pixel service."""
+"""Run the capability-bound local WSI pixel service."""
 
 from __future__ import annotations
 

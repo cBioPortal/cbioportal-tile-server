@@ -1,11 +1,18 @@
-"""Fail-closed checks for the de-identified WSI publication contract."""
+"""Fail-closed checks for the de-identified WSI publication contract.
+
+These checks are institution-neutral (dates, labelled MRNs, opaque slide keys).
+Site-specific identifier formats, such as specimen accession numbers, are the
+data provider's to reject before rows are published.
+"""
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from collections.abc import Iterable, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 _ABSOLUTE_DATE = re.compile(
@@ -28,6 +35,15 @@ _NAMED_MONTH_DATE = re.compile(
 )
 _COMPACT_DATE = re.compile(r"(?<!\d)(?:19|20)\d{6}(?!\d)")
 _LABELLED_MRN = re.compile(r"(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}")
+SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+# SEALED_SOURCE is base64url without padding of nonce(12) || AES-256-GCM
+# ciphertext (at least one byte) || tag(16), as carried in the capability's
+# `enc` claim.
+SEALED_SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+SEALED_SOURCE_MAX_CHARS = 4096
+SEALED_SOURCE_NONCE_BYTES = 12
+SEALED_SOURCE_TAG_BYTES = 16
+SEALED_SOURCE_MIN_BYTES = SEALED_SOURCE_NONCE_BYTES + SEALED_SOURCE_TAG_BYTES + 1
 _URI_EXTENSION = {
     "source": {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"},
     "thumbnail": {".jpg", ".jpeg", ".png"},
@@ -44,11 +60,14 @@ _FORBIDDEN_FIELDS = {
     "release_id",
     "procedure_date_days",
 }
+# Identifiers allowed to reach the browser without date/MRN text scanning.
+# slide_key is opaque hex and validated by SLIDE_KEY_PATTERN; image_id is
+# server-side only (contract wsi-serving-v6) and never appears in a public row.
 _APPROVED_IDENTIFIER_FIELDS = {
     "patient_id",
     "reference_sample_id",
     "sample_id",
-    "image_id",
+    "slide_key",
 }
 _WSI_NON_TEXT_FIELDS = {
     "is_hne",
@@ -59,11 +78,7 @@ _WSI_NON_TEXT_FIELDS = {
     "thumbnail_height",
     "tile_metadata_json",
 }
-_THUMBNAIL_CONTENT_TYPES = {
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-}
+_THUMBNAIL_CONTENT_TYPES = {"image/jpeg", "image/png"}
 _TILE_METADATA_FIELDS = {
     "dimensions",
     "levels",
@@ -82,6 +97,56 @@ _TILE_METADATA_FIELDS = {
     "thumbnail_max_decode_pixels",
     "source_fingerprint",
 }
+
+
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
+# Columns that must never reach cBioPortal (data_wsi.txt format v4): image_id
+# and the source/thumbnail URIs travel only inside SEALED_SOURCE and are
+# validated by validate_artifact_uri when the tile server opens it.
+_PLAINTEXT_SOURCE_FIELDS = ("IMAGE_ID", "SOURCE_URL", "THUMBNAIL_URL")
+# Ciphertext columns: random base64url can look like a date or labelled MRN, so
+# they are shape-checked instead of text-scanned.
+_CIPHERTEXT_FIELDS = {"sealed_source"}
+# Canonical opaque keys are built from slide_key hex, which can contain
+# YYYYMMDD-looking runs.
+_OPAQUE_KEY_PATTERNS = {
+    "part_key": re.compile(r"^part:[0-9a-f]{32}$"),
+    "block_key": re.compile(r"^block:[0-9a-f]{32}$"),
+    "specimen_key": re.compile(r"^(?:block|part|unmatched)::part:[0-9a-f]{32}::block:[0-9a-f]{32}$"),
+}
+
+
+# Opaque keys a timeline LINKOUT may carry as query parameters.
+_LINKOUT_OPAQUE_PARAMS = {
+    "specimenKey": _OPAQUE_KEY_PATTERNS["specimen_key"],
+    "slideKey": SLIDE_KEY_PATTERN,
+}
+
+
+def _assert_safe_linkout(field: str, value: object) -> None:
+    """Scan a link's path and each query value; skip only well-formed opaque keys.
+
+    An opaque hex key can contain a run that looks like a compact date
+    (e.g. ``...20190412...``), so scanning the whole URL rejects valid links.
+    Keys that do not match their exact opaque pattern are scanned like any
+    other value.
+    """
+    text = _text(value)
+    if not text:
+        return
+    parts = urlsplit(text)
+    _assert_safe_text(f"{field} path", unquote(parts.path))
+    _assert_safe_text(f"{field} fragment", unquote(parts.fragment))
+    for name, param in parse_qsl(parts.query, keep_blank_values=True):
+        pattern = _LINKOUT_OPAQUE_PARAMS.get(name)
+        if pattern and pattern.fullmatch(param):
+            continue
+        _assert_safe_text(f"{field} {name}", param)
+
+
+def _skips_date_scan(field: str, value: object) -> bool:
+    pattern = _OPAQUE_KEY_PATTERNS.get(field)
+    return bool(pattern and pattern.fullmatch(_text(value)))
 
 
 class DeidViolation(ValueError):
@@ -128,25 +193,51 @@ def _assert_safe_metadata_text(value: object, field: str = "TILE_METADATA_JSON")
         _assert_safe_text(field, value)
     elif isinstance(value, Mapping):
         for key, child in value.items():
+            if key == "source_fingerprint":
+                # A SHA-256 identity digest, not free text: its hex can
+                # contain an eight-digit run that looks like YYYYMMDD.
+                if not isinstance(child, str) or not _SHA256_HEX.fullmatch(child):
+                    raise DeidViolation(f"invalid {field}.{key}")
+                continue
             _assert_safe_metadata_text(child, f"{field}.{key}")
     elif isinstance(value, list):
         for index, child in enumerate(value):
             _assert_safe_metadata_text(child, f"{field}[{index}]")
 
 
-def _validate_thumbnail_content_type(uri: object, content_type: object) -> None:
-    value = _text(uri)
-    media_type = _text(content_type).lower()
-    if not value or not media_type:
+def _is_servable(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = _text(value).lower()
+    if text in {"", "false"}:
+        return False
+    if text == "true":
+        return True
+    raise DeidViolation("CAN_SERVE_TILES must be TRUE or FALSE")
+
+
+def _validate_sealed_source(value: object, *, servable: bool) -> None:
+    """Check SEALED_SOURCE shape without decrypting or echoing it."""
+    text = _text(value)
+    if not text:
+        if servable:
+            raise DeidViolation("SEALED_SOURCE is required when CAN_SERVE_TILES is TRUE")
         return
+    if not servable:
+        raise DeidViolation("SEALED_SOURCE must be empty when CAN_SERVE_TILES is not TRUE")
+    if len(text) > SEALED_SOURCE_MAX_CHARS or not SEALED_SOURCE_PATTERN.fullmatch(text):
+        raise DeidViolation("SEALED_SOURCE must be base64url without padding")
     try:
-        path = unquote(unquote(urlsplit(value).path))
-    except ValueError as error:
-        raise DeidViolation("malformed thumbnail URI") from error
-    extension = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
-    expected = _THUMBNAIL_CONTENT_TYPES.get(extension)
-    if expected is None or media_type != expected:
-        raise DeidViolation("thumbnail content type does not match URI")
+        decoded = b64url_decode(text)
+    except (binascii.Error, ValueError) as error:
+        raise DeidViolation("SEALED_SOURCE must be base64url without padding") from error
+    if len(decoded) < SEALED_SOURCE_MIN_BYTES:
+        raise DeidViolation("SEALED_SOURCE is too short to be a sealed source")
+
+
+def b64url_decode(value: str) -> bytes:
+    """Decode base64url with or without padding; raises binascii.Error/ValueError."""
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _uri_is_under_prefix(uri: str, prefixes: Iterable[str]) -> bool:
@@ -157,10 +248,8 @@ def _uri_is_under_prefix(uri: str, prefixes: Iterable[str]) -> bool:
 def validate_artifact_uri(
     uri: object,
     *,
-    image_id: str,
     kind: str,
     prefixes: Iterable[str] = (),
-    related_identifiers: Iterable[str] = (),
 ) -> None:
     """Validate a source/thumbnail URI without exposing source identifiers."""
     value = _text(uri)
@@ -198,7 +287,6 @@ def validate_artifact_uri(
     # may use a different artifact key. The approved prefix and identifier
     # checks below are the privacy boundary; they must not be bypassed by a
     # user-controlled query or path traversal.
-    lowered = (value + " " + decoded_path).lower()
     # Approved object-store roots are deployment-controlled release boundaries;
     # their folder names may contain pipeline dates. Identifiers remain
     # forbidden regardless of prefix.
@@ -213,26 +301,43 @@ def validate_artifact_uri(
         or _LABELLED_MRN.search(decoded_path)
     ):
         raise DeidViolation(f"identifier/date in {kind} URI")
-    for identifier in related_identifiers:
-        token = _text(identifier)
-        if token and token.lower() in lowered:
-            raise DeidViolation(f"related identifier in {kind} URI")
 
 
-def validate_wsi_public_row(
-    row: Mapping[str, object],
-    *,
-    source_prefixes: Iterable[str] = (),
-    thumbnail_prefixes: Iterable[str] = (),
-) -> None:
-    """Validate the exact fields projected into a public WSI study row."""
-    image_id = _text(row.get("IMAGE_ID"))
-    if not image_id:
-        raise DeidViolation("IMAGE_ID is required")
+def validate_wsi_public_row(row: Mapping[str, object]) -> None:
+    """Validate one public WSI study row (data_wsi.txt format v4).
+
+    SLIDE_KEY is required. IMAGE_ID, SOURCE_URL and THUMBNAIL_URL must be
+    absent or empty: sources are published only as SEALED_SOURCE, which is
+    required when CAN_SERVE_TILES is TRUE and empty otherwise. Every other
+    column is scanned for absolute dates and labelled MRNs. Violations name
+    the field, never its value.
+    """
+    slide_key = _text(row.get("SLIDE_KEY"))
+    if not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+        raise DeidViolation("SLIDE_KEY must be 32 lowercase hex characters")
+    for field, value in row.items():
+        if field.upper() in _PLAINTEXT_SOURCE_FIELDS and _text(value):
+            raise DeidViolation(
+                f"{field.upper()} is not allowed; sources are published only as SEALED_SOURCE"
+            )
+    _validate_sealed_source(
+        row.get("SEALED_SOURCE"), servable=_is_servable(row.get("CAN_SERVE_TILES"))
+    )
+    content_type = _text(row.get("THUMBNAIL_CONTENT_TYPE")).lower()
+    if content_type and content_type not in _THUMBNAIL_CONTENT_TYPES:
+        raise DeidViolation("unsupported THUMBNAIL_CONTENT_TYPE")
     for field, value in row.items():
         normalized_field = field.lower()
-        if normalized_field not in _APPROVED_IDENTIFIER_FIELDS and normalized_field not in _WSI_NON_TEXT_FIELDS:
+        if normalized_field in _CIPHERTEXT_FIELDS:
+            continue
+        if (
+            normalized_field not in _APPROVED_IDENTIFIER_FIELDS
+            and normalized_field not in _WSI_NON_TEXT_FIELDS
+            and not _skips_date_scan(normalized_field, value)
+        ):
             _assert_safe_text(field, value)
+        elif _LABELLED_MRN.search(_text(value)):
+            raise DeidViolation(f"labelled MRN in {field}")
         if field.upper() == "TILE_METADATA_JSON" and _text(value):
             try:
                 metadata = json.loads(_text(value))
@@ -246,27 +351,6 @@ def validate_wsi_public_row(
             if unknown and not set(metadata) <= {"width", "height"}:
                 raise DeidViolation("unknown TILE_METADATA_JSON field")
             _assert_safe_metadata_text(metadata)
-    related = (
-        row.get("PATIENT_ID"),
-        row.get("REFERENCE_SAMPLE_ID"),
-        row.get("SAMPLE_ID"),
-        row.get("BARCODE"),
-    )
-    validate_artifact_uri(
-        row.get("SOURCE_URL"),
-        image_id=image_id,
-        kind="source",
-        prefixes=source_prefixes,
-        related_identifiers=related,
-    )
-    _validate_thumbnail_content_type(row.get("THUMBNAIL_URL"), row.get("THUMBNAIL_CONTENT_TYPE"))
-    validate_artifact_uri(
-        row.get("THUMBNAIL_URL"),
-        image_id=image_id,
-        kind="thumbnail",
-        prefixes=thumbnail_prefixes,
-        related_identifiers=related,
-    )
 
 
 def validate_timeline_public_row(row: Mapping[str, object]) -> None:
@@ -275,20 +359,12 @@ def validate_timeline_public_row(row: Mapping[str, object]) -> None:
     for field, value in row.items():
         if field.upper() in forbidden or field.lower() in _FORBIDDEN_FIELDS:
             raise DeidViolation(f"forbidden timeline field: {field}")
-        if field.upper() == "IMAGE_IDS":
-            try:
-                image_ids = json.loads(_text(value))
-            except (TypeError, ValueError) as error:
-                raise DeidViolation("IMAGE_IDS must be a JSON array") from error
-            if (
-                not isinstance(image_ids, list)
-                or not image_ids
-                or any(not isinstance(image_id, str) or not image_id.strip() for image_id in image_ids)
-                or image_ids != sorted(set(image_ids))
-            ):
-                raise DeidViolation("IMAGE_IDS must be a sorted, unique string array")
-            continue
-        if field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
+        if field.upper() in {"IMAGE_ID", "IMAGE_IDS"}:
+            # Real slide identifiers are server-side only (wsi-serving-v6).
+            raise DeidViolation(f"forbidden timeline field: {field}")
+        if field.upper() == "LINKOUT":
+            _assert_safe_linkout(field, value)
+        elif field.upper() not in {"PATIENT_ID", "SAMPLE_ID"}:
             _assert_safe_text(field, value)
     for field in ("START_DATE", "STOP_DATE"):
         value = _text(row.get(field))

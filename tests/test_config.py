@@ -93,11 +93,23 @@ class TestOtherSettings:
         s = make_settings(
             WSI_RELEASE_ID="candidate-1",
             IMAGE_GIT_SHA="a" * 40,
-            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v3",
+            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v6",
         )
         assert s.release_id == "candidate-1"
         assert s.image_git_sha == "a" * 40
-        assert s.serving_contract_version == "wsi-serving-v3"
+        assert s.serving_contract_version == "wsi-serving-v6"
+
+    def test_serving_contract_version_default(self):
+        assert make_settings().serving_contract_version == "wsi-serving-v6"
+
+    def test_source_seal_key_reads_environment(self):
+        key = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
+        s = make_settings(WSI_SOURCE_SEAL_KEY=key)
+        assert s.wsi_source_seal_key == key
+        assert key not in repr(s)
+
+    def test_source_seal_key_defaults_empty(self):
+        assert make_settings().wsi_source_seal_key == ""
 
     def test_wsi_artifact_prefixes_read_environment(self):
         s = make_settings(

@@ -1,15 +1,16 @@
 """URL-bound cBioPortal WSI pixel service.
 
 The service deliberately has no clinical metadata, hierarchy, search, or
-image-id lookup. cBioPortal supplies an exact source URL and a short-lived
-slide capability; this process validates the capability and serves pixels.
+image-id lookup. cBioPortal issues a short-lived slide capability whose
+encrypted claim carries the exact source URLs; this process validates and
+decrypts the capability and serves pixels. Browsers never supply or see a
+source URL.
 """
 
 from __future__ import annotations
 
 import asyncio
 import errno
-import hmac
 import json
 import logging
 import random
@@ -33,7 +34,9 @@ from tifffile import TiffFileError
 
 from . import cache as tile_cache
 from .auth import (
+    WSI_AUTH_VERSION,
     InvalidWsiToken,
+    decode_source_seal_key,
     source_cache_identity,
     source_digest,
     validate_wsi_auth_configuration,
@@ -76,6 +79,8 @@ logger = logging.getLogger(__name__)
 _slides: SlideCache | None = None
 _image_operation_semaphore: asyncio.Semaphore | None = None
 _thumbnail_fetch_semaphore: asyncio.Semaphore | None = None
+# Decoded once at startup; lifespan refuses to start without a valid key.
+_source_seal_key: bytes | None = None
 
 
 class _SingleFlight:
@@ -298,7 +303,12 @@ async def _run_with_miss_lock_lease(cache_key: str, token: str, producer):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore
+    global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore, _source_seal_key
+    try:
+        _source_seal_key = decode_source_seal_key(settings.wsi_source_seal_key)
+    except InvalidWsiToken:
+        logger.error("WSI_SOURCE_SEAL_KEY must be standard base64 of exactly 32 bytes")
+        raise RuntimeError("WSI source seal key is not configured") from None
     _slides = SlideCache(capacity=settings.max_open_slides)
     _image_operation_semaphore = asyncio.Semaphore(settings.max_image_operations)
     _thumbnail_fetch_semaphore = asyncio.Semaphore(settings.thumbnail_fetch_concurrency)
@@ -372,6 +382,7 @@ async def require_wsi_capability(request: Request, call_next):
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
+            seal_key=_source_seal_key,
         )
     except InvalidWsiToken:
         if not settings.wsi_auth_previous_secret:
@@ -382,6 +393,7 @@ async def require_wsi_capability(request: Request, call_next):
                 settings.wsi_auth_previous_secret,
                 settings.wsi_auth_audience,
                 settings.wsi_auth_max_ttl,
+                seal_key=_source_seal_key,
             )
         except InvalidWsiToken:
             # Preserve the same response for an invalid token regardless of
@@ -390,8 +402,6 @@ async def require_wsi_capability(request: Request, call_next):
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
-    if claims.get("wsi_auth_version") != 2:
-        return Response(status_code=403, content="slide-scoped capability is required")
     request.state.wsi_claims = claims
     return await call_next(request)
 
@@ -526,22 +536,18 @@ def _claims(request: Request) -> dict:
     return claims
 
 def _slide_rate_limit_scope(claims: dict) -> str:
-    return f"{claims['study_id']}\0{claims['image_id']}"
+    return f"{claims['study_id']}\0{claims['slide_key']}"
 
 
-
-def _authorize_source(request: Request, source: str, operation: str) -> tuple[str, dict]:
-    source = _allowed_source(source)
+def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
+    """Return the capability-sealed source for `operation` and its claims."""
     claims = _claims(request)
-    if claims.get("wsi_auth_version") != 2:
-        raise HTTPException(status_code=403, detail="slide-scoped capability is required")
-    claim_name = "tile_source_sha256" if operation == "tile" else "thumbnail_source_sha256"
-    if not hmac.compare_digest(source_digest(source), claims[claim_name]):
-        raise HTTPException(status_code=403, detail="source is outside capability")
+    source = _allowed_source(
+        claims.get("tile_source" if operation == "tile" else "thumbnail_source")
+    )
     try:
         validate_artifact_uri(
             source,
-            image_id=str(claims.get("image_id") or ""),
             kind="source" if operation == "tile" else "thumbnail",
             prefixes=(
                 settings.wsi_allowed_source_prefixes
@@ -554,12 +560,13 @@ def _authorize_source(request: Request, source: str, operation: str) -> tuple[st
     return source, claims
 
 
-def _source_from_request(request: Request, query_source: str | None) -> str:
-    header_source = request.headers.get("x-wsi-source", "").strip()
-    query_source = (query_source or "").strip()
-    if header_source and query_source and not hmac.compare_digest(header_source, query_source):
-        raise HTTPException(status_code=400, detail="conflicting source bindings")
-    return header_source or query_source
+def _reject_client_source(request: Request, query_source: str | None) -> None:
+    """Refuse browser-supplied source bindings; the capability carries them."""
+    if query_source is not None or "x-wsi-source" in request.headers:
+        raise HTTPException(
+            status_code=400,
+            detail="client-supplied source bindings are not accepted",
+        )
 
 
 def _run_slide_operation(
@@ -717,7 +724,7 @@ def _readiness_status() -> tuple[int, dict]:
     payload = {
         "status": "ok",
         "auth_required": True,
-        "auth_contract_version": 2,
+        "auth_contract_version": WSI_AUTH_VERSION,
         "n_workers": settings.n_workers,
         "release_id": settings.release_id,
         "image_git_sha": settings.image_git_sha,
@@ -728,6 +735,7 @@ def _readiness_status() -> tuple[int, dict]:
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
+            decode_source_seal_key(settings.wsi_source_seal_key),
         )
         if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
             raise InvalidWsiToken("WSI artifact allowlists are not configured")
@@ -736,7 +744,7 @@ def _readiness_status() -> tuple[int, dict]:
                 raise InvalidWsiToken("WSI release ID is not configured")
             if not re.fullmatch(r"[0-9a-fA-F]{40}", settings.image_git_sha):
                 raise InvalidWsiToken("WSI image git SHA is not a full commit")
-            if settings.serving_contract_version != "wsi-serving-v3":
+            if settings.serving_contract_version != "wsi-serving-v6":
                 raise InvalidWsiToken("unsupported WSI serving contract version")
         return 200, payload
     except InvalidWsiToken:
@@ -747,7 +755,11 @@ def _readiness_status() -> tuple[int, dict]:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "n_workers": settings.n_workers, "auth_contract_version": 2}
+    return {
+        "status": "ok",
+        "n_workers": settings.n_workers,
+        "auth_contract_version": WSI_AUTH_VERSION,
+    }
 
 
 @app.get("/ready")
@@ -775,8 +787,8 @@ async def tile(
     y: int,
     source: str | None = Query(None),
 ):
-    source = _source_from_request(request, source)
-    source, claims = _authorize_source(request, source, "tile")
+    _reject_client_source(request, source)
+    source, claims = _authorize_source(request, "tile")
     source_fingerprint = claims.get("tile_source_fingerprint")
     cache_key = source_cache_identity(source, source_fingerprint)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
@@ -834,8 +846,8 @@ async def thumbnail(
     width: int = 256,
     height: int = 256,
 ):
-    source = _source_from_request(request, source)
-    source, claims = _authorize_source(request, source, "thumbnail")
+    _reject_client_source(request, source)
+    source, claims = _authorize_source(request, "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
     source_fingerprint = claims.get("thumbnail_source_fingerprint")
