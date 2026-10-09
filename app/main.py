@@ -79,6 +79,8 @@ logger = logging.getLogger(__name__)
 _slides: SlideCache | None = None
 _image_operation_semaphore: asyncio.Semaphore | None = None
 _thumbnail_fetch_semaphore: asyncio.Semaphore | None = None
+# Decoded once at startup; lifespan refuses to start without a valid key.
+_source_seal_key: bytes | None = None
 
 
 class _SingleFlight:
@@ -301,9 +303,9 @@ async def _run_with_miss_lock_lease(cache_key: str, token: str, producer):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore
+    global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore, _source_seal_key
     try:
-        decode_source_seal_key(settings.wsi_source_seal_key)
+        _source_seal_key = decode_source_seal_key(settings.wsi_source_seal_key)
     except InvalidWsiToken:
         logger.error("WSI_SOURCE_SEAL_KEY must be standard base64 of exactly 32 bytes")
         raise RuntimeError("WSI source seal key is not configured") from None
@@ -375,16 +377,12 @@ async def require_wsi_capability(request: Request, call_next):
     if not authorization.startswith("Bearer "):
         return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
     try:
-        seal_key = decode_source_seal_key(settings.wsi_source_seal_key)
-    except InvalidWsiToken:
-        return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
-    try:
         claims = validate_wsi_token(
             authorization[7:].strip(),
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
-            seal_key=seal_key,
+            seal_key=_source_seal_key,
         )
     except InvalidWsiToken:
         if not settings.wsi_auth_previous_secret:
@@ -395,7 +393,7 @@ async def require_wsi_capability(request: Request, call_next):
                 settings.wsi_auth_previous_secret,
                 settings.wsi_auth_audience,
                 settings.wsi_auth_max_ttl,
-                seal_key=seal_key,
+                seal_key=_source_seal_key,
             )
         except InvalidWsiToken:
             # Preserve the same response for an invalid token regardless of
@@ -404,8 +402,6 @@ async def require_wsi_capability(request: Request, call_next):
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
-    if claims.get("wsi_auth_version") != WSI_AUTH_VERSION:
-        return Response(status_code=403, content="slide-scoped capability is required")
     request.state.wsi_claims = claims
     return await call_next(request)
 
@@ -546,8 +542,6 @@ def _slide_rate_limit_scope(claims: dict) -> str:
 def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
     """Return the capability-sealed source for `operation` and its claims."""
     claims = _claims(request)
-    if claims.get("wsi_auth_version") != WSI_AUTH_VERSION:
-        raise HTTPException(status_code=403, detail="slide-scoped capability is required")
     source = _allowed_source(
         claims.get("tile_source" if operation == "tile" else "thumbnail_source")
     )

@@ -605,6 +605,7 @@ def wsi_auth_settings(monkeypatch):
     monkeypatch.setattr(main_module.settings, "wsi_auth_secret", WSI_SECRET)
     monkeypatch.setattr(main_module.settings, "wsi_auth_previous_secret", "")
     monkeypatch.setattr(main_module.settings, "wsi_source_seal_key", SEAL_KEY_B64)
+    monkeypatch.setattr(main_module, "_source_seal_key", SEAL_KEY)
     monkeypatch.setattr(main_module.settings, "wsi_auth_audience", "cbioportal-wsi")
     monkeypatch.setattr(main_module.settings, "wsi_auth_max_ttl", 300)
     monkeypatch.setattr(main_module.settings, "wsi_allowed_source_schemes", ["s3", "file"])
@@ -924,23 +925,6 @@ class TestCapabilityRoutes:
                 response = await client.get(
                     "/tiles/zxy/0/0/0",
                     headers=_bearer(make_v4_token(WSI_SECRET, wsi_auth_version=3)),
-                )
-
-        assert response.status_code == 401
-        get_tile.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("seal_key", ["", "c2hvcnQ="])
-    async def test_capability_is_rejected_without_valid_seal_key(
-        self, wsi_auth_settings, monkeypatch, seal_key
-    ):
-        monkeypatch.setattr(main_module.settings, "wsi_source_seal_key", seal_key)
-        get_tile = AsyncMock(return_value=b"tile")
-        transport = httpx.ASGITransport(app=main_module.app)
-        with patch.object(main_module.tile_cache, "get_tile", new=get_tile):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.get(
-                    "/tiles/zxy/0/0/0", headers=_bearer(make_v4_token(WSI_SECRET))
                 )
 
         assert response.status_code == 401
