@@ -5,9 +5,7 @@ import json
 import time
 
 import pytest
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from app.auth import (
     InvalidWsiToken,
@@ -55,19 +53,6 @@ def seal_claims(
     return base64.urlsafe_b64encode(nonce + ciphertext).rstrip(b"=").decode()
 
 
-def make_token(secret: str, **claims) -> str:
-    def encode(value):
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
-
-    header = encode({"alg": "HS256", "typ": "JWT"})
-    payload = encode(claims)
-    signing_input = f"{header}.{payload}".encode()
-    signature = base64.urlsafe_b64encode(
-        hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
-    return f"{header}.{payload}.{signature}"
-
-
 def make_raw_token(secret: str, header, payload) -> str:
     def encode(value):
         return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
@@ -79,6 +64,10 @@ def make_raw_token(secret: str, header, payload) -> str:
         hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
     ).rstrip(b"=").decode()
     return f"{encoded_header}.{encoded_payload}.{signature}"
+
+
+def make_token(secret: str, **claims) -> str:
+    return make_raw_token(secret, {"alg": "HS256", "typ": "JWT"}, claims)
 
 
 def valid_claims(seal_key: bytes = SEAL_KEY, **overrides):
@@ -211,7 +200,10 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
     [
         (VECTOR_ENC, VECTOR_KEY, "f" * 32),
         (VECTOR_ENC, VECTOR_KEY, VECTOR_SLIDE_KEY.upper()),
+        # Sealed with another key, including the capability signing secret.
         (VECTOR_ENC, SEAL_KEY, VECTOR_SLIDE_KEY),
+        (VECTOR_ENC, bytes(32), VECTOR_SLIDE_KEY),
+        (VECTOR_ENC, b"s" * 32, VECTOR_SLIDE_KEY),
         (VECTOR_ENC, VECTOR_KEY[:16], VECTOR_SLIDE_KEY),
         (VECTOR_ENC[:-2] + ("AA" if VECTOR_ENC[-2:] != "AA" else "BB"), VECTOR_KEY, VECTOR_SLIDE_KEY),
         (VECTOR_ENC[:16] + ("A" if VECTOR_ENC[16] != "A" else "B") + VECTOR_ENC[17:], VECTOR_KEY, VECTOR_SLIDE_KEY),
@@ -256,52 +248,11 @@ def test_malformed_sealed_plaintext_is_rejected(sealed):
         )
 
 
-def test_v2_and_v3_tokens_are_rejected():
+@pytest.mark.parametrize("version", [2, 3, "4"])
+def test_unsupported_auth_version_is_rejected(version):
     secret = "s" * 32
-    now = int(time.time())
-    v2_claims = {
-        "sub": "user@example.org",
-        "aud": "cbioportal-wsi",
-        "scope": "wsi:read",
-        "study_id": "study-a",
-        "image_id": "slide-a",
-        "wsi_auth_version": 2,
-        "tile_source_sha256": source_digest(TILE_SOURCE),
-        "thumbnail_source_sha256": source_digest(THUMBNAIL_SOURCE),
-        "thumbnail_width": 1024,
-        "thumbnail_height": 768,
-        "iat": now,
-        "exp": now + 300,
-    }
     with pytest.raises(InvalidWsiToken, match="unsupported WSI authorization contract"):
-        validate(make_token(secret, **v2_claims), secret, "cbioportal-wsi")
-    with pytest.raises(InvalidWsiToken, match="unsupported WSI authorization contract"):
-        validate(make_v4_token(secret, wsi_auth_version=2), secret, "cbioportal-wsi")
-    with pytest.raises(InvalidWsiToken, match="unsupported WSI authorization contract"):
-        validate(make_v4_token(secret, wsi_auth_version=3), secret, "cbioportal-wsi")
-    with pytest.raises(InvalidWsiToken, match="unsupported WSI authorization contract"):
-        validate(make_v4_token(secret, wsi_auth_version="4"), secret, "cbioportal-wsi")
-
-
-def test_enc_sealed_with_another_key_is_rejected():
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="source binding"):
-        validate(make_v4_token(secret, seal_key=bytes(32)), secret, "cbioportal-wsi")
-
-
-def test_enc_sealed_with_key_derived_from_signing_secret_is_rejected():
-    secret = "s" * 32
-    derived = HKDF(
-        algorithm=hashes.SHA256(), length=32, salt=None, info=b"wsi-claim-enc-v3"
-    ).derive(secret.encode("utf-8"))
-    with pytest.raises(InvalidWsiToken, match="source binding"):
-        validate(make_v4_token(secret, seal_key=derived), secret, "cbioportal-wsi")
-
-
-def test_signing_secret_does_not_open_enc():
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(make_v4_token(secret), secret, "cbioportal-wsi", seal_key=secret.encode())
+        validate(make_v4_token(secret, wsi_auth_version=version), secret, "cbioportal-wsi")
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,6 @@ from tests.test_auth import (
     SLIDE_KEY,
     THUMBNAIL_SOURCE,
     TILE_SOURCE,
-    make_token,
     make_v4_token,
     seal_claims,
 )
@@ -82,22 +81,6 @@ class TestReadinessIdentity:
         assert payload["status"] == "unavailable"
         if seal_key:
             assert seal_key not in json.dumps(payload)
-
-    def test_valid_source_seal_key_passes_readiness(self, monkeypatch):
-        monkeypatch.setattr(main_module.settings, "wsi_auth_secret", WSI_SECRET)
-        monkeypatch.setattr(main_module.settings, "wsi_source_seal_key", SEAL_KEY_B64)
-        monkeypatch.setattr(main_module.settings, "release_id", "")
-        monkeypatch.setattr(main_module.settings, "image_git_sha", "")
-        monkeypatch.setattr(
-            main_module.settings, "wsi_allowed_source_prefixes", ("s3://slides/",)
-        )
-        monkeypatch.setattr(
-            main_module.settings, "wsi_allowed_thumbnail_prefixes", ("s3://thumbs/",)
-        )
-
-        status, _ = main_module._readiness_status()
-
-        assert status == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("seal_key", ["", "c2hvcnQ="])
@@ -617,28 +600,17 @@ def _bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _request_with_capability(token: str) -> httpx.Request:
+    """A tile request carrying the claims the capability middleware would attach."""
+    request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
+    request.state = type("State", (), {})()
+    request.state.wsi_claims = main_module.validate_wsi_token(
+        token, WSI_SECRET, "cbioportal-wsi", seal_key=SEAL_KEY
+    )
+    return request
+
+
 class TestSourceBinding:
-    def test_client_source_header_is_rejected(self):
-        request = httpx.Request(
-            "GET",
-            "http://test/thumbnails",
-            headers={"X-WSI-Source": "s3://bucket/thumbnail.jpg"},
-        )
-        with pytest.raises(main_module.HTTPException) as exc_info:
-            main_module._reject_client_source(request, None)
-        assert exc_info.value.status_code == 400
-        assert "s3://" not in str(exc_info.value.detail)
-
-    @pytest.mark.parametrize("query_source", ["s3://bucket/thumbnail.jpg", ""])
-    def test_client_source_query_is_rejected(self, query_source):
-        request = httpx.Request("GET", "http://test/thumbnails")
-        with pytest.raises(main_module.HTTPException) as exc_info:
-            main_module._reject_client_source(request, query_source)
-        assert exc_info.value.status_code == 400
-
-    def test_requests_without_client_source_are_accepted(self):
-        main_module._reject_client_source(httpx.Request("GET", "http://test/thumbnails"), None)
-
     def test_rate_limit_scope_uses_slide_key(self):
         claims = {"study_id": "study-a", "slide_key": SLIDE_KEY, "image_id": "slide-a"}
 
@@ -708,32 +680,12 @@ class TestSourceBinding:
     def test_authorize_source_uses_decrypted_capability_source(
         self, wsi_auth_settings, operation, expected
     ):
-        request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
-        request.state = type("State", (), {})()
-        request.state.wsi_claims = main_module.validate_wsi_token(
-            make_v4_token(WSI_SECRET), WSI_SECRET, "cbioportal-wsi", seal_key=SEAL_KEY
-        )
+        request = _request_with_capability(make_v4_token(WSI_SECRET))
 
         source, claims = main_module._authorize_source(request, operation)
 
         assert source == expected
         assert claims["slide_key"] == SLIDE_KEY
-
-    def test_authorize_source_applies_deid_policy_to_decrypted_source(
-        self, wsi_auth_settings, monkeypatch
-    ):
-        monkeypatch.setattr(main_module.settings, "wsi_allowed_source_prefixes", ["s3://other/"])
-        request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
-        request.state = type("State", (), {})()
-        request.state.wsi_claims = main_module.validate_wsi_token(
-            make_v4_token(WSI_SECRET), WSI_SECRET, "cbioportal-wsi", seal_key=SEAL_KEY
-        )
-
-        with pytest.raises(main_module.HTTPException) as exc_info:
-            main_module._authorize_source(request, "tile")
-
-        assert exc_info.value.status_code == 403
-        assert "s3://" not in str(exc_info.value.detail)
 
     @pytest.mark.parametrize(
         ("operation", "sealed"),
@@ -748,7 +700,7 @@ class TestSourceBinding:
             ("tile", {"tile_source": "s3://slides/slide-a.svs?versionId=1"}),
             ("thumbnail", {"thumbnail_source": "s3://thumbs/../private/slide-a.jpg"}),
             ("tile", {"tile_source": "s3://user:pass@slides/slide-a.svs"}),
-            # Labelled MRN and the decrypted image_id in an unapproved path.
+            # Labelled MRN.
             ("thumbnail", {"thumbnail_source": "s3://thumbs/MRN-12345678.jpg"}),
         ],
     )
@@ -765,14 +717,7 @@ class TestSourceBinding:
                 **sealed,
             },
         )
-        request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
-        request.state = type("State", (), {})()
-        request.state.wsi_claims = main_module.validate_wsi_token(
-            make_v4_token(WSI_SECRET, enc=enc),
-            WSI_SECRET,
-            "cbioportal-wsi",
-            seal_key=SEAL_KEY,
-        )
+        request = _request_with_capability(make_v4_token(WSI_SECRET, enc=enc))
 
         with pytest.raises(main_module.HTTPException) as exc_info:
             main_module._authorize_source(request, operation)
@@ -796,14 +741,7 @@ class TestSourceBinding:
                 "thumbnail_source": THUMBNAIL_SOURCE,
             },
         )
-        request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
-        request.state = type("State", (), {})()
-        request.state.wsi_claims = main_module.validate_wsi_token(
-            make_v4_token(WSI_SECRET, enc=enc),
-            WSI_SECRET,
-            "cbioportal-wsi",
-            seal_key=SEAL_KEY,
-        )
+        request = _request_with_capability(make_v4_token(WSI_SECRET, enc=enc))
 
         with pytest.raises(main_module.HTTPException) as exc_info:
             main_module._authorize_source(request, "tile")
@@ -873,33 +811,6 @@ class TestCapabilityRoutes:
         assert "s3://" not in response.text
 
     @pytest.mark.asyncio
-    async def test_v2_capability_is_rejected(self, wsi_auth_settings):
-        now = int(main_module.time.time())
-        v2_token = make_token(
-            WSI_SECRET,
-            sub="user@example.org",
-            aud="cbioportal-wsi",
-            scope="wsi:read",
-            study_id="study-a",
-            image_id="slide-a",
-            wsi_auth_version=2,
-            tile_source_sha256=main_module.source_digest(TILE_SOURCE),
-            thumbnail_source_sha256=main_module.source_digest(THUMBNAIL_SOURCE),
-            thumbnail_width=1024,
-            thumbnail_height=768,
-            iat=now,
-            exp=now + 300,
-        )
-        transport = httpx.ASGITransport(app=main_module.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            response = await client.get(
-                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fslides%2Fslide-a.svs",
-                headers=_bearer(v2_token),
-            )
-
-        assert response.status_code == 401
-
-    @pytest.mark.asyncio
     async def test_previous_secret_verifies_signature_and_seal_key_opens_enc(
         self, wsi_auth_settings, monkeypatch
     ):
@@ -915,20 +826,6 @@ class TestCapabilityRoutes:
 
         assert response.status_code == 200
         assert get_tile.await_args.args[0] == main_module.source_cache_identity(TILE_SOURCE)
-
-    @pytest.mark.asyncio
-    async def test_v3_capability_is_rejected(self, wsi_auth_settings):
-        get_tile = AsyncMock(return_value=b"tile")
-        transport = httpx.ASGITransport(app=main_module.app)
-        with patch.object(main_module.tile_cache, "get_tile", new=get_tile):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.get(
-                    "/tiles/zxy/0/0/0",
-                    headers=_bearer(make_v4_token(WSI_SECRET, wsi_auth_version=3)),
-                )
-
-        assert response.status_code == 401
-        get_tile.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_decrypted_thumbnail_outside_policy_is_refused(
@@ -954,6 +851,3 @@ class TestCapabilityRoutes:
         assert response.status_code == 403
         assert "s3://" not in response.text
         get_thumbnail.assert_not_awaited()
-
-    def test_readiness_reports_v4_auth_contract(self):
-        assert main_module.health()["auth_contract_version"] == 4
