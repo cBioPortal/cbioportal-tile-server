@@ -9,6 +9,9 @@ Routes:
 
 Auth: all routes require a short-lived, study-scoped capability issued by
 cBioPortal via ``require_user()``.
+
+``slide_id`` carries the opaque slide key, never a pathology image ID; any
+other value is rejected so image IDs cannot reach annotation storage.
 """
 
 import json
@@ -21,12 +24,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from .auth import require_user
+from .deid import SLIDE_KEY_PATTERN
 from .config import settings
 from .annotation_db import close_pool, connection, migrate, open_pool
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/annotations", tags=["annotations"])
+
+SLIDE_KEY_REGEX = SLIDE_KEY_PATTERN.pattern
 
 _db_path: str = ""
 _db_url: str = ""
@@ -88,7 +94,7 @@ class AnnotationTarget(BaseModel):
 
 
 class AnnotationIn(BaseModel):
-    slide_id: str
+    slide_id: str = Field(..., pattern=SLIDE_KEY_REGEX, description="Opaque slide key")
     study_id: str
     body: AnnotationBody
     target: AnnotationTarget
@@ -382,7 +388,7 @@ async def _delete_postgres(annotation_id: str) -> None:
 
 @router.get("", response_model=list[AnnotationOut])
 async def list_annotations(
-    slide_id: str = Query(..., description="Slide image_id"),
+    slide_id: str = Query(..., pattern=SLIDE_KEY_REGEX, description="Opaque slide key"),
     study_id: str = Query(..., description="cBioPortal study ID"),
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:

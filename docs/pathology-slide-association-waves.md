@@ -1,26 +1,26 @@
-# Normalized WSI release flow
+# Normalized WSI snapshot flow
 
 The upstream pathology association dataset remains the source for pathology
 structure and slide facts. The Databricks/export pipeline emits the canonical
 study files; cBioPortal core resolves stable study, patient, and sample
-identifiers, validates all references, and writes one append-only release to
+identifiers, validates all references, and writes one complete snapshot to
 the normalized ClickHouse tables:
 
-- `wsi_release`
-- `wsi_release_patient`
+- `wsi_patient`
 - `wsi_part`
 - `wsi_block`
 - `wsi_slide`
 - `wsi_slide_placement`
 
-The release row is the visibility boundary. A retry receives a new release
-ID, and it is inserted only after all normalized rows have been inserted. Patient,
-sample, and slide IDs are scoped to the study; duplicate slide IDs carry a
-study-qualified source path. Unknown or mismatched study/patient/sample references, duplicate
-placements, and orphan slide associations are rejected before release.
+Blue/green database promotion is the visibility boundary. Build the inactive
+database from a fresh schema and import each snapshot once; discard and rebuild
+after a failed or repeated import. Patient, sample, and slide IDs are scoped to
+the study; duplicate slide IDs carry a study-qualified source path. Unknown or
+mismatched study/patient/sample references, duplicate placements, and orphan
+slide associations are rejected before import.
 
 cBioPortal assembles `GET /api/wsi/v2/hierarchy/{studyId}/{patientId}` from the
-active normalized release. The response contains only the nested WSI
+normalized snapshot. The response contains only the nested WSI
 structure and slide placement facts. Unmatched pathology is represented by a
 null `sampleId` and an explicit sample group; there is no `UNMATCHED` sample
 record and no flat `slide_associations` payload.
@@ -34,20 +34,18 @@ source URLs in the per-slide access bundle.
 
 ## Thumbnail artifact prerequisite
 
-The thumbnail artifact is prepared before the canonical association refresh by
-a separate scheduled batch process. The batch reads the slide inventory and
-source slides, writes master JPEGs to the S3/Dell ECS-compatible store, and
-populates `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with the
-artifact URI, `tile_metadata_json`, dimensions, content type, and a
-fingerprint embedded in the metadata JSON. The production canonical SQL is
-owned by `../pdm_databricks_pipelines` and joins the registry only when the
-source URI and fingerprint match the current preferred inventory. A rewritten
-object with the same ECS URL is consequently uncertified until it has been
-re-audited and its thumbnail regenerated.
+The thumbnail artifact is prepared before the association export by a
+separate scheduled batch outside this repository. The batch reads source
+slides, writes master JPEGs to the S3-compatible store, and records the
+artifact URI, `tile_metadata_json`, dimensions, content type, and a source
+fingerprint embedded in the metadata JSON. The export should use a thumbnail
+only when its source URI and fingerprint match the current source object, so
+an object rewritten in place at the same URL is treated as uncertified until
+its thumbnail is regenerated.
 
 The frontend is read-only and does not upload thumbnails. The tile-server
 on-demand worker is limited to development/rehearsal or controlled remediation;
-it does not publish registry rows and is not the production path.
+it is not the production path.
 
 Import the validated cBioPortal WSI study files through cBioPortal core:
 
@@ -57,4 +55,4 @@ metaImport.py -s /path/to/study
 
 The tile server does not write ClickHouse. Focused API checks are available
 with `uv run pytest`; the complete tile-server suite should pass after the
-core import has published a release.
+core import has loaded the snapshot.

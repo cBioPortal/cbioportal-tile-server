@@ -82,9 +82,46 @@ class TestOtherSettings:
         assert s.thumbnail_fetch_max_attempts == 2
         assert s.thumbnail_fetch_retry_delay_sec == 0.1
 
+    def test_thumbnail_prewarm_required_reads_environment(self):
+        assert make_settings().thumbnail_prewarm_required is False
+        assert make_settings(THUMBNAIL_PREWARM_REQUIRED="true").thumbnail_prewarm_required is True
+
     def test_wsi_auth_max_ttl_reads_environment(self):
         s = make_settings(WSI_AUTH_MAX_TTL="600")
         assert s.wsi_auth_max_ttl == 600
+
+    def test_release_identity_reads_environment(self):
+        s = make_settings(
+            WSI_RELEASE_ID="candidate-1",
+            IMAGE_GIT_SHA="a" * 40,
+            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v6",
+        )
+        assert s.release_id == "candidate-1"
+        assert s.image_git_sha == "a" * 40
+        assert s.serving_contract_version == "wsi-serving-v6"
+
+    def test_serving_contract_version_default(self):
+        assert make_settings().serving_contract_version == "wsi-serving-v6"
+
+    def test_source_seal_key_reads_environment(self):
+        key = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
+        s = make_settings(WSI_SOURCE_SEAL_KEY=key)
+        assert s.wsi_source_seal_key == key
+        assert key not in repr(s)
+
+    def test_source_seal_key_defaults_empty(self):
+        assert make_settings().wsi_source_seal_key == ""
+
+    def test_wsi_artifact_prefixes_read_environment(self):
+        s = make_settings(
+            WSI_ALLOWED_SOURCE_PREFIXES="s3://slides/, file:///app/testdata/",
+            WSI_ALLOWED_THUMBNAIL_PREFIXES="s3://thumbs/",
+        )
+        assert s.wsi_allowed_source_prefixes == [
+            "s3://slides/",
+            "file:///app/testdata/",
+        ]
+        assert s.wsi_allowed_thumbnail_prefixes == ["s3://thumbs/"]
 
     def test_max_image_operations_default(self):
         s = make_settings()
@@ -123,30 +160,6 @@ class TestOtherSettings:
         map_file.write_text('{"slide-a":"/app/testdata/slide-a.svs"}')
         s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
         assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
-
-    def test_databricks_warehouse_id_from_env(self):
-        s = make_settings(DATABRICKS_WAREHOUSE_ID="wh-test-123")
-        assert s.databricks_warehouse_id == "wh-test-123"
-
-    def test_use_canonical_association_table_defaults_true(self):
-        s = make_settings()
-        assert s.use_canonical_association_table is True
-
-    def test_use_canonical_association_table_can_be_disabled(self):
-        s = make_settings(USE_CANONICAL_ASSOCIATION_TABLE="false")
-        assert s.use_canonical_association_table is False
-
-    def test_allow_legacy_association_fallback_defaults_false(self):
-        s = make_settings()
-        assert s.allow_legacy_association_fallback is False
-
-    def test_allow_legacy_association_fallback_can_be_disabled(self):
-        s = make_settings(ALLOW_LEGACY_ASSOCIATION_FALLBACK="false")
-        assert s.allow_legacy_association_fallback is False
-
-    def test_allow_legacy_association_fallback_can_be_enabled(self):
-        s = make_settings(ALLOW_LEGACY_ASSOCIATION_FALLBACK="true")
-        assert s.allow_legacy_association_fallback is True
 
     def test_annotation_database_url_from_env(self):
         s = make_settings(ANNOTATION_DATABASE_URL="postgresql://user:pass@host/db")

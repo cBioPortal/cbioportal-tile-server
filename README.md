@@ -1,70 +1,114 @@
 # cbioportal-tile-server
 
-The cBioPortal WSI pixel service. This process serves only JPEG tiles and
-pre-rendered thumbnail artifacts; it does not know about patients, samples,
-studies, slide hierarchy, or image IDs.
+A tile server that lets cBioPortal display large images, such as digitized
+pathology slides, in a pan-and-zoom viewer. It reads images from S3-compatible
+object storage and serves deep-zoom JPEG tiles (`z/x/y`) and thumbnails to the
+cBioPortal frontend.
+
+At MSK, cBioPortal uses this service to show H&E and IHC whole-slide images
+alongside the patients and samples they were taken from.
+
+The service only handles pixels. It does not know about patients, samples,
+studies, slide hierarchy, or image IDs; cBioPortal owns that metadata and
+authorizes every request (see [Request flow](#request-flow)).
+
+## What it serves
+
+- **Image formats:** anything
+  [`tiffslide`](https://github.com/Bayer-Group/tiffslide) can open. That
+  includes whole-slide image formats such as Aperio SVS and Leica SCN, and
+  generic tiled/pyramidal TIFF, so the server is not limited to pathology
+  slides. Tiles are encoded as RGB JPEG, so RGB images are the best fit.
+  Formats `tiffslide` cannot open (for example DICOM and MIRAX) are not
+  supported.
+- **Tiles are generated on the fly.** No tile pyramid is precomputed. A source
+  image stores some resolution levels, but not necessarily one for every zoom
+  level the viewer requests. For each tile request, the server reads the
+  region from the coarsest source level that still meets the requested
+  resolution, downscales it to the tile size, encodes it as JPEG, and caches
+  it (in Redis, when configured) for subsequent requests.
+- **The only preprocessing is a one-time offline step per image** that
+  renders a thumbnail and records the image's tile metadata (dimensions and
+  resolution levels). cBioPortal marks an image as servable only after both
+  exist (see [Offline preparation](#offline-preparation)). The
+  server fetches those thumbnails and resizes them on request; it never
+  renders a thumbnail from the source image.
+- **Limit:** if an image lacks low-resolution levels, the most zoomed-out
+  tiles can exceed `MAX_DECODE_PIXELS`, and the server rejects them with HTTP
+  422 rather than decoding the full-resolution image.
 
 ## Request flow
 
 1. cBioPortal authenticates the user and checks study permissions.
-2. `GET /api/wsi/v2/slides/{studyId}/{imageId}/access` reads the materialized
-   slide row from the cBioPortal database and returns the exact tile source URL,
-   thumbnail artifact URL, tile metadata, and a short-lived Bearer capability.
-3. The browser sends that URL and capability to this service.
-4. The service verifies the capability's SHA-256 binding to the exact URL and
-   reads pixels from object storage.
+2. `GET /api/wsi/v2/slides/{studyId}/{slideKey}/access` reads the materialized
+   slide row from the cBioPortal database and returns tile metadata, thumbnail
+   dimensions, and a short-lived Bearer capability. The exact tile source URL
+   and thumbnail artifact URL are in the capability's `enc` claim, sealed by
+   the data provider with a key cBioPortal does not hold; neither the database
+   nor the response carries an `imageId` or source URL.
+3. The browser sends only that capability to this service.
+4. The service verifies the capability, opens `enc` with
+   `WSI_SOURCE_SEAL_KEY`, checks the URLs against the artifact policy, and
+   reads pixels from them in object storage.
 
 The tile server never resolves an image ID, queries cBioPortal metadata, or
-loads portal data files. A URL without a matching capability is
-rejected, even when the URL is otherwise reachable.
+loads portal data files. Client-supplied source URLs (`?source=` or
+`X-WSI-Source`) are rejected.
 
-## Production WSI artifact dataflow
+## Offline preparation
 
-Thumbnail generation and registry publication are an offline prerequisite to
-the API. They are not performed by the frontend or by the FastAPI request
-handlers. The production sequence is:
+Thumbnail generation and study-file export happen offline, before a slide can
+be served. Each deployment supplies its own preparation pipeline; this
+repository contains only the online service. Whatever produces the data, the
+tile server relies on this contract:
 
-1. A separate cron, Slurm, or equivalent scheduled job runs
-   `tools/run_thumbnail_pipeline_slurm.sh` (or an equivalent wrapper around
-   `tools/generate_slide_thumbnails.py`).
-2. The batch reads eligible `slide_inventory` rows and source slides from the
-   S3/Dell ECS-compatible store, writes immutable master JPEGs back to that
-   store, and upserts
-   `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` with
-   `artifact_uri`, `tile_metadata_json`, `width`, `height`, and
-   `content_type`.
-3. The thumbnail publisher automatically runs
-   `tools/generate_thumbnail_variants.py` after the master registry is
-   published. It creates 128×96 navigation derivatives under a
-   manifest-versioned prefix and publishes their serving pointers. The first
-   run adds the serving-pointer columns to the existing registry; reruns are
-   idempotent.
-4. The Databricks canonical-association job joins the source path to the
-   latest successful registry row and computes `can_serve_tiles`. The
-   canonical job must run only after the thumbnail batch has completed for the
-   input inventory (use a job dependency or completion watermark).
-5. The exporter carries `SOURCE_URL`, `TILE_METADATA_JSON`, `THUMBNAIL_URL`,
-   dimensions, and content type into `meta_wsi.txt`/`data_wsi.txt`.
-6. cBioPortal core imports that complete snapshot and is the sole ClickHouse
-   writer.
+1. Thumbnail JPEGs are written to object storage under a prefix listed in
+   `WSI_ALLOWED_THUMBNAIL_PREFIXES`; source slides live under
+   `WSI_ALLOWED_SOURCE_PREFIXES`.
+2. The pipeline seals each servable slide's `image_id`, tile source URL, and
+   thumbnail URL into `sealed_source` (the `enc` format above, keyed with
+   `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`).
+3. Each slide row in the cBioPortal WSI study files (`meta_wsi.txt`/
+   `data_wsi.txt`) carries `slide_key`, `sealed_source`,
+   `tile_metadata_json`, `thumbnail_width`, `thumbnail_height`, and
+   `thumbnail_content_type`, and never the `image_id` or URLs.
+   `tile_metadata_json` must pass
+   `app.metadata_contract.validate_tile_metadata`.
+4. cBioPortal core imports those files and is the sole ClickHouse writer. It
+   publishes `can_serve_tiles=true` only when every field is present, and
+   forwards `sealed_source` as the capability's `enc` claim.
+
+The tile server never reads the pipeline's tables, registries, manifests, or
+credentials; it sees only what the access bundle and capability token carry.
+A slide becomes servable after thumbnails are published, study files are
+exported, and cBioPortal core has imported them.
+
+### Modules shared with offline tooling
+
+Preparation pipelines may import `app.tiles`, `app.slide_store`,
+`app.identity`, `app.metadata_contract`, and `app.deid` so their thumbnails,
+tile metadata, and de-identification checks match what this service renders
+and enforces. Treat changes to those modules as contract changes: bump
+`IDENTITY_VERSION` or `TILE_METADATA_SCHEMA_VERSION` in `app/identity.py` when
+the rendered output or metadata shape changes, and call the change out in the
+pull request.
 
 The frontend is read-only: it requests the backend access bundle and then
-requests `/thumbnails`; it has no ECS/S3 upload credentials and never writes
-Databricks tables. `app/thumbnail_worker.py` is a controlled on-demand CLI
-that can write a generated JPEG to the configured S3/ECS-compatible location,
-but it does not update `slide_thumbnail_registry` and is not a production
-publication mechanism. Keep it limited to development, rehearsal, or explicit
-remediation.
+requests `/thumbnails`; it has no object-store upload credentials.
+`app/thumbnail_worker.py` is a controlled on-demand CLI that can write a
+generated JPEG to the configured S3-compatible location, but it is not a
+production publication mechanism. Keep it limited to development, rehearsal,
+or explicit remediation.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Public liveness probe |
-| GET | `/ready` | Public readiness probe (auth configuration only) |
+| GET | `/ready` | Public readiness probe (auth and artifact-policy configuration) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
-| GET | `/tiles/zxy/{z}/{x}/{y}?source=...` | Source-bound JPEG tile |
-| GET | `/thumbnails?source=...&width=...&height=...` | Source-bound thumbnail resize |
+| GET | `/tiles/zxy/{z}/{x}/{y}` | Capability-bound JPEG tile |
+| GET | `/thumbnails?width=...&height=...` | Capability-bound thumbnail resize |
 
 The same routes are available under `/wsi`. Every pixel request requires:
 
@@ -72,15 +116,26 @@ The same routes are available under `/wsi`. Every pixel request requires:
 Authorization: Bearer <cBioPortal slide capability>
 ```
 
-Capabilities are HMAC-SHA256 JWTs with `scope=wsi:read`,
-`wsi_auth_version=2`, `study_id`, `image_id`, exact source URL digests, bounded
-thumbnail dimensions, and an expiry no longer than `WSI_AUTH_MAX_TTL`.
+Capabilities are HMAC-SHA256 JWTs (signed with `WSI_AUTH_SECRET`) with
+`scope=wsi:read`, `wsi_auth_version=4`, `study_id`, an opaque `slide_key`,
+bounded thumbnail dimensions, an expiry no longer than `WSI_AUTH_MAX_TTL`, and
+an `enc` claim. `enc` is the slide's sealed source: base64url (no padding) of
+nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes), keyed with the raw
+32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`, over JSON
+`{"image_id":…,"tile_source":…,"thumbnail_source":…}`. The data provider seals
+it when it publishes the slide; cBioPortal stores and forwards it verbatim and
+cannot open it, so neither cBioPortal nor the browser sees the `image_id` or
+source URLs. The tile server decrypts it and applies the source/thumbnail URI
+policy (scheme, approved prefix, extension, identifier checks) before any read.
+Requests that supply a source themselves (`?source=` or `X-WSI-Source`) are
+rejected with `400`. See `../docs/wsi-deid-slide-key-contract.md`
+(`wsi-serving-v6`).
 `/health` and `/ready` intentionally remain public for orchestration probes.
 
 ## Runtime configuration
 
-The service needs only pixel storage, the shared capability secret, and an
-optional Redis cache:
+The service needs only pixel storage, the shared capability secret, the source
+seal key, and an optional Redis cache:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -88,9 +143,13 @@ optional Redis cache:
 | `AWS_ACCESS_KEY_ID` | — | Object-store access key |
 | `AWS_SECRET_ACCESS_KEY` | — | Object-store secret key |
 | `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with cBioPortal |
+| `WSI_AUTH_PREVIOUS_SECRET` | — | Optional prior secret during a bounded signing-key rotation |
+| `WSI_SOURCE_SEAL_KEY` | — | Required. Standard base64 of exactly 32 random bytes; opens the `enc` claim. Shared with the data provider that seals sources, never with cBioPortal. Startup fails without it |
 | `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
 | `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
+| `WSI_ALLOWED_SOURCE_PREFIXES` | empty | Comma-separated approved source URI prefixes; required for publication |
+| `WSI_ALLOWED_THUMBNAIL_PREFIXES` | empty | Comma-separated approved thumbnail URI prefixes; required for publication |
 | `REDIS_URL` | `redis://redis:6379` | Optional tile/thumbnail cache |
 | `THUMBNAIL_FETCH_CONCURRENCY` | `8` | Per-worker concurrent thumbnail object fetches |
 | `THUMBNAIL_FETCH_MAX_ATTEMPTS` | `2` | Total object-store read attempts per thumbnail request |
@@ -100,6 +159,7 @@ optional Redis cache:
 | `THUMBNAIL_S3_READ_TIMEOUT_SEC` | `5` | S3 object-read timeout |
 | `THUMBNAIL_S3_MAX_ATTEMPTS` | `2` | S3 client retry limit |
 | `THUMBNAIL_PREWARM_URI` | — | Optional stable thumbnail object used to prewarm each worker |
+| `THUMBNAIL_PREWARM_REQUIRED` | `false` | Refuse startup when the prewarm object cannot be read |
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `16777216` | Maximum on-demand tile decode |
@@ -116,19 +176,15 @@ optional Redis cache:
 | `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
 | `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
-| `ONCOKB_API_TOKEN` | — | Optional OncoKB token for annotation enrichment |
-| `WSI_THUMBNAIL_REGISTRY_TABLE` | `cdsi_prod.pathology_data_mining.slide_thumbnail_registry` | Three-part Unity Catalog table used by the offline thumbnail publisher |
-| `WSI_CANONICAL_ASSOCIATION_TABLE` | `cdsi_prod.pathology_data_mining.canonical_slide_associations` | Three-part table read by metadata and export tooling |
-| `WSI_SUMMARY_TABLE` | `cdsi_prod.pathology_data_mining.sample_wsi_summary` | Three-part summary table used by clinical-file tooling |
-| `WSI_STAIN_CLASSIFICATION_TABLE` | `cdsi_prod.pathology_data_mining.slide_stain_classification` | Approved offline H-Optimus release consumed by canonical stain routing |
 
-Thumbnail artifacts are generated offline by
-`tools/generate_slide_thumbnails.py` and their URL, dimensions, content type,
-and tile metadata are loaded into the cBioPortal WSI slide table. A slide is
+Thumbnail artifacts are generated offline (see
+[Offline preparation](#offline-preparation)); their dimensions, content
+type, tile metadata, and sealed source (which carries the URL) are loaded into
+the cBioPortal WSI slide table. A slide is
 published with `can_serve_tiles=false` until all of those fields are present.
 The online service does not generate thumbnails, consult a manifest, or write
-the registry. Production deployments must schedule the offline batch described
-above; an on-demand worker is not a substitute for registry publication.
+the registry. Production deployments must run an offline thumbnail batch; the
+on-demand worker is not a substitute.
 
 Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
 Redis is an optimization only; a cache outage does not change authorization.
@@ -155,123 +211,21 @@ miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ```bash
 python3 tools/write_dev_env.py
-printf 'WSI_AUTH_SECRET=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 24)" >> .env
+printf 'WSI_AUTH_SECRET=%s\nWSI_SOURCE_SEAL_KEY=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -base64 32)" "$(openssl rand -hex 24)" >> .env
 docker compose up --build
 ```
 
 The compose file is a local rehearsal. Configure the same secret, audience,
-and compatible TTL in cBioPortal and this service.
+and compatible TTL in cBioPortal and this service, and the same
+`WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
+produced.
 
-## Offline preparation
+## Local slide tests
 
-The backend data pipeline publishes one WSI release containing hierarchy rows
-plus the pixel contract fields (`source_url`, `tile_metadata_json`,
-`thumbnail_url`, dimensions, and content type). The thumbnail generator uses
-the same intrinsic tile metadata when creating the registry artifact. The
-exporter and SQL pipeline are intentionally offline tooling; none of their
-metadata clients are imported by the FastAPI runtime.
-
-Run the thumbnail batch as a separate scheduled process before the canonical
-Databricks refresh. The Slurm wrapper runs the navigation-variant job after
-master publication. For a standalone backfill or repair, run:
-
-```bash
-python3 tools/generate_thumbnail_variants.py \
-  --warehouse-id "$DATABRICKS_WAREHOUSE_ID" \
-  --variant-root-uri s3://mskmind-bkt/wsi-thumbnails/variants/nav-128x96
-```
-
-A successful run must publish both the object-store artifacts and the matching
-registry rows; writing only a JPEG or only a manifest is insufficient. Legacy
-successful rows with missing `tile_metadata_json` must be backfilled or
-regenerated before export.
-
-The cBioPortal ingestion boundary is the study-scoped `meta_wsi.txt` and
-`data_wsi.txt` pair. Export it from the canonical association table with:
-
-```bash
-python3 tools/export_materialized_hierarchy_snapshot.py \
-  --study-dir /path/to/study \
-  --study-id study_id
-```
-
-Load the exported files through the standard cBioPortal importer. The core
-importer validates and resolves the complete snapshot, writes the normalized
-ClickHouse hierarchy, and publishes its release manifest last:
-
-```bash
-metaImport.py -s /path/to/study
-# or, for a complete replacement snapshot:
-metaImport.py -d /path/to/wsi-update
-```
-
-The tile server is deliberately not a ClickHouse writer. It receives source
-URLs and tile metadata from cBioPortal's WSI access endpoint and serves the
-authorized pixel and thumbnail requests.
-
-### Image-assisted stain routing
-
-The offline stain-classifier publisher writes an approved release to
-`WSI_STAIN_CLASSIFICATION_TABLE`. The canonical association job joins the
-latest approved row by `image_id`, applies exact binary adjudications first,
-and then permits only high-confidence H&E-to-IHC promotions. Metadata IHC is
-never downgraded by the model; missing scores and ambiguous reviews retain
-metadata behavior. The resulting `is_hne`, `is_ihc`, and `slide_type` values
-are consumed by the normal WSI importer, ClickHouse hierarchy, and frontend
-filters. Tile authorization and pixel delivery remain unchanged.
-
-The canonical association table normalizes whitespace, control characters, and
-known stain aliases before emitting `stain_group` and `stain_name`. The source
-values remain available as `stain_group_raw` and `stain_name_raw`; ambiguous
-recuts, controls, and special stains are not silently forced into the binary
-H&E/IHC classes.
-
-Binary metadata precedence is explicit: valid manual labels win, FISH names
-remain non-binary unless manually adjudicated, recognized H&E/IHC groups win
-over contradictory names, and name inference is limited to blank groups. The
-reviewed exact `SSL H&E` pattern is promoted to H&E; other SSL patterns remain
-in the review queue. Run `tools/stain_metadata_audit.sql` against the source
-tables to inspect coverage, conflicts, and the ranked non-binary queue before
-publishing a release.
-
-For development or rehearsal, use the Databricks `dev` profile and its
-warehouse, and point the WSI tables at an isolated `cdsi_dev.wsi_test`
-schema. The dev materializer loads only the supplied snapshot and master
-thumbnail registry; it does not generate or publish thumbnail variants. Set
-`THUMBNAIL_MANIFEST_URI` to a separate object-store prefix such as
-`s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json`. The dev workspace does
-not expose the production PHI catalogs, so load a validated study snapshot and
-the offline registry with:
-
-```bash
-DATABRICKS_CONFIG_PROFILE=dev PYTHONPATH=. .venv/bin/python \
-  tools/materialize_dev_wsi_snapshot.py \
-  --meta-wsi /path/to/meta_wsi.txt \
-  --registry-jsonl /path/to/thumbnail-results.jsonl \
-  --namespace cdsi_dev.wsi_test \
-  --warehouse-id a52519fa662ce69d \
-  --artifact-root-uri s3://mskmind-bkt/wsi-thumbnails-dev/masters \
-  --manifest-uri s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json
-```
-
-This writes only the dev source, registry, canonical, and summary tables and
-publishes the supplied manifest below the separate `wsi-thumbnails-dev/`
-prefix. The materializer rejects registry rows whose artifact URI is not
-exactly below the dev artifact root, retains failed registry rows for
-diagnostics, and publishes only complete successful rows in the manifest. The
-production Databricks SQL templates remain available through
-`tools/run_wsi_pipelines.py` for a workspace with the production source
-catalogs; leaving the variables unset preserves production defaults.
-
-Beta does not require these dev tables. To prepare a beta study, run the
-exporter against the production canonical association table using a read-only
-Databricks identity, then import the resulting study files into the beta
-ClickHouse database. The imported `THUMBNAIL_URL` values point to the already
-published production S3 artifacts; beta does not connect to or write the
-production Databricks tables.
-
-For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
-issue a v2 capability whose source URL is the mounted file URI. The normal
+For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`,
+include `file:///app/testdata/` in both prefix allowlists, and issue a v4
+capability whose `enc` seals the mounted file URIs with `WSI_SOURCE_SEAL_KEY`
+(see `seal_claims` in `tests/test_auth.py`). The normal
 production default accepts only `s3` URLs.
 
 ## PHI-safe operation
@@ -305,9 +259,3 @@ The repository must provide the `DOCKER_HUB_USERNAME` and
 digest printed by the workflow (`@sha256:...`), not a mutable tag.  The
 workflow does not publish from pull requests or expose registry credentials to
 fork builds.
-
-## Databricks bundles
-
-- Root [databricks.yml](databricks.yml) manages the nightly WSI summary pipeline job.
-- [databricks/lakebase/README.md](databricks/lakebase/README.md) documents the
-  separate Lakebase bundle used to provision annotation storage.

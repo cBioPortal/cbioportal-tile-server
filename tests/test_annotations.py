@@ -3,6 +3,10 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
+
 from app import annotations
 from app.annotations import (
     AnnotationBody,
@@ -11,6 +15,8 @@ from app.annotations import (
     AnnotationTarget,
     AnnotationUpdate,
 )
+
+SLIDE_KEY = "0123456789abcdef0123456789abcdef"
 
 
 def user(
@@ -28,7 +34,7 @@ def user(
 
 def annotation_input(
     *,
-    slide_id: str = "slide-1",
+    slide_id: str = SLIDE_KEY,
     study_id: str = "study-1",
     visible_to: list[str] | None = None,
 ) -> AnnotationIn:
@@ -68,7 +74,7 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
     assert created.created_at
     assert created.updated_at
 
-    listed = await annotations.list_annotations("slide-1", "study-1", owner)
+    listed = await annotations.list_annotations(SLIDE_KEY, "study-1", owner)
     assert [item.id for item in listed] == [created.id]
 
     updated = await annotations.update_annotation(
@@ -86,7 +92,7 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
     assert updated.updated_at
 
     await annotations.delete_annotation(created.id, owner)
-    assert await annotations.list_annotations("slide-1", "study-1", owner) == []
+    assert await annotations.list_annotations(SLIDE_KEY, "study-1", owner) == []
 
 
 @pytest.mark.asyncio
@@ -99,16 +105,16 @@ async def test_annotation_visibility_honors_creator_groups_and_public_rows():
     public = await annotations.create_annotation(annotation_input(visible_to=[]), owner)
 
     outsider_rows = await annotations.list_annotations(
-        "slide-1", "study-1", user("outsider")
+        SLIDE_KEY, "study-1", user("outsider")
     )
     assert [item.id for item in outsider_rows] == [public.id]
 
     group_rows = await annotations.list_annotations(
-        "slide-1", "study-1", user("reviewer", groups=["pathology"])
+        SLIDE_KEY, "study-1", user("reviewer", groups=["pathology"])
     )
     assert {item.id for item in group_rows} == {group.id, public.id}
 
-    owner_rows = await annotations.list_annotations("slide-1", "study-1", owner)
+    owner_rows = await annotations.list_annotations(SLIDE_KEY, "study-1", owner)
     assert {item.id for item in owner_rows} == {private.id, group.id, public.id}
 
 
@@ -125,7 +131,7 @@ async def test_annotation_writes_require_creator_and_matching_study_scope():
 
     with pytest.raises(HTTPException) as wrong_study_list:
         await annotations.list_annotations(
-            "slide-1", "study-1", user("owner", study_id="study-2")
+            SLIDE_KEY, "study-1", user("owner", study_id="study-2")
         )
     assert wrong_study_list.value.status_code == 403
 
@@ -172,3 +178,18 @@ async def test_annotation_update_uses_atomic_optimistic_locking():
     assert len(successes) == 1
     assert len(conflicts) == 1
     assert conflicts[0].status_code == 409
+
+
+@pytest.mark.parametrize("slide_id", ["470775", "slide-1", "S12-34567", "0123456789ABCDEF0123456789ABCDEF"])
+def test_annotations_accept_only_opaque_slide_keys(slide_id):
+    with pytest.raises(ValidationError):
+        annotation_input(slide_id=slide_id)
+
+    app = FastAPI()
+    app.include_router(annotations.router)
+    app.dependency_overrides[annotations.require_user] = lambda: user("owner")
+    response = TestClient(app).get(
+        "/annotations", params={"slide_id": slide_id, "study_id": "study-1"}
+    )
+    assert response.status_code == 422
+
