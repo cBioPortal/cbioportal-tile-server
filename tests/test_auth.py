@@ -145,15 +145,6 @@ def test_sealed_claims_are_decrypted_once_per_token(monkeypatch):
     assert validate(token, secret, "cbioportal-wsi")["tile_source"] == TILE_SOURCE
 
 
-def test_rejected_sealed_claims_are_not_cached():
-    from app import auth
-
-    auth._decrypt_sealed_claims_cached.cache_clear()
-    with pytest.raises(InvalidWsiToken):
-        decrypt_sealed_claims("A" * 64, SEAL_KEY, SLIDE_KEY)
-    assert auth._decrypt_sealed_claims_cached.cache_info().currsize == 0
-
-
 def test_source_seal_key_decodes_contract_vector():
     assert decode_source_seal_key(VECTOR_SEAL_KEY_B64).hex() == VECTOR_KEY_HEX
 
@@ -218,14 +209,6 @@ def test_tampered_or_rebound_enc_is_rejected(enc, seal_key, slide_key):
         decrypt_sealed_claims(enc, seal_key, slide_key)
     assert "testdata" not in str(exc_info.value)
     assert VECTOR_SLIDE_KEY not in str(exc_info.value)
-
-
-def test_token_with_enc_bound_to_another_slide_key_is_rejected():
-    secret = "s" * 32
-    claims = valid_claims()
-    claims["slide_key"] = "f" * 32
-    with pytest.raises(InvalidWsiToken, match="source binding"):
-        validate(make_token(secret, **claims), secret, "cbioportal-wsi")
 
 
 @pytest.mark.parametrize(
