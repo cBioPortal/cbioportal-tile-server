@@ -99,7 +99,6 @@ def test_timeline_linkout_allows_opaque_keys_with_date_like_hex():
         "/patient/wsiHESlides?studyId=s&caseId=P-1&sampleId=P-1-T01"
         "&stainFilter=hne&matchLevel=PART"
         f"&specimenKey={specimen_key.replace(':', '%3A')}"
-        f"&slideKey={hex_with_date}"
     )
     validate_timeline_public_row({"PATIENT_ID": "P-1", "START_DATE": "-14", "LINKOUT": linkout})
 
@@ -111,7 +110,6 @@ def test_timeline_linkout_allows_opaque_keys_with_date_like_hex():
         "/patient/wsiHESlides?studyId=s&caseId=P-1&note=2019-04-12",
         # a specimenKey that is not a well-formed opaque key is scanned like any value
         "/patient/wsiHESlides?studyId=s&caseId=P-1&specimenKey=20190412",
-        "/patient/wsiHESlides?studyId=s&caseId=P-1&slideKey=MRN%3A123456",
         # dates in the path are rejected
         "/patient/2019-04-12/wsiHESlides?studyId=s",
     ],

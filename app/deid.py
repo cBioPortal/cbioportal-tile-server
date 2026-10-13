@@ -119,7 +119,6 @@ _OPAQUE_KEY_PATTERNS = {
 # Opaque keys a timeline LINKOUT may carry as query parameters.
 _LINKOUT_OPAQUE_PARAMS = {
     "specimenKey": _OPAQUE_KEY_PATTERNS["specimen_key"],
-    "slideKey": SLIDE_KEY_PATTERN,
 }
 
 
