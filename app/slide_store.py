@@ -35,7 +35,7 @@ def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     """
     Return (bucket, key, s3_opts) for a source URL.
 
-    The source URL must be a full s3:// URI supplied by cBioPortal.
+    The source URL must be a full s3:// URI opened from the sealed capability.
     """
     if not slide_id.startswith("s3://"):
         raise FileNotFoundError("Slide not found (expected s3:// URI)")

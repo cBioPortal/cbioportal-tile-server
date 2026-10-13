@@ -753,7 +753,7 @@ def _readiness_status() -> tuple[int, dict]:
             settings.wsi_auth_secret,
             settings.wsi_auth_audience,
             settings.wsi_auth_max_ttl,
-            decode_source_seal_key(settings.wsi_source_seal_key),
+            _source_seal_key,
         )
         if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
             raise InvalidWsiToken("WSI artifact allowlists are not configured")

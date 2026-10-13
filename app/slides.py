@@ -21,7 +21,6 @@ from typing import Callable, Iterator, TypeVar
 
 from tiffslide import TiffSlide
 
-from .config import settings
 from .blockcache import cache_lease_for_slide, purge_slide_cache, touch_slide_cache
 from .metrics import SLIDE_OPEN_ERRORS, SLIDE_OPEN_SECONDS
 from .slide_store import SlideEntry as _Entry
@@ -30,30 +29,6 @@ from .slide_store import open_slide as _open_slide
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
-
-
-def _resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
-    """
-    Return (bucket, key, s3_opts) for a source URL.
-
-    The URL is supplied by cBioPortal, e.g.
-    "s3://mskmind-bkt/reef-slides/3735444.svs".
-    """
-    if not slide_id.startswith("s3://"):
-        raise FileNotFoundError("Slide not found (expected s3:// URI)")
-    without_scheme = slide_id[5:]
-    bucket, _, key = without_scheme.partition("/")
-    if not bucket or not key:
-        raise FileNotFoundError("Malformed slide URI")
-
-    opts: dict = {}
-    if settings.aws_endpoint_url:
-        opts["endpoint_url"] = settings.aws_endpoint_url
-    if settings.aws_access_key_id:
-        opts["key"] = settings.aws_access_key_id
-    if settings.aws_secret_access_key:
-        opts["secret"] = settings.aws_secret_access_key
-    return bucket, key, opts
 
 
 @dataclass
