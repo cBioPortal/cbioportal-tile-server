@@ -62,10 +62,10 @@ class TestReadinessIdentity:
         assert status == 503
         assert payload["status"] == "unavailable"
 
-    @pytest.mark.parametrize("seal_key", ["", "c2hvcnQ=", SEAL_KEY.hex()])
+    @pytest.mark.parametrize("seal_key", [None, b"short", SEAL_KEY.hex().encode()])
     def test_invalid_source_seal_key_fails_readiness(self, monkeypatch, seal_key):
         monkeypatch.setattr(main_module.settings, "wsi_auth_secret", WSI_SECRET)
-        monkeypatch.setattr(main_module.settings, "wsi_source_seal_key", seal_key)
+        monkeypatch.setattr(main_module, "_source_seal_key", seal_key)
         monkeypatch.setattr(main_module.settings, "release_id", "")
         monkeypatch.setattr(main_module.settings, "image_git_sha", "")
         monkeypatch.setattr(
@@ -80,7 +80,7 @@ class TestReadinessIdentity:
         assert status == 503
         assert payload["status"] == "unavailable"
         if seal_key:
-            assert seal_key not in json.dumps(payload)
+            assert seal_key.decode() not in json.dumps(payload)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("seal_key", ["", "c2hvcnQ="])
