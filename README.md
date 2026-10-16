@@ -117,8 +117,9 @@ Authorization: Bearer <cBioPortal slide capability>
 ```
 
 Capabilities are HMAC-SHA256 JWTs (signed with `WSI_AUTH_SECRET`) with
-`scope=wsi:read`, `wsi_auth_version=4`, `study_id`, an opaque `slide_key`,
-bounded thumbnail dimensions, an expiry no longer than `WSI_AUTH_MAX_TTL`, and
+`scope=wsi:read`, `wsi_auth_version=4`, `study_id`, an opaque `slide_key` (12
+lowercase hex characters), bounded thumbnail dimensions, an expiry no longer
+than `WSI_AUTH_MAX_TTL`, and
 an `enc` claim. `enc` is the slide's sealed source: base64url (no padding) of
 nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes), keyed with the raw
 32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`, over JSON

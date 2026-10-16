@@ -35,7 +35,7 @@ _NAMED_MONTH_DATE = re.compile(
 )
 _COMPACT_DATE = re.compile(r"(?<!\d)(?:19|20)\d{6}(?!\d)")
 _LABELLED_MRN = re.compile(r"(?i)\b(?:mrn|medical[ _-]?record(?:[ _-]?number)?)\b\s*[:=#-]?\s*\d{4,}")
-SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{12}$")
 # SEALED_SOURCE is base64url without padding of nonce(12) || AES-256-GCM
 # ciphertext (at least one byte) || tag(16), as carried in the capability's
 # `enc` claim.
@@ -110,9 +110,9 @@ _CIPHERTEXT_FIELDS = {"sealed_source"}
 # Canonical opaque keys are built from slide_key hex, which can contain
 # YYYYMMDD-looking runs.
 _OPAQUE_KEY_PATTERNS = {
-    "part_key": re.compile(r"^part:[0-9a-f]{32}$"),
-    "block_key": re.compile(r"^block:[0-9a-f]{32}$"),
-    "specimen_key": re.compile(r"^(?:block|part|unmatched)::part:[0-9a-f]{32}::block:[0-9a-f]{32}$"),
+    "part_key": re.compile(r"^part:[0-9a-f]{12}$"),
+    "block_key": re.compile(r"^block:[0-9a-f]{12}$"),
+    "specimen_key": re.compile(r"^(?:block|part|unmatched)::part:[0-9a-f]{12}::block:[0-9a-f]{12}$"),
 }
 
 
@@ -313,7 +313,7 @@ def validate_wsi_public_row(row: Mapping[str, object]) -> None:
     """
     slide_key = _text(row.get("SLIDE_KEY"))
     if not SLIDE_KEY_PATTERN.fullmatch(slide_key):
-        raise DeidViolation("SLIDE_KEY must be 32 lowercase hex characters")
+        raise DeidViolation("SLIDE_KEY must be 12 lowercase hex characters")
     for field, value in row.items():
         if field.upper() in _PLAINTEXT_SOURCE_FIELDS and _text(value):
             raise DeidViolation(

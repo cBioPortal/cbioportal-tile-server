@@ -4,12 +4,12 @@ import pytest
 
 from app.deid import DeidViolation, validate_artifact_uri, validate_timeline_public_row, validate_wsi_public_row
 
-SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+SLIDE_KEY = "0123456789ab"
 # Contract V6.1 test vector: a well-formed sealed source.
 SEALED_SOURCE = (
     "AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85"
-    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa"
-    "9qfr9t209wS7V-LhGl8i"
+    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRT"
+    "AkaMITic3pNdzkC_lpw5"
 )
 
 
@@ -93,8 +93,8 @@ def test_timeline_rows_only_allow_relative_start_dates():
 
 def test_timeline_linkout_allows_opaque_keys_with_date_like_hex():
     # Opaque hex keys can contain YYYYMMDD-looking runs; they must not be rejected.
-    hex_with_date = "20190412" + "a" * 24
-    specimen_key = f"part::part:{hex_with_date}::block:{'b' * 32}"
+    hex_with_date = "20190412" + "a" * 4
+    specimen_key = f"part::part:{hex_with_date}::block:{'b' * 12}"
     linkout = (
         "/patient/wsiHESlides?studyId=s&caseId=P-1&sampleId=P-1-T01"
         "&stainFilter=hne&matchLevel=PART"
@@ -198,7 +198,7 @@ def test_public_rows_reject_identifier_field_names_even_without_labelled_values(
 
 @pytest.mark.parametrize(
     "slide_key",
-    ["", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef", "g" * 32, SLIDE_KEY + "0"],
+    ["", "0123456789AB", "0123456789", "g" * 12, SLIDE_KEY + "0", "0123456789abcdef0123456789abcdef"],
 )
 def test_public_wsi_row_requires_opaque_slide_key(slide_key):
     with pytest.raises(DeidViolation, match="SLIDE_KEY"):
@@ -211,11 +211,11 @@ def test_public_wsi_row_requires_slide_key_column():
 
 
 def test_slide_key_hex_is_not_mistaken_for_a_compact_date():
-    validate_wsi_public_row({"SLIDE_KEY": "abc20210314def0123456789abcdef01"})
+    validate_wsi_public_row({"SLIDE_KEY": "a20210314bcd"})
 
 
 def test_public_wsi_row_allows_date_like_hex_in_opaque_keys():
-    key = "20190412" + "a" * 24
+    key = "20190412" + "a" * 4
     validate_wsi_public_row(
         {
             "SLIDE_KEY": SLIDE_KEY,

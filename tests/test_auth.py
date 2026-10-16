@@ -17,7 +17,7 @@ from app.auth import (
     validate_wsi_token,
 )
 
-SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+SLIDE_KEY = "0123456789ab"
 TILE_SOURCE = "s3://slides/slide-a.svs"
 THUMBNAIL_SOURCE = "s3://thumbs/slide-a.jpg"
 SEAL_KEY = bytes(range(32))
@@ -25,7 +25,7 @@ SEAL_KEY_B64 = base64.b64encode(SEAL_KEY).decode()
 
 # Contract test vector (docs/wsi-deid-slide-key-contract.md, V6.1).
 VECTOR_SEAL_KEY_B64 = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
-VECTOR_SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+VECTOR_SLIDE_KEY = "0123456789ab"
 VECTOR_KEY_HEX = "f176a275656d945cd5ee1c32030b53363375dcc34baa77a7cf94b2ed8f9c6c0b"
 VECTOR_KEY = bytes.fromhex(VECTOR_KEY_HEX)
 VECTOR_PLAINTEXT = (
@@ -34,8 +34,8 @@ VECTOR_PLAINTEXT = (
 )
 VECTOR_ENC = (
     "AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85"
-    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa"
-    "9qfr9t209wS7V-LhGl8i"
+    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRT"
+    "AkaMITic3pNdzkC_lpw5"
 )
 
 
@@ -189,7 +189,8 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
 @pytest.mark.parametrize(
     ("enc", "seal_key", "slide_key"),
     [
-        (VECTOR_ENC, VECTOR_KEY, "f" * 32),
+        (VECTOR_ENC, VECTOR_KEY, "f" * 12),
+        (VECTOR_ENC, VECTOR_KEY, "0123456789abcdef0123456789abcdef"),
         (VECTOR_ENC, VECTOR_KEY, VECTOR_SLIDE_KEY.upper()),
         # Sealed with another key, including the capability signing secret.
         (VECTOR_ENC, SEAL_KEY, VECTOR_SLIDE_KEY),
@@ -251,7 +252,8 @@ def test_token_must_not_expose_sealed_claims_in_plaintext(claim):
 
 
 @pytest.mark.parametrize(
-    "slide_key", [None, "", "0123456789ABCDEF0123456789ABCDEF", "0" * 31, "0" * 33, 12345]
+    "slide_key",
+    [None, "", "0123456789AB", "0" * 11, "0" * 13, "0123456789abcdef0123456789abcdef", 12345],
 )
 def test_malformed_slide_key_is_rejected(slide_key):
     secret = "s" * 32
