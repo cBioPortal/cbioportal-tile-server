@@ -128,7 +128,7 @@ _runtime_s3_lock = threading.Lock()
 def _s3_location(uri: str) -> tuple[str, str]:
     parsed = urlparse(uri)
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
-        raise FileNotFoundError(f"Malformed thumbnail URI: {uri!r}")
+        raise FileNotFoundError("Malformed thumbnail URI")
     return parsed.netloc, parsed.path.lstrip("/")
 
 
