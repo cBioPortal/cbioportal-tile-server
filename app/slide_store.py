@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,8 @@ from tiffslide import TiffSlide
 
 from .blockcache import cache_directory_for_slide
 from .config import settings
+
+_OFFSET_Z = re.compile(r"\|\s*OffsetZ\s*=\s*([-+]?[\d.]+)")
 
 
 def s3_opts() -> dict:
@@ -47,14 +50,25 @@ def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     return bucket, key, s3_opts()
 
 
-def _keep_first_focal_plane(tf: TiffFile) -> None:
+def _is_nominal_focus(page: Any) -> bool:
+    match = _OFFSET_Z.search(page.description or "")
+    if match is None:
+        return True
+    try:
+        return float(match.group(1)) == 0
+    except ValueError:
+        return False
+
+
+def _keep_nominal_focus_plane(tf: TiffFile) -> None:
     """
-    Reduce a Z-stack SVS baseline series to its first focal plane, in place.
+    Reduce a Z-stack SVS baseline series to its nominal-focus plane, in place.
 
     tifffile groups an Aperio Z-stack's pages into one ZYXS series, which
-    tiffslide refuses to open (it reads only 2-D and 3-D series). The first
-    page of each level is the nominal-focus plane, the one without OffsetZ.
-    This must run before the slide's properties are first read.
+    tiffslide refuses to open (it reads only 2-D and 3-D series). Each level
+    keeps its nominal-focus page: the one whose description has no OffsetZ or
+    OffsetZ = 0, else its first page. This must run before the slide's
+    properties are first read.
     """
     series = tf.series
     baseline = series[0]
@@ -62,7 +76,7 @@ def _keep_first_focal_plane(tf: TiffFile) -> None:
         return
 
     def plane(level: TiffPageSeries) -> TiffPageSeries:
-        page = level.pages[0]
+        page = next((p for p in level.pages if _is_nominal_focus(p)), level.pages[0])
         return TiffPageSeries(
             [page], page.shape, page.dtype, page.axes, parent=tf, name=level.name, kind=level.kind
         )
@@ -75,7 +89,7 @@ def _keep_first_focal_plane(tf: TiffFile) -> None:
 def _tiff_slide(source: Any, **kwargs: Any) -> TiffSlide:
     slide = TiffSlide(source, **kwargs)
     try:
-        _keep_first_focal_plane(slide.ts_tifffile)
+        _keep_nominal_focus_plane(slide.ts_tifffile)
     except BaseException:
         slide.close()
         raise
