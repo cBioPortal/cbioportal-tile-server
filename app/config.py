@@ -55,8 +55,6 @@ class Settings:
         default_factory=lambda: _env_str("WSI_SOURCE_SEAL_KEY"), repr=False
     )
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
-    # Deprecated compatibility setting. Pixel routes always require a
-    # capability; this value is intentionally ignored by app.main.
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
@@ -140,8 +138,6 @@ class Settings:
     cache_miss_wait_timeout_seconds: float = field(
         default_factory=lambda: _env_float("CACHE_MISS_WAIT_TIMEOUT_SECONDS", 60.0)
     )
-    # Deprecated cache setting retained for offline/legacy imports; runtime
-    # endpoints never cache clinical or slide metadata.
 
     # Slide cache / workers
     max_open_slides: int = field(default_factory=lambda: _env_int("MAX_OPEN_SLIDES", 64))
@@ -162,7 +158,6 @@ class Settings:
     slide_s3_max_connections: int = field(
         default_factory=lambda: _env_int("SLIDE_S3_MAX_CONNECTIONS", 16)
     )
-    # Deprecated compatibility setting retained for offline callers.
     # RATE_LIMIT_PER_MINUTE is retained as a one-release compatibility alias.
     cache_miss_rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int(
