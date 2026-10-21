@@ -187,8 +187,12 @@ class TestZStackSlides:
         _write_zstack_svs(path)
         assert tifffile.TiffFile(path).series[0].axes == "ZYXS"
 
-        slide, _ = open_slide(str(path), logger=MagicMock())
+        logger = MagicMock()
+        slide, _ = open_slide(str(path), logger=logger)
 
+        logger.warning.assert_called_once()
+        assert logger.warning.call_args.args[0].startswith("zstack_flattened:")
+        assert logger.warning.call_args.args[1] == 3
         assert slide.properties["tiffslide.series-axes"] == "YXS"
         assert slide.level_dimensions == ((768, 512), (192, 128))
         assert list(slide.associated_images) == ["thumbnail"]
@@ -207,7 +211,9 @@ class TestZStackSlides:
 
     def test_single_plane_slide_is_unchanged(self):
         path = Path(__file__).parent / "testdata" / "CMU-1-Small-Region.svs"
-        slide, _ = open_slide(str(path), logger=MagicMock())
+        logger = MagicMock()
+        slide, _ = open_slide(str(path), logger=logger)
+        logger.warning.assert_not_called()
         assert slide.properties["tiffslide.series-axes"] == "YXS"
         assert slide.dimensions == (2220, 2967)
 

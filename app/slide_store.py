@@ -108,9 +108,12 @@ def _is_nominal_focus(page: Any) -> bool:
         return False
 
 
-def _keep_nominal_focus_plane(tf: TiffFile) -> None:
+def _keep_nominal_focus_plane(tf: TiffFile) -> int:
     """
     Reduce a Z-stack SVS baseline series to its nominal-focus plane, in place.
+
+    Returns the number of focal planes the slide had, or 0 if it was not a
+    Z-stack.
 
     tifffile groups an Aperio Z-stack's pages into one ZYXS series, which
     tiffslide refuses to open (it reads only 2-D and 3-D series). Each level
@@ -121,7 +124,7 @@ def _keep_nominal_focus_plane(tf: TiffFile) -> None:
     series = tf.series
     baseline = series[0]
     if baseline.ndim != 4 or not baseline.axes.startswith("Z"):
-        return
+        return 0
 
     def plane(level: TiffPageSeries) -> TiffPageSeries:
         page = next((p for p in level.pages if _is_nominal_focus(p)), level.pages[0])
@@ -132,15 +135,20 @@ def _keep_nominal_focus_plane(tf: TiffFile) -> None:
     first = plane(baseline)
     first.levels.extend(plane(level) for level in baseline.levels[1:])
     series[0] = first
+    return int(baseline.shape[0])
 
 
-def _tiff_slide(source: Any, **kwargs: Any) -> TiffSlide:
+def _tiff_slide(source: Any, logger: Any, **kwargs: Any) -> TiffSlide:
     slide = TiffSlide(source, **kwargs)
     try:
-        _keep_nominal_focus_plane(slide.ts_tifffile)
+        planes = _keep_nominal_focus_plane(slide.ts_tifffile)
     except BaseException:
         slide.close()
         raise
+    if planes:
+        # Grep for "zstack_flattened" to count Z-stack slides: they render
+        # without error now, so this log line is the only sign of them.
+        logger.warning("zstack_flattened: serving the nominal-focus plane of %d focal planes", planes)
     return slide
 
 
@@ -179,7 +187,7 @@ def open_slide(
                     block_size=settings.blockcache_block_size,
                 )
                 try:
-                    return _tiff_slide(fileobj), fileobj
+                    return _tiff_slide(fileobj, logger), fileobj
                 except BaseException:
                     fileobj.close()
                     raise
@@ -204,7 +212,7 @@ def open_slide(
             return slide, fileobj
 
         url = f"s3://{bucket}/{key}"
-        slide = _tiff_slide(url, storage_options=storage_options)
+        slide = _tiff_slide(url, logger, storage_options=storage_options)
         return slide, None
 
     local_path = slide_id[7:] if slide_id.startswith("file://") else slide_id
@@ -212,7 +220,7 @@ def open_slide(
         raise FileNotFoundError(f"Slide not found: {slide_id!r}")
     if not os.path.exists(local_path):
         raise FileNotFoundError(f"Slide not found: {slide_id!r}")
-    slide = _tiff_slide(local_path)
+    slide = _tiff_slide(local_path, logger)
     return slide, None
 
 
