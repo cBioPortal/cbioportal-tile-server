@@ -37,7 +37,6 @@ from .auth import (
     WSI_AUTH_VERSION,
     InvalidWsiToken,
     decode_source_seal_key,
-    source_cache_identity,
     source_digest,
     validate_wsi_auth_configuration,
     validate_wsi_token,
@@ -248,16 +247,11 @@ def _traceback_frames(exc: BaseException) -> str:
     )
 
 
-def _attempt_slide_cache_repair(
-    source: str, exc: Exception, cache_identity: str | None = None
-) -> bool:
+def _attempt_slide_cache_repair(source: str, exc: Exception) -> bool:
     if not isinstance(_slides, SlideCache):
         return False
     try:
-        if cache_identity:
-            repaired = _slides.repair(source, cache_identity)
-        else:
-            repaired = _slides.repair(source)
+        repaired = _slides.repair(source)
     except Exception as repair_exc:  # noqa: BLE001 - preserve the original failure
         logger.error(
             "Slide cache repair failed; source_digest=%s error_type=%s repair_error_type=%s",
@@ -573,10 +567,7 @@ def _run_slide_operation(
     source: str,
     operation,
     *args,
-    source_fingerprint: str | None = None,
 ):
-    cache_identity = source_cache_identity(source, source_fingerprint)
-    cache_namespace = cache_identity if source_fingerprint else None
     repair_attempted = False
     direct_attempted = False
     while True:
@@ -585,10 +576,6 @@ def _run_slide_operation(
                 raise RuntimeError("slide cache is not initialized")
             if direct_attempted:
                 result = _slides.run_uncached(source, operation, *args)
-            elif source_fingerprint:
-                result = _slides.run(
-                    source, operation, *args, cache_identity=cache_identity
-                )
             else:
                 result = _slides.run(source, operation, *args)
             if repair_attempted or direct_attempted:
@@ -603,7 +590,7 @@ def _run_slide_operation(
         except Exception as exc:
             if not repair_attempted and _is_cache_repairable_slide_error(exc):
                 repair_attempted = True
-                if _attempt_slide_cache_repair(source, exc, cache_namespace):
+                if _attempt_slide_cache_repair(source, exc):
                     continue
             if (
                 repair_attempted
@@ -656,16 +643,9 @@ async def _run_slide_image_operation(
     operation,
     *args,
     operation_kind: str = "image",
-    source_fingerprint: str | None = None,
 ):
     return await _run_image_operation(
-        partial(
-            _run_slide_operation,
-            source,
-            operation,
-            *args,
-            source_fingerprint=source_fingerprint,
-        ),
+        partial(_run_slide_operation, source, operation, *args),
         operation_kind=operation_kind,
     )
 
@@ -789,8 +769,7 @@ async def tile(
 ):
     _reject_client_source(request, source)
     source, claims = _authorize_source(request, "tile")
-    source_fingerprint = claims.get("tile_source_fingerprint")
-    cache_key = source_cache_identity(source, source_fingerprint)
+    cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=TILE_CACHE_HEADERS)
@@ -803,7 +782,6 @@ async def tile(
             x,
             y,
             operation_kind="tile",
-            source_fingerprint=source_fingerprint,
         )
         await tile_cache.set_tile(cache_key, z, x, y, image_bytes)
         return image_bytes
@@ -850,19 +828,16 @@ async def thumbnail(
     source, claims = _authorize_source(request, "thumbnail")
     width = max(1, min(width, 2048))
     height = max(1, min(height, 2048))
-    source_fingerprint = claims.get("thumbnail_source_fingerprint")
-    cache_key = source_cache_identity(source, source_fingerprint)
+    cache_key = source_digest(source)
     cached = await tile_cache.get_thumbnail(cache_key, width, height)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
         record = ThumbnailRecord(
-            image_id=cache_key,
             uri=source,
             width=claims["thumbnail_width"],
             height=claims["thumbnail_height"],
-            content_type="image/jpeg",
         )
         payload = await _run_thumbnail_fetch(record)
         if width >= record.width and height >= record.height:

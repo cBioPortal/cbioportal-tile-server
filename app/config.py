@@ -1,8 +1,6 @@
 import configparser
-import json
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 def _aws_profile(key: str, fallback: str = "") -> str:
@@ -38,17 +36,6 @@ def _env_csv(name: str, default: str) -> list[str]:
     return [item.strip() for item in os.environ.get(name, default).split(",") if item.strip()]
 
 
-def _env_json_file_map(name: str) -> dict[str, str]:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return {}
-    path = Path(raw)
-    data = json.loads(path.read_text())
-    if not isinstance(data, dict):
-        raise ValueError(f"{name} must point to a JSON object")
-    return {str(key): str(value) for key, value in data.items()}
-
-
 @dataclass
 class Settings:
     release_id: str = field(default_factory=lambda: _env_str("WSI_RELEASE_ID"))
@@ -70,7 +57,6 @@ class Settings:
     wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
     # Deprecated compatibility setting. Pixel routes always require a
     # capability; this value is intentionally ignored by app.main.
-    wsi_auth_required: bool = field(default_factory=lambda: _env_bool("WSI_AUTH_REQUIRED", True))
     wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
@@ -97,23 +83,12 @@ class Settings:
     thumbnail_max_decode_pixels: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_MAX_DECODE_PIXELS", 16_777_216)
     )
-    thumbnail_timeout_sec: int = field(
-        default_factory=lambda: _env_int("THUMBNAIL_TIMEOUT_SEC", 8)
-    )
-    thumbnail_placeholder_cache_ttl: int = field(
-        default_factory=lambda: _env_int("THUMBNAIL_PLACEHOLDER_CACHE_TTL", 60)
-    )
+    # Read only by the offline thumbnail pipeline that imports this package.
     thumbnail_manifest_uri: str = field(
         default_factory=lambda: _env_str("THUMBNAIL_MANIFEST_URI")
     )
     thumbnail_master_size: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_MASTER_SIZE", 1024)
-    )
-    thumbnail_manifest_refresh_sec: int = field(
-        default_factory=lambda: _env_int("THUMBNAIL_MANIFEST_REFRESH_SEC", 300)
-    )
-    thumbnail_generated_record_cache_capacity: int = field(
-        default_factory=lambda: _env_int("THUMBNAIL_GENERATED_RECORD_CACHE_CAPACITY", 4096)
     )
     thumbnail_batch_timeout_sec: int = field(
         default_factory=lambda: _env_int("THUMBNAIL_BATCH_TIMEOUT_SEC", 600)
@@ -167,7 +142,6 @@ class Settings:
     )
     # Deprecated cache setting retained for offline/legacy imports; runtime
     # endpoints never cache clinical or slide metadata.
-    metadata_cache_ttl: int = field(default_factory=lambda: _env_int("METADATA_CACHE_TTL", 86_400))
 
     # Slide cache / workers
     max_open_slides: int = field(default_factory=lambda: _env_int("MAX_OPEN_SLIDES", 64))
@@ -189,7 +163,6 @@ class Settings:
         default_factory=lambda: _env_int("SLIDE_S3_MAX_CONNECTIONS", 16)
     )
     # Deprecated compatibility setting retained for offline callers.
-    path_cache_capacity: int = field(default_factory=lambda: _env_int("PATH_CACHE_CAPACITY", 4_096))
     # RATE_LIMIT_PER_MINUTE is retained as a one-release compatibility alias.
     cache_miss_rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int(
@@ -205,10 +178,6 @@ class Settings:
     blockcache_prune_interval_seconds: int = field(
         default_factory=lambda: _env_int("BLOCKCACHE_PRUNE_INTERVAL_SECONDS", 60)
     )
-
-    # Test-only local slide fixtures
-    test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
-    test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
 
     # CORS
     cors_origins: list[str] = field(

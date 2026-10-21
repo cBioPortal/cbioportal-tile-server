@@ -51,8 +51,7 @@ REDIS_URL=<password-protected Redis URL>
 ```
 
 The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
-server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
-legacy configuration key but authentication is mandatory for pixel routes.
+server TTL lower than the backend TTL. Authentication is mandatory for pixel routes.
 The URI prefix allowlists are a de-identification boundary; leave them empty
 only for an isolated non-publishing unit test.
 
@@ -105,10 +104,7 @@ becomes servable only after its thumbnail is published, the study files are
 exported, and cBioPortal core has imported them. See the README's
 "Offline preparation" section for the full contract.
 
-The frontend only requests `/thumbnails` and never uploads artifacts. The
-tile-server `app/thumbnail_worker.py` CLI can be used for development,
-rehearsal, or controlled remediation, but it writes only an object-store
-artifact. It must not be used as the production source of truth.
+The frontend only requests `/thumbnails` and never uploads artifacts.
 
 ## Response and cache policy
 

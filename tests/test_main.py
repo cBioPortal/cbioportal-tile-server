@@ -382,27 +382,10 @@ class TestTransientSourceFailures:
             result = main_module._run_slide_operation(
                 "s3://bucket/slide.svs",
                 lambda _: None,
-                source_fingerprint="a" * 64,
             )
 
         assert result == b"jpeg"
         direct.assert_called_once()
-
-    def test_fingerprint_is_passed_to_slide_cache_namespace(self):
-        slides = object.__new__(main_module.SlideCache)
-        with (
-            patch.object(main_module, "_slides", slides),
-            patch.object(main_module.SlideCache, "run", return_value=b"jpeg") as run,
-        ):
-            assert main_module._run_slide_operation(
-                "s3://bucket/slide.svs",
-                lambda _: None,
-                source_fingerprint="a" * 64,
-            ) == b"jpeg"
-
-        assert run.call_args.kwargs["cache_identity"] == main_module.source_cache_identity(
-            "s3://bucket/slide.svs", "a" * 64
-        )
 
 
 class TestThumbnailFetchRetry:
@@ -741,7 +724,7 @@ class TestCapabilityRoutes:
 
         assert response.status_code == 200
         assert response.content == b"image"
-        assert cached.await_args.args[0] == main_module.source_cache_identity(expected)
+        assert cached.await_args.args[0] == main_module.source_digest(expected)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
@@ -786,4 +769,4 @@ class TestCapabilityRoutes:
                 )
 
         assert response.status_code == 200
-        assert get_tile.await_args.args[0] == main_module.source_cache_identity(TILE_SOURCE)
+        assert get_tile.await_args.args[0] == main_module.source_digest(TILE_SOURCE)

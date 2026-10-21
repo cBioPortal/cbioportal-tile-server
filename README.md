@@ -96,10 +96,6 @@ pull request.
 
 The frontend is read-only: it requests the backend access bundle and then
 requests `/thumbnails`; it has no object-store upload credentials.
-`app/thumbnail_worker.py` is a controlled on-demand CLI that can write a
-generated JPEG to the configured S3-compatible location, but it is not a
-production publication mechanism. Keep it limited to development, rehearsal,
-or explicit remediation.
 
 ## Endpoints
 

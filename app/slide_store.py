@@ -133,7 +133,6 @@ def _tiff_slide(source: Any, **kwargs: Any) -> TiffSlide:
 def open_slide(
     slide_id: str,
     logger: Any,
-    cache_identity: str | None = None,
     use_block_cache: bool = True,
 ) -> tuple[TiffSlide, Any]:
     """
@@ -145,7 +144,7 @@ def open_slide(
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        cache_dir = cache_directory_for_slide(slide_id, cache_identity) if use_block_cache else None
+        cache_dir = cache_directory_for_slide(slide_id) if use_block_cache else None
         if cache_dir is not None:
             cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)
