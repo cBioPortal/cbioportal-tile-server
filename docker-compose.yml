@@ -20,6 +20,8 @@ services:
 
       # ── WSI capability authentication ────────────────────────────────────
       WSI_AUTH_SECRET: ${WSI_AUTH_SECRET:?WSI_AUTH_SECRET must be set}
+      # Opens the capability's sealed source; standard base64 of 32 bytes.
+      WSI_SOURCE_SEAL_KEY: ${WSI_SOURCE_SEAL_KEY:?WSI_SOURCE_SEAL_KEY must be set}
       WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
       WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
       WSI_ALLOWED_SOURCE_SCHEMES: ${WSI_ALLOWED_SOURCE_SCHEMES:-s3}

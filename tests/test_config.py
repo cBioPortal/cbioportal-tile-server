@@ -93,11 +93,17 @@ class TestOtherSettings:
         s = make_settings(
             WSI_RELEASE_ID="candidate-1",
             IMAGE_GIT_SHA="a" * 40,
-            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v3",
+            WSI_SERVING_CONTRACT_VERSION="wsi-serving-v6",
         )
         assert s.release_id == "candidate-1"
         assert s.image_git_sha == "a" * 40
-        assert s.serving_contract_version == "wsi-serving-v3"
+        assert s.serving_contract_version == "wsi-serving-v6"
+
+    def test_source_seal_key_reads_environment(self):
+        key = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
+        s = make_settings(WSI_SOURCE_SEAL_KEY=key)
+        assert s.wsi_source_seal_key == key
+        assert key not in repr(s)
 
     def test_wsi_artifact_prefixes_read_environment(self):
         s = make_settings(
@@ -137,16 +143,6 @@ class TestOtherSettings:
     def test_cache_miss_rate_limit_accepts_legacy_alias(self):
         s = make_settings(RATE_LIMIT_PER_MINUTE="7")
         assert s.cache_miss_rate_limit_per_minute == 7
-
-    def test_test_slide_map_defaults_empty(self):
-        s = make_settings()
-        assert s.test_slide_map == {}
-
-    def test_test_slide_map_reads_json_file(self, tmp_path):
-        map_file = tmp_path / "slide-map.json"
-        map_file.write_text('{"slide-a":"/app/testdata/slide-a.svs"}')
-        s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
-        assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
 
     def test_cors_origins_parsed(self):
         s = make_settings(CORS_ORIGINS="https://a.example.com,https://b.example.com")

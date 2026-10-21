@@ -1,8 +1,10 @@
 import os
 import re
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import fsspec
 from tifffile import TiffFile, TiffPageSeries
@@ -35,18 +37,64 @@ def s3_opts() -> dict:
     return opts
 
 
+_URI_EXTENSIONS = {
+    "source": {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"},
+    "thumbnail": {".jpg", ".jpeg", ".png"},
+}
+
+
+class UnsafeSourceUri(ValueError):
+    """A capability's source URI is outside the deployment's approved objects."""
+
+
+def check_source_uri(uri: str, *, kind: str, prefixes: Iterable[str] = ()) -> None:
+    """
+    Accept only a plain s3:// or file:// object under an approved prefix.
+
+    The URI comes from the sealed capability and never leaves this server, so
+    the approved prefixes, not its text, are the boundary. Messages never echo it.
+    """
+    if kind not in _URI_EXTENSIONS:
+        raise UnsafeSourceUri(f"unknown URI kind: {kind}")
+    try:
+        parsed = urlsplit(uri)
+    except ValueError as error:
+        raise UnsafeSourceUri(f"malformed {kind} URI") from error
+    scheme = parsed.scheme.lower()
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise UnsafeSourceUri(f"unsafe {kind} URI")
+    if scheme not in {"s3", "file"}:
+        raise UnsafeSourceUri(f"unsupported {kind} URI scheme")
+    path = unquote(unquote(parsed.path))
+    if (
+        not path
+        or path.endswith("/")
+        or (scheme == "s3" and not parsed.netloc)
+        or (scheme == "file" and (parsed.netloc not in {"", "localhost"} or not path.startswith("/")))
+    ):
+        raise UnsafeSourceUri(f"malformed {kind} URI")
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        raise UnsafeSourceUri(f"unsafe {kind} URI path")
+    normalized = uri.rstrip("/")
+    if prefixes and not any(normalized.startswith(prefix.rstrip("/") + "/") for prefix in prefixes):
+        raise UnsafeSourceUri(f"unapproved {kind} URI prefix")
+    stem, dot, extension = path.rsplit("/", 1)[-1].rpartition(".")
+    if not dot or not stem or f".{extension.lower()}" not in _URI_EXTENSIONS[kind]:
+        raise UnsafeSourceUri(f"{kind} URI is not an image file")
+
+
 def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     """
     Return (bucket, key, s3_opts) for a source URL.
 
-    The source URL must be a full s3:// URI supplied by cBioPortal.
+    The source URL must be a full s3:// URI opened from the sealed capability.
     """
     if not slide_id.startswith("s3://"):
-        raise FileNotFoundError(f"Slide not found: {slide_id!r} (expected s3:// URI)")
+        raise FileNotFoundError("Slide not found (expected s3:// URI)")
     without_scheme = slide_id[5:]
     bucket, _, key = without_scheme.partition("/")
     if not bucket or not key:
-        raise FileNotFoundError(f"Malformed slide URI: {slide_id!r}")
+        raise FileNotFoundError("Malformed slide URI")
     return bucket, key, s3_opts()
 
 
@@ -107,7 +155,6 @@ def _tiff_slide(source: Any, logger: Any, **kwargs: Any) -> TiffSlide:
 def open_slide(
     slide_id: str,
     logger: Any,
-    cache_identity: str | None = None,
     use_block_cache: bool = True,
 ) -> tuple[TiffSlide, Any]:
     """
@@ -119,7 +166,7 @@ def open_slide(
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        cache_dir = cache_directory_for_slide(slide_id, cache_identity) if use_block_cache else None
+        cache_dir = cache_directory_for_slide(slide_id) if use_block_cache else None
         if cache_dir is not None:
             cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)
