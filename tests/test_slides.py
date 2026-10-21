@@ -3,7 +3,9 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
+import tifffile
 
 from app.slide_store import open_slide, resolve_s3_location
 
@@ -153,3 +155,46 @@ def test_blockcache_open_receives_configured_block_size(tmp_path):
         "rb",
         block_size=1_048_576,
     )
+
+
+def _write_zstack_svs(path, planes=3, height=512, width=768):
+    """Write a two-level Aperio SVS with `planes` focal planes; plane z has red = 50 * (z + 1)."""
+    aperio = "Aperio Image Library v12.0.15 \r\n"
+
+    def plane(z, h, w):
+        image = np.zeros((h, w, 3), np.uint8)
+        image[..., 0] = 50 * (z + 1)
+        return image
+
+    def write(tw, image, desc, tile=(256, 256)):
+        tw.write(image, tile=tile, description=aperio + desc, metadata=None)
+
+    with tifffile.TiffWriter(path) as tw:
+        write(tw, plane(0, height, width), f"{width}x{height}|AppMag = 20|MPP = 0.5")
+        write(tw, plane(0, 64, 96), "thumbnail", tile=None)
+        for z in range(1, planes):
+            write(tw, plane(z, height, width), f"{width}x{height}|OffsetZ = {2 * z}")
+        for z in range(planes):
+            write(tw, plane(z, height // 4, width // 4), f"level 1|OffsetZ = {2 * z}")
+
+
+class TestZStackSlides:
+    def test_zstack_opens_first_focal_plane(self, tmp_path):
+        path = tmp_path / "zstack.svs"
+        _write_zstack_svs(path)
+        assert tifffile.TiffFile(path).series[0].axes == "ZYXS"
+
+        slide, _ = open_slide(str(path), logger=MagicMock())
+
+        assert slide.properties["tiffslide.series-axes"] == "YXS"
+        assert slide.level_dimensions == ((768, 512), (192, 128))
+        assert list(slide.associated_images) == ["thumbnail"]
+        for level in range(slide.level_count):
+            pixel = np.asarray(slide.read_region((0, 0), level, (16, 16)))[0, 0]
+            assert pixel.tolist() == [50, 0, 0]
+
+    def test_single_plane_slide_is_unchanged(self):
+        path = Path(__file__).parent / "testdata" / "CMU-1-Small-Region.svs"
+        slide, _ = open_slide(str(path), logger=MagicMock())
+        assert slide.properties["tiffslide.series-axes"] == "YXS"
+        assert slide.dimensions == (2220, 2967)

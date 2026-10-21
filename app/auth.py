@@ -1,10 +1,30 @@
 """Validation for short-lived cBioPortal WSI access capabilities."""
 
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import time
+from functools import lru_cache
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from app.deid import (
+    SEALED_SOURCE_MIN_BYTES,
+    SEALED_SOURCE_NONCE_BYTES,
+    SEALED_SOURCE_PATTERN,
+    SLIDE_KEY_PATTERN,
+    b64url_decode,
+)
+
+
+WSI_AUTH_VERSION = 4
+SOURCE_SEAL_KEY_BYTES = 32
+# Claims that carry real slide identifiers or source bindings.  A JWT
+# payload is readable by the browser, so these may only travel inside `enc`.
+_SEALED_CLAIMS = ("image_id", "tile_source", "thumbnail_source")
 
 
 class InvalidWsiToken(ValueError):
@@ -12,7 +32,7 @@ class InvalidWsiToken(ValueError):
 
 
 def source_digest(source: str) -> str:
-    """Hash the exact source URL representation signed by cBioPortal."""
+    """Hash a source URL for cache keys and log correlation without exposing it."""
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
@@ -34,22 +54,86 @@ def source_cache_identity(source: str, source_fingerprint: str | None = None) ->
 
 def _b64decode(value: str) -> bytes:
     try:
-        return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+        return b64url_decode(value)
     except Exception as exc:
         raise InvalidWsiToken("invalid token encoding") from exc
 
 
-def validate_wsi_auth_configuration(secret: str, audience: str, max_ttl: int) -> None:
+def decode_source_seal_key(value: str) -> bytes:
+    """Decode `WSI_SOURCE_SEAL_KEY`: standard base64 of exactly 32 random bytes.
+
+    The key seals `enc` at the data provider and is never derived from
+    `WSI_AUTH_SECRET`.  Failures never echo the configured value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidWsiToken("WSI source seal key is not configured")
+    try:
+        key = base64.b64decode(value.strip(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidWsiToken("WSI source seal key is not configured") from exc
+    if len(key) != SOURCE_SEAL_KEY_BYTES:
+        raise InvalidWsiToken("WSI source seal key is not configured")
+    return key
+
+
+def decrypt_sealed_claims(enc: object, seal_key: bytes, slide_key: str) -> dict:
+    """Decrypt the `enc` claim with the raw source seal key, bound to `slide_key`.
+
+    `enc` is base64url-without-padding of nonce(12) || ciphertext || tag(16)
+    from AES-256-GCM with AAD = UTF-8 `slide_key`.  Failures never echo the
+    ciphertext, plaintext, or slide key.
+    """
+    if not isinstance(enc, str) or not SEALED_SOURCE_PATTERN.fullmatch(enc):
+        raise InvalidWsiToken("invalid token source binding")
+    return dict(_decrypt_sealed_claims_cached(enc, seal_key, slide_key))
+
+
+# One token authorizes hundreds of tile requests; decrypt its `enc` once. The
+# cache is consulted only after the signature/expiry checks pass on every
+# request. `enc` is sealed once per slide (random nonce), so every token for a
+# slide shares one entry; failures raise and are therefore never cached.
+@lru_cache(maxsize=4096)
+def _decrypt_sealed_claims_cached(enc: str, seal_key: bytes, slide_key: str) -> tuple[tuple[str, str], ...]:
+    try:
+        sealed = b64url_decode(enc)
+    except (binascii.Error, ValueError) as exc:
+        raise InvalidWsiToken("invalid token source binding") from exc
+    if len(sealed) < SEALED_SOURCE_MIN_BYTES:
+        raise InvalidWsiToken("invalid token source binding")
+    try:
+        plaintext = AESGCM(seal_key).decrypt(
+            sealed[:SEALED_SOURCE_NONCE_BYTES],
+            sealed[SEALED_SOURCE_NONCE_BYTES:],
+            slide_key.encode("utf-8"),
+        )
+        claims = json.loads(plaintext.decode("utf-8"))
+    except (InvalidTag, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidWsiToken("invalid token source binding") from exc
+    if not isinstance(claims, dict):
+        raise InvalidWsiToken("invalid token source binding")
+    for claim in _SEALED_CLAIMS:
+        value = claims.get(claim)
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidWsiToken("invalid token source binding")
+    return tuple((claim, claims[claim]) for claim in _SEALED_CLAIMS)
+
+
+def validate_wsi_auth_configuration(
+    secret: str, audience: str, max_ttl: int, seal_key: bytes
+) -> None:
     if not secret or len(secret.encode()) < 32:
         raise InvalidWsiToken("WSI authentication is not configured")
     if not audience or not audience.strip() or not 1 <= max_ttl <= 300:
         raise InvalidWsiToken("WSI authentication is not configured")
+    if not isinstance(seal_key, bytes) or len(seal_key) != SOURCE_SEAL_KEY_BYTES:
+        raise InvalidWsiToken("WSI source seal key is not configured")
 
 
 def validate_wsi_token(
-    token: str, secret: str, audience: str, max_ttl: int = 300
+    token: str, secret: str, audience: str, max_ttl: int = 300, *, seal_key: bytes
 ) -> dict:
-    validate_wsi_auth_configuration(secret, audience, max_ttl)
+    """Verify a capability signed with `secret` and open its sealed source."""
+    validate_wsi_auth_configuration(secret, audience, max_ttl, seal_key)
 
     parts = token.split(".")
     if len(parts) != 3:
@@ -82,14 +166,13 @@ def validate_wsi_token(
         raise InvalidWsiToken("invalid token subject")
     if not isinstance(payload.get("study_id"), str) or not payload["study_id"].strip():
         raise InvalidWsiToken("invalid token study")
-    if payload.get("wsi_auth_version") != 2:
+    if payload.get("wsi_auth_version") != WSI_AUTH_VERSION:
         raise InvalidWsiToken("unsupported WSI authorization contract")
-    if not isinstance(payload.get("image_id"), str) or not payload["image_id"].strip():
-        raise InvalidWsiToken("invalid token image")
-    for claim in ("tile_source_sha256", "thumbnail_source_sha256"):
-        value = payload.get(claim)
-        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-            raise InvalidWsiToken("invalid token source binding")
+    slide_key = payload.get("slide_key")
+    if not isinstance(slide_key, str) or not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+        raise InvalidWsiToken("invalid token slide")
+    if any(claim in payload for claim in _SEALED_CLAIMS):
+        raise InvalidWsiToken("token exposes sealed slide claims")
     for claim in ("tile_source_fingerprint", "thumbnail_source_fingerprint"):
         value = payload.get(claim)
         if value is not None and (
@@ -109,4 +192,8 @@ def validate_wsi_token(
     if payload["exp"] <= payload["iat"] or payload["exp"] - payload["iat"] > max_ttl:
         raise InvalidWsiToken("token lifetime exceeds configured maximum")
 
-    return payload
+    # Decrypt last so expired or mis-scoped tokens never reach the cipher.
+    sealed = decrypt_sealed_claims(payload.get("enc"), seal_key, slide_key)
+    claims = {key: value for key, value in payload.items() if key != "enc"}
+    claims.update(sealed)
+    return claims
