@@ -123,7 +123,7 @@ _LINKOUT_OPAQUE_PARAMS = {
 
 
 def _assert_safe_linkout(field: str, value: object) -> None:
-    """Scan a link's path and each query value; skip only well-formed opaque keys.
+    """Scan every part of a link; skip only query values that are well-formed opaque keys.
 
     An opaque hex key can contain a run that looks like a compact date
     (e.g. ``...20190412...``), so scanning the whole URL rejects valid links.
@@ -133,10 +133,15 @@ def _assert_safe_linkout(field: str, value: object) -> None:
     text = _text(value)
     if not text:
         return
-    parts = urlsplit(text)
+    try:
+        parts = urlsplit(text)
+    except ValueError as exc:
+        raise DeidViolation(f"{field} is not a valid link") from exc
+    _assert_safe_text(f"{field} host", unquote(parts.netloc))
     _assert_safe_text(f"{field} path", unquote(parts.path))
     _assert_safe_text(f"{field} fragment", unquote(parts.fragment))
     for name, param in parse_qsl(parts.query, keep_blank_values=True):
+        _assert_safe_text(f"{field} parameter", name)
         pattern = _LINKOUT_OPAQUE_PARAMS.get(name)
         if pattern and pattern.fullmatch(param):
             continue

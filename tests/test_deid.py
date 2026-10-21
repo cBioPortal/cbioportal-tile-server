@@ -112,6 +112,14 @@ def test_timeline_linkout_allows_opaque_keys_with_date_like_hex():
         "/patient/wsiHESlides?studyId=s&caseId=P-1&specimenKey=20190412",
         # dates in the path are rejected
         "/patient/2019-04-12/wsiHESlides?studyId=s",
+        # dates and MRNs in a parameter name are rejected
+        "/patient/wsiHESlides?2019-04-12",
+        "/patient/wsiHESlides?MRN%3A12345678=x",
+        # identifiers in the host or user info are rejected
+        "https://mrn:12345678@example.org/patient",
+        "https://20190412.example.org/patient",
+        # a malformed link is a violation, not an unrelated error
+        "http://[abc/patient",
     ],
 )
 def test_timeline_linkout_still_rejects_dates_and_mrns(linkout):
