@@ -174,6 +174,9 @@ seal key, and an optional Redis cache:
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
+| `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
+| `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
+| `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
 
 Thumbnail artifacts are generated offline (see
 [Offline preparation](#offline-preparation)); their dimensions, content

@@ -7,8 +7,13 @@ import time
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from fastapi import HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials
+
 from app.auth import (
     InvalidWsiToken,
+    require_user,
+    validate_scoped_capability,
     decode_source_seal_key,
     decrypt_sealed_claims,
     source_cache_identity,
@@ -364,3 +369,145 @@ def test_token_lifetime_cannot_exceed_configured_limit():
             "cbioportal-wsi",
             max_ttl=10,
         )
+
+
+def scoped_claims(**overrides):
+    now = int(time.time())
+    claims = {
+        "sub": "user@example.org",
+        "aud": "cbioportal-wsi",
+        "scope": "annotations:read annotations:write",
+        "study_id": "study-a",
+        "iat": now,
+        "exp": now + 300,
+    }
+    claims.update(overrides)
+    return claims
+
+
+ANNOTATION_SCOPES = {"annotations:read", "annotations:write"}
+
+
+def test_scoped_capability_returns_study_and_subject():
+    secret = "s" * 32
+    claims = validate_scoped_capability(
+        make_token(secret, **scoped_claims()), secret, "cbioportal-wsi", ANNOTATION_SCOPES
+    )
+    assert claims["study_id"] == "study-a"
+    assert claims["sub"] == "user@example.org"
+
+
+def test_scoped_capability_accepts_a_superset_of_scopes():
+    secret = "s" * 32
+    token = make_token(
+        secret,
+        **scoped_claims(scope="agent:chat research:read annotations:read annotations:write"),
+    )
+    assert validate_scoped_capability(token, secret, "cbioportal-wsi", {"annotations:read"})
+
+
+@pytest.mark.parametrize("change", [
+    {"scope": "annotations:read"},
+    {"scope": ""},
+    {"aud": "other"},
+    {"sub": ""},
+    {"study_id": " "},
+    {"exp": int(time.time()) - 1},
+    {"exp": int(time.time()) + 1000},
+])
+def test_scoped_capability_rejects_invalid_claims(change):
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken):
+        validate_scoped_capability(
+            make_token(secret, **scoped_claims(**change)), secret, "cbioportal-wsi", ANNOTATION_SCOPES
+        )
+
+
+@pytest.mark.parametrize("change", [
+    {"scope": "wsi:read annotations:read annotations:write"},
+    {"slide_key": SLIDE_KEY},
+    {"enc": "x"},
+    {"wsi_auth_version": 4},
+    {"image_id": "slide-a"},
+    {"tile_source": TILE_SOURCE},
+])
+def test_scoped_capability_never_names_a_slide(change):
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken):
+        validate_scoped_capability(
+            make_token(secret, **scoped_claims(**change)), secret, "cbioportal-wsi", ANNOTATION_SCOPES
+        )
+
+
+def test_scoped_capability_rejects_wrong_signature():
+    with pytest.raises(InvalidWsiToken, match="signature"):
+        validate_scoped_capability(
+            make_token("t" * 32, **scoped_claims()), "s" * 32, "cbioportal-wsi", ANNOTATION_SCOPES
+        )
+
+
+def test_slide_capability_cannot_be_used_for_annotations():
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken):
+        validate_scoped_capability(make_v4_token(secret), secret, "cbioportal-wsi", {"annotations:read"})
+
+
+def test_annotation_capability_cannot_open_tiles():
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken):
+        validate(make_token(secret, **scoped_claims()), secret, "cbioportal-wsi")
+
+
+def _annotation_request(method: str) -> Request:
+    return Request({"type": "http", "method": method, "path": "/annotations", "headers": []})
+
+
+def _bearer(token: str) -> HTTPAuthorizationCredentials:
+    return HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+
+@pytest.fixture
+def annotation_auth(monkeypatch):
+    from app.auth import settings
+
+    monkeypatch.setattr(settings, "annotation_auth_enabled", True)
+    monkeypatch.setattr(settings, "wsi_auth_secret", "s" * 32)
+    monkeypatch.setattr(settings, "wsi_auth_audience", "cbioportal-wsi")
+    monkeypatch.setattr(settings, "wsi_auth_max_ttl", 300)
+    monkeypatch.setattr(settings, "wsi_auth_previous_secret", "")
+    return "s" * 32
+
+
+async def test_require_user_returns_the_capability_study(annotation_auth):
+    token = make_token(annotation_auth, **scoped_claims())
+    user = await require_user(_annotation_request("POST"), _bearer(token))
+    assert user == {"sub": "user@example.org", "groups": [], "study_id": "study-a"}
+
+
+async def test_require_user_needs_write_scope_to_modify(annotation_auth):
+    token = make_token(annotation_auth, **scoped_claims(scope="annotations:read"))
+    assert (await require_user(_annotation_request("GET"), _bearer(token)))["study_id"] == "study-a"
+    for method in ("POST", "PUT", "DELETE"):
+        with pytest.raises(HTTPException) as exc:
+            await require_user(_annotation_request(method), _bearer(token))
+        assert exc.value.status_code == 401
+
+
+async def test_require_user_accepts_the_previous_secret_during_rotation(annotation_auth, monkeypatch):
+    from app.auth import settings
+
+    monkeypatch.setattr(settings, "wsi_auth_previous_secret", "p" * 32)
+    token = make_token("p" * 32, **scoped_claims())
+    assert (await require_user(_annotation_request("GET"), _bearer(token)))["sub"] == "user@example.org"
+    with pytest.raises(HTTPException):
+        await require_user(_annotation_request("GET"), _bearer(make_token("x" * 32, **scoped_claims())))
+
+
+async def test_require_user_rejects_missing_and_foreign_tokens(annotation_auth):
+    with pytest.raises(HTTPException) as missing:
+        await require_user(_annotation_request("GET"), None)
+    assert missing.value.status_code == 401
+    with pytest.raises(HTTPException) as foreign:
+        await require_user(_annotation_request("GET"), _bearer("generic-keycloak-token"))
+    assert foreign.value.status_code == 401
+

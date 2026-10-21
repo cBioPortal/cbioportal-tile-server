@@ -85,12 +85,10 @@ class Settings:
         default_factory=lambda: _env_csv("WSI_ALLOWED_THUMBNAIL_PREFIXES", "")
     )
 
-    # S3 / Dell ECS connection
     aws_endpoint_url: str = field(default_factory=lambda: _env_str("AWS_ENDPOINT_URL", _aws_profile("endpoint_url", "")))
     aws_access_key_id: str = field(default_factory=lambda: _env_str("AWS_ACCESS_KEY_ID", _aws_profile("aws_access_key_id")))
     aws_secret_access_key: str = field(default_factory=lambda: _env_str("AWS_SECRET_ACCESS_KEY", _aws_profile("aws_secret_access_key")))
 
-    # Tile settings
     tile_size: int = field(default_factory=lambda: _env_int("TILE_SIZE", 256))
     jpeg_quality: int = field(default_factory=lambda: _env_int("JPEG_QUALITY", 85))
     max_decode_pixels: int = field(default_factory=lambda: _env_int("MAX_DECODE_PIXELS", 16_777_216))
@@ -210,7 +208,10 @@ class Settings:
     test_slide_map_file: str = field(default_factory=lambda: _env_str("WSI_TEST_SLIDE_MAP_FILE", ""))
     test_slide_map: dict[str, str] = field(default_factory=lambda: _env_json_file_map("WSI_TEST_SLIDE_MAP_FILE"))
 
-    # CORS
+    annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
+    annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
+    annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
+
     cors_origins: list[str] = field(
         default_factory=lambda: _env_csv(
             "CORS_ORIGINS",
