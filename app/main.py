@@ -44,7 +44,6 @@ from .auth import (
 )
 from .blockcache import get_blockcache_manager
 from .config import settings
-from .deid import DeidViolation, validate_artifact_uri
 from .metrics import (
     CACHE_MISS_LEADERS,
     COALESCED_CACHE_MISS_REQUESTS,
@@ -64,6 +63,7 @@ from .metrics import (
     track_image_operation,
     track_thumbnail_fetch,
 )
+from .slide_store import UnsafeSourceUri, check_source_uri
 from .slides import SlideCache
 from .thumbnail_store import (
     ThumbnailRecord,
@@ -546,7 +546,7 @@ def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
         claims.get("tile_source" if operation == "tile" else "thumbnail_source")
     )
     try:
-        validate_artifact_uri(
+        check_source_uri(
             source,
             kind="source" if operation == "tile" else "thumbnail",
             prefixes=(
@@ -555,7 +555,7 @@ def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
                 else settings.wsi_allowed_thumbnail_prefixes
             ),
         )
-    except DeidViolation:
+    except UnsafeSourceUri:
         raise HTTPException(status_code=403, detail="source is outside de-id policy")
     return source, claims
 

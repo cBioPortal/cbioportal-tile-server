@@ -694,8 +694,6 @@ class TestSourceBinding:
             ("tile", {"tile_source": "s3://slides/slide-a.svs?versionId=1"}),
             ("thumbnail", {"thumbnail_source": "s3://thumbs/../private/slide-a.jpg"}),
             ("tile", {"tile_source": "s3://user:pass@slides/slide-a.svs"}),
-            # Labelled MRN.
-            ("thumbnail", {"thumbnail_source": "s3://thumbs/MRN-12345678.jpg"}),
             # Unsupported schemes.
             ("tile", {"tile_source": "https://slides/slide-a.svs"}),
             ("tile", {"tile_source": "gs://slides/slide-a.svs"}),

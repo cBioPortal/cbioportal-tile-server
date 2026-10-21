@@ -22,8 +22,8 @@ intrinsic tile metadata, and a `wsi_auth_version=4` token signed with
 real `image_id` and both source URLs encrypted by the data provider with
 AES-256-GCM under the raw 32-byte `WSI_SOURCE_SEAL_KEY` (AAD = `slide_key`).
 cBioPortal stores and forwards it verbatim and cannot decrypt it. The tile
-server opens it, applies `validate_artifact_uri` (scheme, approved prefix,
-extension, identifier checks), and reads only those URLs. v2 and v3 tokens are
+server opens it, applies `check_source_uri` (scheme, approved prefix,
+extension, no traversal), and reads only those URLs. v2 and v3 tokens are
 rejected. Contract: `wsi-serving-v6`
 (`../docs/wsi-deid-slide-key-contract.md`).
 

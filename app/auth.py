@@ -11,7 +11,7 @@ from functools import lru_cache
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from app.deid import (
+from app.sealed_source import (
     SEALED_SOURCE_MIN_BYTES,
     SEALED_SOURCE_NONCE_BYTES,
     SEALED_SOURCE_PATTERN,

@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import tifffile
 
-from app.slide_store import open_slide, resolve_s3_location
+from app.slide_store import UnsafeSourceUri, check_source_uri, open_slide, resolve_s3_location
 
 
 def _settings(
@@ -198,3 +198,25 @@ class TestZStackSlides:
         slide, _ = open_slide(str(path), logger=MagicMock())
         assert slide.properties["tiffslide.series-axes"] == "YXS"
         assert slide.dimensions == (2220, 2967)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://slides/../patient-123.svs",  # traversal
+        "s3://other/slide-1.svs",  # outside the approved prefix
+        "s3://slides/slide-1.svs?x=1",  # query
+        "s3://key:secret@slides/slide-1.svs",  # user info
+        "https://slides/slide-1.svs",  # scheme
+        "s3://slides/notes.txt",  # not an image file
+        "s3://slides/",  # no object
+    ],
+)
+def test_check_source_uri_rejects_unsafe_or_unapproved_uris(uri):
+    with pytest.raises(UnsafeSourceUri):
+        check_source_uri(uri, kind="source", prefixes=("s3://slides/",))
+
+
+def test_check_source_uri_allows_dated_folders_under_an_approved_prefix():
+    check_source_uri("s3://pathology/2026-08-19/slide-1.svs", kind="source", prefixes=("s3://pathology/",))
+    check_source_uri("s3://thumbs/2026-08-19/slide-1.jpg", kind="thumbnail", prefixes=("s3://thumbs/",))

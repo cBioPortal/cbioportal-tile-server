@@ -86,9 +86,10 @@ exported, and cBioPortal core has imported them.
 ### Modules shared with offline tooling
 
 Preparation pipelines may import `app.tiles`, `app.slide_store`,
-`app.identity`, `app.metadata_contract`, and `app.deid` so their thumbnails,
-tile metadata, and de-identification checks match what this service renders
-and enforces. Treat changes to those modules as contract changes: bump
+`app.identity`, `app.metadata_contract`, and `app.sealed_source` so their
+thumbnails, tile metadata, and sealed-source shape match what this service
+renders and opens. De-identification of study files is the data provider's
+responsibility; this service does not validate study rows. Treat changes to those modules as contract changes: bump
 `IDENTITY_VERSION` or `TILE_METADATA_SCHEMA_VERSION` in `app/identity.py` when
 the rendered output or metadata shape changes, and call the change out in the
 pull request.
@@ -127,7 +128,7 @@ nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes), keyed with the raw
 it when it publishes the slide; cBioPortal stores and forwards it verbatim and
 cannot open it, so neither cBioPortal nor the browser sees the `image_id` or
 source URLs. The tile server decrypts it and applies the source/thumbnail URI
-policy (scheme, approved prefix, extension, identifier checks) before any read.
+policy (scheme, approved prefix, extension, no traversal) before any read.
 Requests that supply a source themselves (`?source=` or `X-WSI-Source`) are
 rejected with `400`. See `../docs/wsi-deid-slide-key-contract.md`
 (`wsi-serving-v6`).

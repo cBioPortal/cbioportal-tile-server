@@ -1,7 +1,9 @@
 import os
 import shutil
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import fsspec
 from tifffile import TiffFile, TiffPageSeries
@@ -30,6 +32,52 @@ def s3_opts() -> dict:
         },
     }
     return opts
+
+
+_URI_EXTENSIONS = {
+    "source": {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"},
+    "thumbnail": {".jpg", ".jpeg", ".png"},
+}
+
+
+class UnsafeSourceUri(ValueError):
+    """A capability's source URI is outside the deployment's approved objects."""
+
+
+def check_source_uri(uri: str, *, kind: str, prefixes: Iterable[str] = ()) -> None:
+    """
+    Accept only a plain s3:// or file:// object under an approved prefix.
+
+    The URI comes from the sealed capability and never leaves this server, so
+    the approved prefixes, not its text, are the boundary. Messages never echo it.
+    """
+    if kind not in _URI_EXTENSIONS:
+        raise UnsafeSourceUri(f"unknown URI kind: {kind}")
+    try:
+        parsed = urlsplit(uri)
+    except ValueError as error:
+        raise UnsafeSourceUri(f"malformed {kind} URI") from error
+    scheme = parsed.scheme.lower()
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise UnsafeSourceUri(f"unsafe {kind} URI")
+    if scheme not in {"s3", "file"}:
+        raise UnsafeSourceUri(f"unsupported {kind} URI scheme")
+    path = unquote(unquote(parsed.path))
+    if (
+        not path
+        or path.endswith("/")
+        or (scheme == "s3" and not parsed.netloc)
+        or (scheme == "file" and (parsed.netloc not in {"", "localhost"} or not path.startswith("/")))
+    ):
+        raise UnsafeSourceUri(f"malformed {kind} URI")
+    if any(segment in {".", ".."} for segment in path.split("/")):
+        raise UnsafeSourceUri(f"unsafe {kind} URI path")
+    normalized = uri.rstrip("/")
+    if prefixes and not any(normalized.startswith(prefix.rstrip("/") + "/") for prefix in prefixes):
+        raise UnsafeSourceUri(f"unapproved {kind} URI prefix")
+    stem, dot, extension = path.rsplit("/", 1)[-1].rpartition(".")
+    if not dot or not stem or f".{extension.lower()}" not in _URI_EXTENSIONS[kind]:
+        raise UnsafeSourceUri(f"{kind} URI is not an image file")
 
 
 def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
