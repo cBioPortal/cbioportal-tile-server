@@ -238,3 +238,26 @@ def test_check_source_uri_rejects_unsafe_or_unapproved_uris(uri):
 def test_check_source_uri_allows_dated_folders_under_an_approved_prefix():
     check_source_uri("s3://pathology/2026-08-19/slide-1.svs", kind="source", prefixes=("s3://pathology/",))
     check_source_uri("s3://thumbs/2026-08-19/slide-1.jpg", kind="thumbnail", prefixes=("s3://thumbs/",))
+
+
+def test_s3_reads_check_the_etag_on_the_client():
+    from app.slide_store import s3_opts
+
+    assert s3_opts()["local_expiry_check"] is True
+
+
+def test_source_changed_errors_are_recognised_through_the_cause_chain():
+    from botocore.exceptions import ClientError
+    from s3fs.utils import FileExpired
+
+    from app.slide_store import is_source_changed_error
+
+    assert is_source_changed_error(FileExpired(filename="bucket/slide.svs", e_tag='"old"'))
+    precondition = ClientError(
+        {"Error": {"Code": "PreconditionFailed"}, "ResponseMetadata": {"HTTPStatusCode": 412}},
+        "GetObject",
+    )
+    wrapped = OSError(22, "Invalid argument")
+    wrapped.__cause__ = precondition
+    assert is_source_changed_error(wrapped)
+    assert not is_source_changed_error(OSError(22, "Invalid argument"))

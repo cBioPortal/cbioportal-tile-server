@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import fsspec
+from s3fs.utils import FileExpired
 from tifffile import TiffFile, TiffPageSeries
 from tiffslide import TiffSlide
 
@@ -25,6 +26,10 @@ def s3_opts() -> dict:
         opts["key"] = settings.aws_access_key_id
     if settings.aws_secret_access_key:
         opts["secret"] = settings.aws_secret_access_key
+    # Compare every range read's ETag with the one the file was opened at, on
+    # the client, so a source replaced in place fails with FileExpired whether
+    # or not the object store honours If-Match.
+    opts["local_expiry_check"] = True
     opts["config_kwargs"] = {
         "connect_timeout": max(0.1, settings.slide_s3_connect_timeout_seconds),
         "read_timeout": max(0.1, settings.slide_s3_read_timeout_seconds),
@@ -45,6 +50,40 @@ _URI_EXTENSIONS = {
 
 class UnsafeSourceUri(ValueError):
     """A capability's source URI is outside the deployment's approved objects."""
+
+
+def source_etag(slide_id: str) -> str | None:
+    """
+    The object's current ETag, read with a fresh HEAD (None for local files).
+
+    Sources can be rewritten in place (an SVS cutover keeps the key but moves
+    every tile), so a cached handle or cached block is only valid for the ETag
+    it was opened against.
+    """
+    if not slide_id.startswith("s3://"):
+        return None
+    bucket, key, storage_options = resolve_s3_location(slide_id)
+    fs = fsspec.filesystem("s3", **storage_options)
+    etag = fs.info(f"{bucket}/{key}", refresh=True).get("ETag")
+    return str(etag) if etag else None
+
+
+def is_source_changed_error(exc: BaseException) -> bool:
+    """Whether a read failed because the object changed after it was opened."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, FileExpired):
+            return True
+        response = getattr(current, "response", None)
+        if isinstance(response, dict):
+            error = response.get("Error", {}) or {}
+            status = (response.get("ResponseMetadata", {}) or {}).get("HTTPStatusCode")
+            if error.get("Code") in ("PreconditionFailed", "412") or status == 412:
+                return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def check_source_uri(uri: str, *, kind: str, prefixes: Iterable[str] = ()) -> None:
@@ -156,17 +195,23 @@ def open_slide(
     slide_id: str,
     logger: Any,
     use_block_cache: bool = True,
+    etag: str | None = None,
 ) -> tuple[TiffSlide, Any]:
     """
     Open a TiffSlide and return (slide, fileobj).
 
     fileobj is the fsspec file handle kept alive alongside the slide.
     When BlockCache is not configured, fileobj is None.
+
+    The block cache is namespaced by etag, the object's ETag when the caller
+    checked it. Reads of an object replaced after opening fail with
+    FileExpired (s3fs compares each response's ETag with the one it opened)
+    instead of mixing the old file's offsets with the new file's bytes.
     """
     if slide_id.startswith("s3://"):
         bucket, key, storage_options = resolve_s3_location(slide_id)
 
-        cache_dir = cache_directory_for_slide(slide_id) if use_block_cache else None
+        cache_dir = cache_directory_for_slide(slide_id, etag) if use_block_cache else None
         if cache_dir is not None:
             cache_dir = os.fspath(cache_dir)
             os.makedirs(cache_dir, exist_ok=True)

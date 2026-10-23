@@ -26,6 +26,7 @@ from .metrics import SLIDE_OPEN_ERRORS, SLIDE_OPEN_SECONDS
 from .slide_store import SlideEntry as _Entry
 from .slide_store import close_entry as _close_entry
 from .slide_store import open_slide as _open_slide
+from .slide_store import source_etag as _source_etag
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -35,6 +36,8 @@ T = TypeVar("T")
 class _CacheEntry:
     entry: _Entry
     active: bool = False
+    # The source ETag the handle and its block cache were opened against.
+    etag: str | None = None
 
 
 @dataclass
@@ -108,13 +111,17 @@ class SlideCache:
             if evicted is not None:
                 _close_entry(evicted.entry)
 
-            cache_lease = cache_lease_for_slide(slide_id)
             started = time.perf_counter()
+            cache_lease = None
             try:
                 try:
+                    # Read the ETag before choosing the block-cache directory,
+                    # so blocks of a replaced object are never reused.
+                    etag = _source_etag(slide_id)
+                    cache_lease = cache_lease_for_slide(slide_id, etag)
                     if cache_lease is not None:
                         cache_lease.__enter__()
-                    slide, fileobj = _open_slide(slide_id, log)
+                    slide, fileobj = _open_slide(slide_id, log, etag=etag)
                 except BaseException as exc:
                     SLIDE_OPEN_ERRORS.labels(error_type=type(exc).__name__).inc()
                     if cache_lease is not None:
@@ -132,9 +139,10 @@ class SlideCache:
                     cached = _CacheEntry(
                         _Entry(slide=slide, fileobj=fileobj, cache_lease=cache_lease),
                         active=True,
+                        etag=etag,
                     )
                     self._cache[slide_id] = cached
-                    touch_slide_cache(slide_id)
+                    touch_slide_cache(slide_id, etag)
                     self._condition.notify_all()
                     if state is not None:
                         state.event.set()
@@ -148,7 +156,7 @@ class SlideCache:
             if current is entry:
                 entry.active = False
                 self._cache.move_to_end(slide_id)
-                touch_slide_cache(slide_id)
+                touch_slide_cache(slide_id, entry.etag)
             self._condition.notify_all()
 
     @contextmanager
@@ -200,6 +208,8 @@ class SlideCache:
         try:
             if entry is not None:
                 _close_entry(entry.entry)
+                purge_slide_cache(slide_id, entry.etag)
+            # The pre-ETag directory name, from images before ETag namespacing.
             purge_slide_cache(slide_id)
             return True
         finally:

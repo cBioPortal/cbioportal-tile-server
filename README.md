@@ -169,7 +169,7 @@ seal key, and an optional Redis cache:
 | `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Renewable cross-worker extraction lock lease |
 | `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `60` | Maximum follower wait for another worker's extraction |
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
-| `BLOCKCACHE_PATH` | — | Optional local range-read cache |
+| `BLOCKCACHE_PATH` | — | Optional local range-read cache, namespaced by each source's ETag so a slide rewritten in place never reuses old blocks |
 | `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
 
 Thumbnail artifacts are generated offline (see
