@@ -308,6 +308,24 @@ class TestTransientSourceFailures:
         assert run.call_count == 2
         repair.assert_called_once_with("s3://bucket/slide.svs")
 
+    def test_source_replaced_in_place_is_reopened_not_retried(self):
+        from s3fs.utils import FileExpired
+
+        slides = object.__new__(main_module.SlideCache)
+        # FileExpired is an EBUSY OSError, which would otherwise read as transient.
+        error = FileExpired(filename="bucket/slide.svs", e_tag='"old"')
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, b"jpeg"]) as run,
+            patch.object(main_module.SlideCache, "repair", return_value=True) as repair,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs", lambda _: None
+            ) == b"jpeg"
+
+        assert run.call_count == 2
+        repair.assert_called_once_with("s3://bucket/slide.svs")
+
     @pytest.mark.parametrize("error", [BlocksizeMismatchError("wrong block size"), TiffFileError("bad cache")])
     def test_cache_read_error_is_repaired_and_retried(self, error):
         slides = object.__new__(main_module.SlideCache)

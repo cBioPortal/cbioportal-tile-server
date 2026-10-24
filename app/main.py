@@ -62,7 +62,7 @@ from .metrics import (
     track_image_operation,
     track_thumbnail_fetch,
 )
-from .slide_store import UnsafeSourceUri, check_source_uri
+from .slide_store import UnsafeSourceUri, check_source_uri, is_source_changed_error
 from .slides import SlideCache
 from .thumbnail_store import (
     ThumbnailRecord,
@@ -213,6 +213,10 @@ def _is_retryable_slide_source_error(exc: Exception) -> bool:
 
 def _is_cache_repairable_slide_error(exc: Exception) -> bool:
     """Identify failures for which reopening after purging the local cache helps."""
+    # A source rewritten in place (same key, new ETag) must be reopened, not
+    # retried: the open handle's offsets belong to the old file.
+    if is_source_changed_error(exc):
+        return True
     if isinstance(
         exc,
         (
