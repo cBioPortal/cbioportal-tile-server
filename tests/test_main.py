@@ -652,6 +652,12 @@ class TestSourceBinding:
             f"study-a\0{SLIDE_KEY}",
         ]
 
+    def test_rate_limit_scope_includes_the_resource_when_named(self):
+        claims = {"study_id": "study-a", "slide_key": SLIDE_KEY}
+        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0{SLIDE_KEY}"
+        claims["resource_id"] = "WSI_SAMPLE"
+        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0WSI_SAMPLE\0{SLIDE_KEY}"
+
     @pytest.mark.asyncio
     async def test_metrics_bypasses_capability_guard(self):
         scope = {

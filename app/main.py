@@ -534,6 +534,10 @@ def _claims(request: Request) -> dict:
     return claims
 
 def _slide_rate_limit_scope(claims: dict) -> str:
+    # A key names a row within its resource, so a capability that names its
+    # resource is scoped to it.
+    if claims.get("resource_id"):
+        return f"{claims['study_id']}\0{claims['resource_id']}\0{claims['slide_key']}"
     return f"{claims['study_id']}\0{claims['slide_key']}"
 
 

@@ -251,7 +251,7 @@ def test_token_must_not_expose_sealed_claims_in_plaintext(claim):
 
 @pytest.mark.parametrize(
     "slide_key",
-    [None, "", "0123456789AB", "0" * 11, "0" * 13, "0123456789abcdef0123456789abcdef", 12345],
+    [None, "", "a key", "a/b", "../x", "a.b", "x" * 129, "k\0", 12345],
 )
 def test_malformed_slide_key_is_rejected(slide_key):
     secret = "s" * 32
@@ -259,6 +259,28 @@ def test_malformed_slide_key_is_rejected(slide_key):
     claims["slide_key"] = slide_key
     with pytest.raises(InvalidWsiToken, match="invalid token slide"):
         validate(make_token(secret, **claims), secret, "cbioportal-wsi")
+
+
+@pytest.mark.parametrize(
+    "slide_key",
+    ["0123456789ab", "0123456789AB", "cycif-roi_17", "k" * 128],
+)
+def test_any_well_formed_resource_key_is_accepted(slide_key):
+    # A capability may name any resource row's serving key; it is bound to the
+    # sealed source as its AAD.
+    secret = "s" * 32
+    token = make_v4_token(secret, slide_key=slide_key, resource_id="ANY_RESOURCE")
+    assert validate(token, secret, "cbioportal-wsi")["slide_key"] == slide_key
+
+
+@pytest.mark.parametrize(
+    "resource_id",
+    ["", "WSI-SAMPLE", "a\0b", "x" * 129, 12345, ["WSI_SAMPLE"]],
+)
+def test_malformed_resource_id_is_rejected(resource_id):
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken, match="invalid token resource"):
+        validate(make_v4_token(secret, resource_id=resource_id), secret, "cbioportal-wsi")
 
 
 @pytest.mark.parametrize(

@@ -12,10 +12,11 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.sealed_source import (
+    CAPABILITY_KEY_PATTERN,
+    RESOURCE_ID_PATTERN,
     SEALED_SOURCE_MIN_BYTES,
     SEALED_SOURCE_NONCE_BYTES,
     SEALED_SOURCE_PATTERN,
-    SLIDE_KEY_PATTERN,
     b64url_decode,
 )
 
@@ -153,8 +154,13 @@ def validate_wsi_token(
     if payload.get("wsi_auth_version") != WSI_AUTH_VERSION:
         raise InvalidWsiToken("unsupported WSI authorization contract")
     slide_key = payload.get("slide_key")
-    if not isinstance(slide_key, str) or not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+    if not isinstance(slide_key, str) or not CAPABILITY_KEY_PATTERN.fullmatch(slide_key):
         raise InvalidWsiToken("invalid token slide")
+    resource_id = payload.get("resource_id")
+    if resource_id is not None and (
+        not isinstance(resource_id, str) or not RESOURCE_ID_PATTERN.fullmatch(resource_id)
+    ):
+        raise InvalidWsiToken("invalid token resource")
     if any(claim in payload for claim in _SEALED_CLAIMS):
         raise InvalidWsiToken("token exposes sealed slide claims")
     for claim in ("thumbnail_width", "thumbnail_height"):
