@@ -15,7 +15,7 @@ from app.sealed_source import (
     SEALED_SOURCE_MIN_BYTES,
     SEALED_SOURCE_NONCE_BYTES,
     SEALED_SOURCE_PATTERN,
-    SLIDE_KEY_PATTERN,
+    CAPABILITY_KEY_PATTERN,
     b64url_decode,
 )
 
@@ -153,7 +153,7 @@ def validate_wsi_token(
     if payload.get("wsi_auth_version") != WSI_AUTH_VERSION:
         raise InvalidWsiToken("unsupported WSI authorization contract")
     slide_key = payload.get("slide_key")
-    if not isinstance(slide_key, str) or not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+    if not isinstance(slide_key, str) or not CAPABILITY_KEY_PATTERN.fullmatch(slide_key):
         raise InvalidWsiToken("invalid token slide")
     if any(claim in payload for claim in _SEALED_CLAIMS):
         raise InvalidWsiToken("token exposes sealed slide claims")
