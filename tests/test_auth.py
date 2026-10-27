@@ -274,6 +274,16 @@ def test_any_well_formed_resource_key_is_accepted(slide_key):
 
 
 @pytest.mark.parametrize(
+    "resource_id",
+    ["", "WSI-SAMPLE", "a\0b", "x" * 129, 12345, ["WSI_SAMPLE"]],
+)
+def test_malformed_resource_id_is_rejected(resource_id):
+    secret = "s" * 32
+    with pytest.raises(InvalidWsiToken, match="invalid token resource"):
+        validate(make_v4_token(secret, resource_id=resource_id), secret, "cbioportal-wsi")
+
+
+@pytest.mark.parametrize(
     ("secret", "audience", "max_ttl", "seal_key"),
     [
         ("s" * 31, "cbioportal-wsi", 300, SEAL_KEY),
