@@ -10,8 +10,8 @@ from pydantic import ValidationError
 from app import agent
 from app import annotations as annotation_store
 
-SLIDE_A = "a" * 32
-SLIDE_B = "b" * 32
+SLIDE_A = "a" * 12
+SLIDE_B = "b" * 12
 
 
 def make_context() -> agent.AgentContext:

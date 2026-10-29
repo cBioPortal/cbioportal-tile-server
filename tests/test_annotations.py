@@ -17,7 +17,7 @@ from app.annotations import (
     AnnotationUpdate,
 )
 
-SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+SLIDE_KEY = "0123456789ab"
 
 
 def user(

@@ -57,7 +57,7 @@ from . import annotations as annotation_store
 from .auth import scoped_user_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
-from .deid import SLIDE_KEY_PATTERN
+from .sealed_source import SLIDE_KEY_PATTERN
 from .research import _load_manifest, _similar_slides_for_model, search_regions_for_agent
 
 logger = logging.getLogger(__name__)

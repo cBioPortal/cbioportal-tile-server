@@ -13,11 +13,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.deid import (
+from app.sealed_source import (
+    CAPABILITY_KEY_PATTERN,
+    RESOURCE_ID_PATTERN,
     SEALED_SOURCE_MIN_BYTES,
     SEALED_SOURCE_NONCE_BYTES,
     SEALED_SOURCE_PATTERN,
-    SLIDE_KEY_PATTERN,
     b64url_decode,
 )
 from app.config import settings
@@ -37,22 +38,6 @@ class InvalidWsiToken(ValueError):
 def source_digest(source: str) -> str:
     """Hash a source URL for cache keys and log correlation without exposing it."""
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
-
-
-def source_cache_identity(source: str, source_fingerprint: str | None = None) -> str:
-    """Return a stable cache namespace for one published source version.
-
-    The URL is still the authorization binding.  The optional serving-manifest
-    fingerprint additionally distinguishes replacements of the object at the
-    same URL, which prevents Redis and local block-cache entries from serving
-    bytes certified for an older source version.
-    """
-    fingerprint = (source_fingerprint or "").strip()
-    if not fingerprint:
-        return source_digest(source)
-    return hashlib.sha256(
-        f"{source_digest(source)}\0{fingerprint}".encode("utf-8")
-    ).hexdigest()
 
 
 def _b64decode(value: str) -> bytes:
@@ -186,18 +171,15 @@ def validate_wsi_token(
     if payload.get("wsi_auth_version") != WSI_AUTH_VERSION:
         raise InvalidWsiToken("unsupported WSI authorization contract")
     slide_key = payload.get("slide_key")
-    if not isinstance(slide_key, str) or not SLIDE_KEY_PATTERN.fullmatch(slide_key):
+    if not isinstance(slide_key, str) or not CAPABILITY_KEY_PATTERN.fullmatch(slide_key):
         raise InvalidWsiToken("invalid token slide")
+    resource_id = payload.get("resource_id")
+    if resource_id is not None and (
+        not isinstance(resource_id, str) or not RESOURCE_ID_PATTERN.fullmatch(resource_id)
+    ):
+        raise InvalidWsiToken("invalid token resource")
     if any(claim in payload for claim in _SEALED_CLAIMS):
         raise InvalidWsiToken("token exposes sealed slide claims")
-    for claim in ("tile_source_fingerprint", "thumbnail_source_fingerprint"):
-        value = payload.get(claim)
-        if value is not None and (
-            not isinstance(value, str)
-            or len(value) != 64
-            or any(char not in "0123456789abcdef" for char in value)
-        ):
-            raise InvalidWsiToken("invalid token source fingerprint")
     for claim in ("thumbnail_width", "thumbnail_height"):
         value = payload.get(claim)
         if type(value) is not int or value <= 0 or value > 8192:
@@ -211,10 +193,11 @@ def validate_wsi_token(
     return claims
 
 
-# Claims that bind a capability to one slide.  Study-scoped capabilities
-# (annotations, the assistant) must carry none of them, so a leaked one can
-# never open tiles and a slide capability can never write annotations.
-_SLIDE_CLAIMS = ("slide_key", "enc", "wsi_auth_version") + _SEALED_CLAIMS
+# Claims that bind a capability to one slide or resource row.  Study-scoped
+# capabilities (annotations, the assistant) must carry none of them, so a
+# leaked one can never open tiles and a slide capability can never write
+# annotations.
+_SLIDE_CLAIMS = ("slide_key", "resource_id", "enc", "wsi_auth_version") + _SEALED_CLAIMS
 
 
 def validate_scoped_capability(
