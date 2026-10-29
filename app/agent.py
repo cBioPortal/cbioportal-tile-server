@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import configparser
 from datetime import datetime, timedelta, timezone
+import functools
 import hashlib
 import json
 import logging
@@ -28,7 +30,16 @@ import aiosqlite
 import boto3
 from botocore.exceptions import ClientError
 try:
-    from agents import Agent, ModelSettings, RunContextWrapper, Runner, function_tool
+    from agents import (
+        Agent,
+        ModelSettings,
+        OpenAIResponsesModel,
+        RunContextWrapper,
+        Runner,
+        function_tool,
+        set_tracing_disabled,
+    )
+    from openai import AsyncOpenAI
 except ModuleNotFoundError:  # Bedrock deployments do not need the legacy SDK.
     class RunContextWrapper:  # type: ignore[no-redef]
         def __init__(self, context: Any):
@@ -49,6 +60,12 @@ except ModuleNotFoundError:  # Bedrock deployments do not need the legacy SDK.
 
     def function_tool(function):  # type: ignore[no-redef]
         return function
+
+    OpenAIResponsesModel = None  # type: ignore[assignment,misc]
+    AsyncOpenAI = None  # type: ignore[assignment,misc]
+
+    def set_tracing_disabled(disabled: bool) -> None:  # type: ignore[no-redef]
+        return None
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -960,6 +977,83 @@ def _ensure_openai_credentials() -> bool:
     return False
 
 
+def _databricks_credentials() -> tuple[str, str] | None:
+    """Return the Databricks workspace URL and token, or None if incomplete.
+
+    ``DATABRICKS_HOST`` and ``DATABRICKS_TOKEN`` (or ``DATABRICKS_TOKEN_FILE``)
+    take precedence; otherwise both come from the configured profile of the
+    Databricks CLI config file.  The token is never logged.
+    """
+    host = settings.databricks_host.strip()
+    token = settings.databricks_token.strip()
+    if not token and settings.databricks_token_file:
+        try:
+            lines = (
+                Path(settings.databricks_token_file)
+                .expanduser()
+                .read_text(encoding="utf-8")
+                .splitlines()
+            )
+            token = lines[0].strip() if lines else ""
+        except OSError:
+            token = ""
+    if not host or not token:
+        profile: dict[str, str] = {}
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(Path(settings.databricks_config_file).expanduser(), encoding="utf-8")
+            name = settings.databricks_config_profile or "DEFAULT"
+            if name == "DEFAULT" or parser.has_section(name):
+                profile = dict(parser[name])
+        except (configparser.Error, OSError):
+            profile = {}
+        host = host or profile.get("host", "").strip()
+        token = token or profile.get("token", "").strip()
+    if not host or not token:
+        return None
+    if not host.startswith(("https://", "http://")):
+        host = f"https://{host}"
+    return host.rstrip("/"), token
+
+
+def _databricks_configured() -> bool:
+    return OpenAIResponsesModel is not None and _databricks_credentials() is not None
+
+
+@functools.lru_cache(maxsize=4)
+def _databricks_client(base_url: str, token: str) -> "AsyncOpenAI":
+    return AsyncOpenAI(base_url=base_url, api_key=token)
+
+
+def _agent_model() -> Any:
+    """Return the Agents SDK model for the configured OpenAI-compatible provider."""
+    if settings.agent_provider.lower() != "databricks":
+        return settings.agent_model
+    credentials = _databricks_credentials()
+    if credentials is None:
+        raise RuntimeError("Databricks credentials are not configured")
+    host, token = credentials
+    # Traces would otherwise be exported to OpenAI with the run's inputs.
+    set_tracing_disabled(True)
+    return OpenAIResponsesModel(
+        model=settings.agent_model,
+        openai_client=_databricks_client(f"{host}/serving-endpoints", token),
+    )
+
+
+def _provider_configured(*, load_credentials: bool = True) -> bool:
+    provider = settings.agent_provider.lower()
+    if provider == "bedrock":
+        return _bedrock_configured()
+    if provider == "databricks":
+        return _databricks_configured()
+    if load_credentials:
+        return _ensure_openai_credentials()
+    return bool(
+        os.environ.get("OPENAI_API_KEY", "").startswith("sk-") or _read_api_key_file()
+    )
+
+
 def _validate_context(context: AgentContext) -> None:
     if (
         not context.viewport.source_fingerprint
@@ -1577,7 +1671,7 @@ def _build_agent() -> Agent:
     return Agent(
         name="WSI research assistant",
         instructions=_agent_instructions(),
-        model=settings.agent_model,
+        model=_agent_model(),
         model_settings=ModelSettings(
             store=False,
             max_tokens=1500,
@@ -2098,9 +2192,8 @@ def _sse(event: str, payload: Any) -> str:
 
 
 async def _stream_agent(request: ChatRequest, user_sub: str):
-    # The legacy stream remains available to offline unit tests and explicit
-    # OpenAI-provider development runs. Bedrock runs require configured AWS
-    # credentials before attempting the provider call.
+    # Bedrock runs use the Converse API when AWS credentials are configured;
+    # the OpenAI and Databricks providers run through the Agents SDK.
     if settings.agent_provider.lower() == "bedrock" and _bedrock_configured():
         try:
             async for chunk in _stream_bedrock(request, user_sub):
@@ -2166,9 +2259,7 @@ def _require_study(user: dict[str, Any], study_id: str) -> None:
 async def agent_health() -> dict[str, Any]:
     return {
         "enabled": bool(settings.agent_enabled),
-        "configured": _bedrock_configured()
-        if settings.agent_provider.lower() == "bedrock"
-        else bool(os.environ.get("OPENAI_API_KEY", "").startswith("sk-") or _read_api_key_file()),
+        "configured": _provider_configured(load_credentials=False),
         "provider": settings.agent_provider,
         "model": settings.agent_model,
     }
@@ -2183,12 +2274,7 @@ async def agent_chat(
         raise HTTPException(
             status_code=404, detail="WSI research assistant is disabled"
         )
-    configured = (
-        _bedrock_configured()
-        if settings.agent_provider.lower() == "bedrock"
-        else _ensure_openai_credentials()
-    )
-    if not configured:
+    if not _provider_configured():
         raise HTTPException(
             status_code=503, detail="WSI research assistant is not configured"
         )

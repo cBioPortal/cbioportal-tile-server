@@ -180,14 +180,30 @@ class Settings:
     )
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
     agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
+    # WSI_AGENT_MODEL names the model for any provider (a Bedrock model ID,
+    # an OpenAI model, or a Databricks serving endpoint name);
+    # BEDROCK_AGENT_MODEL is read when it is unset.
     agent_model: str = field(
-        default_factory=lambda: _env_str(
-            "BEDROCK_AGENT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-        )
+        default_factory=lambda: _env_str("WSI_AGENT_MODEL")
+        or _env_str("BEDROCK_AGENT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
     )
     agent_region: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_REGION", "us-east-1"))
     agent_profile: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_PROFILE"))
     agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    # WSI_AGENT_PROVIDER=databricks: the workspace serves the OpenAI
+    # Responses API at <host>/serving-endpoints. Host and token come from
+    # these variables, else from a profile of the Databricks CLI config file.
+    databricks_host: str = field(default_factory=lambda: _env_str("DATABRICKS_HOST"))
+    databricks_token: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_TOKEN"), repr=False
+    )
+    databricks_token_file: str = field(default_factory=lambda: _env_str("DATABRICKS_TOKEN_FILE"))
+    databricks_config_file: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_CONFIG_FILE", "~/.databrickscfg")
+    )
+    databricks_config_profile: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
+    )
     research_enabled: bool = field(default_factory=lambda: _env_bool("WSI_RESEARCH_ENABLED", False))
     research_manifest_uri: str = field(default_factory=lambda: _env_str("WSI_RESEARCH_MANIFEST_URI"))
     research_rate_limit_per_minute: int = field(

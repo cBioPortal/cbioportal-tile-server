@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -21,5 +22,16 @@ def test_tile_server_has_no_databricks_code():
         "materialize_dev_wsi_snapshot.py",
     ):
         assert not (ROOT / "tools" / filename).exists()
+    # The assistant may call a Databricks model-serving endpoint through the
+    # OpenAI client (app/agent.py, configured in app/config.py); no module may
+    # use a Databricks SDK, connector or REST job/SQL API.
+    forbidden = re.compile(
+        r"^\s*(?:from|import)\s+(?:databricks|pyspark|dbutils)\b|/api/2\.\d/(?:jobs|sql)",
+        re.MULTILINE,
+    )
+    provider_modules = {"agent.py", "config.py"}
     for path in (ROOT / "app").glob("*.py"):
-        assert "databricks" not in path.read_text(encoding="utf-8").lower(), path.name
+        text = path.read_text(encoding="utf-8")
+        assert not forbidden.search(text), path.name
+        if path.name not in provider_modules:
+            assert "databricks" not in text.lower(), path.name

@@ -403,6 +403,77 @@ def test_bedrock_client_isolated_from_slide_store_endpoint(monkeypatch):
     assert client_kwargs["endpoint_url"] == "https://bedrock-runtime.us-east-1.amazonaws.com"
 
 
+@pytest.fixture
+def databricks_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent.settings, "agent_provider", "databricks")
+    monkeypatch.setattr(agent.settings, "agent_model", "databricks-gpt-5-6-terra")
+    monkeypatch.setattr(agent.settings, "databricks_host", "")
+    monkeypatch.setattr(agent.settings, "databricks_token", "")
+    monkeypatch.setattr(agent.settings, "databricks_token_file", "")
+    monkeypatch.setattr(agent.settings, "databricks_config_file", str(tmp_path / "missing.cfg"))
+    monkeypatch.setattr(agent.settings, "databricks_config_profile", "DEFAULT")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    agent._databricks_client.cache_clear()
+    yield tmp_path
+    agent._databricks_client.cache_clear()
+
+
+def test_databricks_provider_serves_the_agent_from_the_workspace(databricks_provider, monkeypatch):
+    monkeypatch.setattr(agent.settings, "databricks_host", "https://example.cloud.databricks.com/")
+    monkeypatch.setattr(agent.settings, "databricks_token", "dapi-test-token")
+    tracing = []
+    monkeypatch.setattr(agent, "set_tracing_disabled", tracing.append)
+
+    assert agent._provider_configured() is True
+    # The workspace token is not an OpenAI key and is never exported as one.
+    assert "OPENAI_API_KEY" not in agent.os.environ
+    model = agent._build_agent().model
+    assert isinstance(model, agent.OpenAIResponsesModel)
+    assert model.model == "databricks-gpt-5-6-terra"
+    assert str(model._client.base_url) == "https://example.cloud.databricks.com/serving-endpoints/"
+    assert model._client.api_key == "dapi-test-token"
+    assert tracing == [True]
+
+
+def test_databricks_provider_reads_the_cli_profile(databricks_provider, monkeypatch):
+    config = databricks_provider / "databrickscfg"
+    config.write_text(
+        "[DEFAULT]\nhost = https://default.cloud.databricks.com\ntoken = dapi-default\n\n"
+        "[other]\nhost = other.cloud.databricks.com\ntoken = dapi-other\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agent.settings, "databricks_config_file", str(config))
+    assert agent._databricks_credentials() == (
+        "https://default.cloud.databricks.com",
+        "dapi-default",
+    )
+    monkeypatch.setattr(agent.settings, "databricks_config_profile", "other")
+    assert agent._databricks_credentials() == (
+        "https://other.cloud.databricks.com",
+        "dapi-other",
+    )
+    token_file = databricks_provider / "token"
+    token_file.write_text("dapi-from-file\n", encoding="utf-8")
+    monkeypatch.setattr(agent.settings, "databricks_token_file", str(token_file))
+    assert agent._databricks_credentials() == (
+        "https://other.cloud.databricks.com",
+        "dapi-from-file",
+    )
+
+
+@pytest.mark.asyncio
+async def test_databricks_provider_requires_credentials(databricks_provider, monkeypatch):
+    monkeypatch.setattr(agent.settings, "agent_enabled", True)
+    assert agent._provider_configured() is False
+    assert (await agent.agent_health())["configured"] is False
+    request = agent.ChatRequest(
+        session_id="session-a", message="Summarize this", context=make_context()
+    )
+    with pytest.raises(HTTPException) as error:
+        await agent.agent_chat(request, {"sub": "user-a", "study_id": "study-a"})
+    assert error.value.status_code == 503
+
+
 @pytest.mark.asyncio
 async def test_action_list_is_session_and_user_scoped(agent_db):
     context = make_context()

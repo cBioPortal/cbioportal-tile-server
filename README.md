@@ -179,12 +179,16 @@ seal key, and an optional Redis cache:
 | `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
 | `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Dev-only compatibility for legacy seeded rows under the synthetic local-development subject |
 | `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
-| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider; `bedrock` is the production path |
+| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
 | `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
 | `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
 | `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
 | `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
 | `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_MODEL` | `BEDROCK_AGENT_MODEL` | Assistant model for any provider: Bedrock model ID, OpenAI model, or Databricks serving endpoint name |
+| `DATABRICKS_HOST` | profile `host` | Workspace URL for `WSI_AGENT_PROVIDER=databricks`; the OpenAI Responses API is called at `<host>/serving-endpoints` |
+| `DATABRICKS_TOKEN` / `DATABRICKS_TOKEN_FILE` | profile `token` | Workspace token (or a file holding it) for the Databricks provider |
+| `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
 | `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
 | `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
 | `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
@@ -257,6 +261,11 @@ set `WSI_AGENT_ENABLED=true`. The browser receives only the short-lived WSI
 capability; the OpenAI credential stays in the tile-server process. Assistant
 annotation and viewer changes are persisted as pending proposals and require
 explicit approval in the viewer before application.
+
+With `WSI_AGENT_PROVIDER=databricks` the assistant runs through the same
+Agents SDK path against a Databricks model-serving endpoint named by
+`WSI_AGENT_MODEL` (for example `databricks-gpt-5-6-terra`). The workspace
+token stays in the tile-server process and Agents SDK tracing is disabled.
 
 ## Local slide tests
 
