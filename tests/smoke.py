@@ -10,7 +10,7 @@ Example:
     export WSI_SMOKE_ENC=...            # the row's sealed source
     export WSI_SMOKE_COOKIE='SESSION=...'  # optional, only behind the ingress
     python tests/smoke.py --host http://localhost:8081 \
-        --study-id study_a --key 0123456789ab --tw 1024 --th 768
+        --study-id study_a --key 0123456789ab
 """
 
 import argparse
@@ -33,8 +33,6 @@ def run_smoke(
     study_id: str,
     key: str,
     enc: str,
-    thumbnail_width: int,
-    thumbnail_height: int,
     cookie: str = "",
 ) -> bool:
     host = host.rstrip("/")
@@ -60,7 +58,7 @@ def run_smoke(
 
     response = session.get(
         f"{host}/thumbnails",
-        params={**slide, "tw": thumbnail_width, "th": thumbnail_height, "width": 256, "height": 256},
+        params={**slide, "width": 256, "height": 256},
         timeout=30,
     )
     ok = check("/thumbnails", response) and response.headers.get("content-type", "").startswith("image/")
@@ -80,7 +78,7 @@ def run_smoke(
 
     rebound = "f" * 12 if key != "f" * 12 else "e" * 12
     response = session.get(f"{host}/tiles/zxy/0/0/0", params={**slide, "key": rebound}, timeout=30)
-    ok = check("sealed source under another key", response, 403)
+    ok = check("sealed source under another key", response, 404)
     passed += int(ok); failed += int(not ok)
 
     print(f"\n  Passed: {passed}   Failed: {failed}")
@@ -92,8 +90,6 @@ def main() -> None:
     parser.add_argument("--host", default="http://localhost:8081")
     parser.add_argument("--study-id", required=True)
     parser.add_argument("--key", required=True)
-    parser.add_argument("--tw", type=int, required=True, help="intrinsic thumbnail width")
-    parser.add_argument("--th", type=int, required=True, help="intrinsic thumbnail height")
     args = parser.parse_args()
     enc = os.environ.get("WSI_SMOKE_ENC", "")
     if not enc:
@@ -103,8 +99,6 @@ def main() -> None:
         args.study_id,
         args.key,
         enc,
-        args.tw,
-        args.th,
         os.environ.get("WSI_SMOKE_COOKIE", ""),
     )
     sys.exit(0 if ok else 1)

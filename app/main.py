@@ -31,7 +31,7 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
     HTTPClientError,
 )
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fsspec.exceptions import BlocksizeMismatchError
 from tifffile import TiffFileError
@@ -78,18 +78,22 @@ from .thumbnail_store import (
     initialize_runtime_store,
     read_thumbnail_bytes,
     render_thumbnail_payload,
+    thumbnail_size,
 )
 from .tiles import InvalidTileRequest, OverviewTooLarge, get_tile_bytes
 
 logger = logging.getLogger(__name__)
 
-# Reported by /health and /ready. 5: tokenless `studyId`+`key`+`enc` requests
-# authorized at the ingress (4 was the Bearer capability JWT).
+# Reported by /health and /ready. 5: `studyId`+`key`+`enc` requests authorized
+# at the ingress, with no token checked here.
 ACCESS_CONTRACT_VERSION = 5
-# A plausible cBioPortal cancer study identifier.
-STUDY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-THUMBNAIL_DIMENSION_PATTERN = re.compile(r"^[1-9][0-9]{0,3}$")
-MAX_THUMBNAIL_DIMENSION = 8192
+# A plausible cBioPortal cancer study identifier; never only dots, so it cannot
+# become a `.`/`..` path segment in the ingress's `/api/studies/{studyId}`.
+STUDY_ID_PATTERN = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,128}$")
+# Requested thumbnail size: a positive integer, clamped to MAX_THUMBNAIL_SIZE.
+THUMBNAIL_SIZE_PATTERN = re.compile(r"^[1-9][0-9]{0,8}$")
+DEFAULT_THUMBNAIL_SIZE = 256
+MAX_THUMBNAIL_SIZE = 2048
 
 _slides: SlideCache | None = None
 _image_operation_semaphore: asyncio.Semaphore | None = None
@@ -399,7 +403,7 @@ app.add_middleware(
 # reuse a response across sessions.
 TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Cookie"}
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Cookie"}
-PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
+PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
 
 
 async def _in_thread(fn, *args):
@@ -503,33 +507,43 @@ def _allowed_source(source: str) -> str:
 
 
 def _single_query_value(request: Request, name: str) -> str | None:
-    """Return one query parameter, refusing repeats so the ingress (which
-    authorizes on the first `studyId`) and this service read the same value."""
-    values = request.query_params.getlist(name)
+    """Return one query parameter, matching its name case-insensitively.
+
+    nginx `$arg_` lookups ignore case, so `StudyID=a&studyId=b` could
+    authorize one study at the ingress and name another here. Any repeat,
+    in any case, is refused so both read the same value.
+    """
+    wanted = name.lower()
+    values = [
+        value
+        for param, value in request.query_params.multi_items()
+        if param.lower() == wanted
+    ]
     if len(values) > 1:
         raise HTTPException(status_code=400, detail=f"{name} must be given once")
     return values[0] if values else None
 
 
 def _client_address(request: Request) -> str:
-    """The rate-limit subject: the first X-Forwarded-For hop, else the peer."""
+    """The rate-limit subject: the last X-Forwarded-For entry, else the peer.
+
+    The ingress appends (or sets) the address it saw as the last entry;
+    anything before it is client-supplied and must not pick the bucket.
+    """
     forwarded = request.headers.get("x-forwarded-for", "")
-    first = forwarded.split(",", 1)[0].strip()
-    if first:
-        return first
+    last = forwarded.rsplit(",", 1)[-1].strip()
+    if last:
+        return last
     return request.client.host if request.client else "unknown"
-
-
-def _slide_rate_limit_scope(study_id: str, key: str) -> str:
-    return f"{study_id}\0{key}"
 
 
 def _open_slide_request(request: Request) -> tuple[str, dict]:
     """Validate `studyId`, `key` and `enc`, and open the sealed source.
 
-    Returns the rate-limit scope and the decrypted claims. Malformed input is
-    a 400; an `enc` that does not open under `key` is a 403. Values are never
-    echoed.
+    Returns the rate-limit scope (the slide's `key`; `studyId` is not bound to
+    the slide) and the decrypted claims. Malformed input is a 400; an `enc`
+    that does not open under `key` is a 404, so the service's own refusals
+    never look like the ingress's 401/403. Values are never echoed.
     """
     study_id = _single_query_value(request, "studyId")
     if study_id is None or not STUDY_ID_PATTERN.fullmatch(study_id):
@@ -550,26 +564,30 @@ def _open_slide_request(request: Request) -> tuple[str, dict]:
     try:
         claims = decrypt_sealed_claims(enc, _source_seal_key, key)
     except InvalidSealedSource:
-        raise HTTPException(status_code=403, detail="sealed source does not match key") from None
-    return _slide_rate_limit_scope(study_id, key), claims
+        raise HTTPException(status_code=404, detail="slide not found") from None
+    return key, claims
 
 
-def _thumbnail_dimension(request: Request, name: str) -> int:
+def _thumbnail_size(request: Request, name: str) -> int:
+    """An optional requested thumbnail size, given at most once, clamped."""
     value = _single_query_value(request, name)
-    if value is None or not THUMBNAIL_DIMENSION_PATTERN.fullmatch(value):
-        raise HTTPException(status_code=400, detail=f"{name} is missing or malformed")
-    number = int(value)
-    if number > MAX_THUMBNAIL_DIMENSION:
-        raise HTTPException(status_code=400, detail=f"{name} is missing or malformed")
-    return number
+    if value is None:
+        return DEFAULT_THUMBNAIL_SIZE
+    if not THUMBNAIL_SIZE_PATTERN.fullmatch(value):
+        raise HTTPException(status_code=400, detail=f"{name} is malformed")
+    return min(int(value), MAX_THUMBNAIL_SIZE)
 
 
 def _authorize_source(claims: dict, operation: str) -> str:
-    """Return the sealed source for `operation` once it passes the artifact policy."""
-    source = _allowed_source(
-        claims.get("tile_source" if operation == "tile" else "thumbnail_source")
-    )
+    """Return the sealed source for `operation` once it passes the artifact policy.
+
+    A sealed source outside the policy is a 404: the request was well formed,
+    the slide just cannot be served. The log and the response omit the URL.
+    """
     try:
+        source = _allowed_source(
+            claims.get("tile_source" if operation == "tile" else "thumbnail_source")
+        )
         check_source_uri(
             source,
             kind="source" if operation == "tile" else "thumbnail",
@@ -579,14 +597,22 @@ def _authorize_source(claims: dict, operation: str) -> str:
                 else settings.wsi_allowed_thumbnail_prefixes
             ),
         )
-    except UnsafeSourceUri:
-        raise HTTPException(status_code=403, detail="source is outside de-id policy")
+    except (HTTPException, UnsafeSourceUri) as exc:
+        logger.warning(
+            "Sealed %s source is outside the de-id policy; reason=%s",
+            operation,
+            exc.detail if isinstance(exc, HTTPException) else exc,
+        )
+        raise HTTPException(status_code=404, detail="source slide not found") from None
     return source
 
 
-def _reject_client_source(request: Request, query_source: str | None) -> None:
+def _reject_client_source(request: Request) -> None:
     """Refuse browser-supplied source bindings; the sealed `enc` carries them."""
-    if query_source is not None or "x-wsi-source" in request.headers:
+    if (
+        any(param.lower() == "source" for param in request.query_params.keys())
+        or "x-wsi-source" in request.headers
+    ):
         raise HTTPException(
             status_code=400,
             detail="client-supplied source bindings are not accepted",
@@ -794,9 +820,8 @@ async def tile(
     z: int,
     x: int,
     y: int,
-    source: str | None = Query(None),
 ):
-    _reject_client_source(request, source)
+    _reject_client_source(request)
     scope, claims = _open_slide_request(request)
     source = _authorize_source(claims, "tile")
     cache_key = source_digest(source)
@@ -848,32 +873,24 @@ async def tile(
 
 
 @app.get("/thumbnails")
-async def thumbnail(
-    request: Request,
-    source: str | None = Query(None),
-    width: int = 256,
-    height: int = 256,
-):
-    _reject_client_source(request, source)
+async def thumbnail(request: Request):
+    # `tw`/`th`, if a client still sends them, are ignored: the stored
+    # thumbnail's own size decides pass-through vs resize, so nothing in the
+    # request outside the cache key can change what is cached under it.
+    _reject_client_source(request)
+    width = _thumbnail_size(request, "width")
+    height = _thumbnail_size(request, "height")
     scope, claims = _open_slide_request(request)
-    thumbnail_width = _thumbnail_dimension(request, "tw")
-    thumbnail_height = _thumbnail_dimension(request, "th")
     source = _authorize_source(claims, "thumbnail")
-    width = max(1, min(width, 2048))
-    height = max(1, min(height, 2048))
     cache_key = source_digest(source)
     cached = await tile_cache.get_thumbnail(cache_key, width, height)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
-        record = ThumbnailRecord(
-            uri=source,
-            width=thumbnail_width,
-            height=thumbnail_height,
-        )
-        payload = await _run_thumbnail_fetch(record)
-        if width >= record.width and height >= record.height:
+        payload = await _run_thumbnail_fetch(ThumbnailRecord(uri=source))
+        master_width, master_height = thumbnail_size(payload)
+        if width >= master_width and height >= master_height:
             data, status = payload, {"status": "ok", "reason": "master"}
         else:
             resize_started = time.perf_counter()
@@ -881,7 +898,6 @@ async def thumbnail(
                 data, status = await _run_image_operation(
                     render_thumbnail_payload,
                     payload,
-                    record,
                     width,
                     height,
                     operation_kind="thumbnail_resize",

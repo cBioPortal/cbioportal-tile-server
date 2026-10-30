@@ -1,11 +1,13 @@
 import asyncio
 import json
+from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 from fsspec.exceptions import BlocksizeMismatchError
+from PIL import Image
 from tifffile import TiffFileError
 
 import app.auth as auth_module
@@ -598,7 +600,13 @@ def _query(**overrides) -> dict:
 
 
 def _thumbnail_query(**overrides) -> dict:
-    return _query(**{"tw": "1024", "th": "768", "width": "128", "height": "96", **overrides})
+    return _query(**{"width": "128", "height": "96", **overrides})
+
+
+def _jpeg(size: tuple[int, int]) -> bytes:
+    out = BytesIO()
+    Image.new("RGB", size, (120, 140, 160)).save(out, format="JPEG")
+    return out.getvalue()
 
 
 async def _get(path: str, params=None, headers=None) -> httpx.Response:
@@ -631,34 +639,92 @@ class TestSlideRoutes:
         assert response.headers["cache-control"] == cache_control
         assert response.headers["vary"] == "Cookie"
 
-    @pytest.mark.asyncio
-    async def test_thumbnail_uses_intrinsic_dimensions_from_the_request(
-        self, slide_settings
-    ):
+    async def _serve_thumbnail(self, params, master: bytes):
+        """Serve one thumbnail miss; return (response, fetched records, cache writes)."""
         records = []
+        stored = AsyncMock()
 
         async def fetch(record):
             records.append(record)
-            return b"master"
+            return master
 
-        async def run_image_operation(fn, payload, record, width, height, **kwargs):
-            return b"resized", {"status": "ok", "reason": "resized"}
+        async def run_image_operation(fn, *args, **kwargs):
+            return fn(*args)
 
         with (
             patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=None)),
-            patch.object(main_module.tile_cache, "set_thumbnail", new=AsyncMock()),
+            patch.object(main_module.tile_cache, "set_thumbnail", new=stored),
             patch.object(main_module.tile_cache, "try_acquire_miss_lock", new=AsyncMock(return_value=None)),
             patch.object(main_module, "_run_thumbnail_fetch", side_effect=fetch),
             patch.object(main_module, "_run_image_operation", side_effect=run_image_operation),
         ):
-            response = await _get("/thumbnails", _thumbnail_query(tw="2000", th="1500"))
+            response = await _get("/thumbnails", params)
+        return response, records, [call.args for call in stored.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_resizes_by_the_stored_thumbnail_size(self, slide_settings):
+        response, records, writes = await self._serve_thumbnail(
+            _thumbnail_query(), _jpeg((1024, 768))
+        )
 
         assert response.status_code == 200
-        assert response.content == b"resized"
         assert response.headers["x-thumbnail-reason"] == "resized"
-        assert [(r.uri, r.width, r.height) for r in records] == [
-            (THUMBNAIL_SOURCE, 2000, 1500)
+        assert Image.open(BytesIO(response.content)).size == (128, 96)
+        assert [r.uri for r in records] == [THUMBNAIL_SOURCE]
+        assert [args[:3] for args in writes] == [
+            (main_module.source_digest(THUMBNAIL_SOURCE), 128, 96)
         ]
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_passes_a_master_that_fits_through(self, slide_settings):
+        master = _jpeg((100, 50))
+        response, _, writes = await self._serve_thumbnail(_thumbnail_query(), master)
+
+        assert response.status_code == 200
+        assert response.headers["x-thumbnail-reason"] == "master"
+        assert response.content == master
+        assert writes[0][3] == master
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lie",
+        [
+            # Claims the master already fits, which would cache it unresized.
+            {"tw": "1", "th": "1"},
+            # Claims a huge master.
+            {"tw": "8192", "th": "8192"},
+            # Malformed values are ignored too, not rejected.
+            {"tw": "abc", "th": "-1"},
+        ],
+    )
+    async def test_client_thumbnail_dimensions_cannot_change_what_is_cached(
+        self, slide_settings, lie
+    ):
+        master = _jpeg((1024, 768))
+        honest, _, honest_writes = await self._serve_thumbnail(_thumbnail_query(), master)
+        lying, _, lying_writes = await self._serve_thumbnail(
+            _thumbnail_query(**lie), master
+        )
+
+        assert honest.status_code == lying.status_code == 200
+        assert lying.content == honest.content
+        assert lying.headers["x-thumbnail-reason"] == "resized"
+        assert lying_writes == honest_writes
+        assert Image.open(BytesIO(lying_writes[0][3])).size == (128, 96)
+
+    @pytest.mark.asyncio
+    async def test_repeated_legacy_thumbnail_dimensions_are_ignored(self, slide_settings):
+        params = list(_thumbnail_query().items()) + [("tw", "1"), ("tw", "2"), ("TH", "3")]
+        response, _, _ = await self._serve_thumbnail(params, _jpeg((1024, 768)))
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_unreadable_stored_thumbnail_is_unavailable(self, slide_settings):
+        response, _, writes = await self._serve_thumbnail(_thumbnail_query(), b"not a jpeg")
+
+        assert response.status_code == 502
+        assert writes == []
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
@@ -670,6 +736,9 @@ class TestSlideRoutes:
             {"studyId": "study a"},
             {"studyId": "study/a"},
             {"studyId": "s" * 129},
+            {"studyId": "."},
+            {"studyId": ".."},
+            {"studyId": "..."},
             {"key": None},
             {"key": ""},
             {"key": "a/b"},
@@ -696,36 +765,79 @@ class TestSlideRoutes:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("name", ["studyId", "key", "enc"])
-    async def test_repeated_slide_parameters_are_rejected(self, slide_settings, name):
-        params = list(_query().items()) + [(name, _query()[name])]
-        with patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=b"x")):
+    @pytest.mark.parametrize("repeat_as", [str, str.upper, str.lower, str.title])
+    async def test_repeated_slide_parameters_are_rejected_in_any_case(
+        self, slide_settings, name, repeat_as
+    ):
+        # nginx `$arg_` lookups ignore case, so `StudyID=a&studyId=b` is a repeat.
+        params = list(_query().items()) + [(repeat_as(name), _query()[name])]
+        cached = AsyncMock(return_value=b"x")
+        with patch.object(main_module.tile_cache, "get_tile", new=cached):
             response = await _get("/tiles/zxy/0/0/0", params)
 
         assert response.status_code == 400
+        cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_parameter_names_match_case_insensitively(self, slide_settings):
+        params = {"StudyID": STUDY_ID, "KEY": SLIDE_KEY, "Enc": make_enc()}
+        cached = AsyncMock(return_value=b"tile")
+        with patch.object(main_module.tile_cache, "get_tile", new=cached):
+            response = await _get("/tiles/zxy/0/0/0", params)
+
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "overrides",
         [
-            {"tw": None},
-            {"th": None},
-            {"tw": ""},
-            {"tw": "0"},
-            {"th": "-1"},
-            {"tw": "8193"},
-            {"th": "99999"},
-            {"tw": "1.5"},
-            {"th": "abc"},
-            {"tw": "01"},
+            {"width": ""},
+            {"width": "0"},
+            {"height": "-1"},
+            {"width": "1.5"},
+            {"height": "abc"},
+            {"width": "01"},
+            {"height": "1" * 10},
         ],
     )
-    async def test_missing_or_malformed_thumbnail_dimensions_are_rejected(
-        self, slide_settings, overrides
-    ):
-        with patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=b"x")):
+    async def test_malformed_thumbnail_size_is_a_400(self, slide_settings, overrides):
+        cached = AsyncMock(return_value=b"x")
+        with patch.object(main_module.tile_cache, "get_thumbnail", new=cached):
             response = await _get("/thumbnails", _thumbnail_query(**overrides))
 
         assert response.status_code == 400
+        cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name", ["width", "height", "WIDTH"])
+    async def test_repeated_thumbnail_size_is_a_400(self, slide_settings, name):
+        params = list(_thumbnail_query().items()) + [(name, "64")]
+        cached = AsyncMock(return_value=b"x")
+        with patch.object(main_module.tile_cache, "get_thumbnail", new=cached):
+            response = await _get("/thumbnails", params)
+
+        assert response.status_code == 400
+        cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("overrides", "size"),
+        [
+            ({"width": None, "height": None}, (256, 256)),
+            ({"width": "64", "height": None}, (64, 256)),
+            ({"width": "99999", "height": "3000"}, (2048, 2048)),
+            ({"width": "1", "height": "1"}, (1, 1)),
+        ],
+    )
+    async def test_thumbnail_size_is_optional_and_clamped(
+        self, slide_settings, overrides, size
+    ):
+        cached = AsyncMock(return_value=b"thumb")
+        with patch.object(main_module.tile_cache, "get_thumbnail", new=cached):
+            response = await _get("/thumbnails", _thumbnail_query(**overrides))
+
+        assert response.status_code == 200
+        assert cached.await_args.args[1:] == size
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
@@ -742,7 +854,7 @@ class TestSlideRoutes:
             {"enc": "A" * 40},
         ],
     )
-    async def test_enc_that_does_not_open_under_the_key_is_forbidden(
+    async def test_enc_that_does_not_open_under_the_key_is_not_found(
         self, slide_settings, path, overrides
     ):
         params = (_query if path.startswith("/tiles") else _thumbnail_query)(**overrides)
@@ -753,7 +865,8 @@ class TestSlideRoutes:
         ):
             response = await _get(path, params)
 
-        assert response.status_code == 403
+        assert response.status_code == 404
+        assert response.json() == {"detail": "slide not found"}
         assert SLIDE_KEY not in response.text
         assert OTHER_SLIDE_KEY not in response.text
         cached.assert_not_awaited()
@@ -787,8 +900,8 @@ class TestSlideRoutes:
             ("/tiles/zxy/0/0/0", {"tile_source": "gs://slides/slide-a.svs"}),
         ],
     )
-    async def test_sealed_source_outside_policy_is_refused(
-        self, slide_settings, path, sealed
+    async def test_sealed_source_outside_policy_is_not_found(
+        self, slide_settings, path, sealed, caplog
     ):
         enc = make_enc(**sealed)
         params = (_query if path.startswith("/tiles") else _thumbnail_query)(enc=enc)
@@ -799,20 +912,23 @@ class TestSlideRoutes:
         ):
             response = await _get(path, params)
 
-        assert response.status_code in (400, 403)
-        assert "s3://" not in response.text
-        assert "slide-a" not in response.text
+        assert response.status_code == 404
+        assert response.json() == {"detail": "source slide not found"}
+        assert "outside the de-id policy" in caplog.text
+        for text in (response.text, caplog.text):
+            assert "s3://" not in text
+            assert "slide-a" not in text
         cached.assert_not_awaited()
 
     @pytest.mark.parametrize("operation", ["tile", "thumbnail"])
-    def test_source_outside_the_prefix_allowlist_is_forbidden(
+    def test_source_outside_the_prefix_allowlist_is_not_found(
         self, slide_settings, operation
     ):
         claims = {"tile_source": "s3://other/slide-a.svs", "thumbnail_source": "s3://other/slide-a.jpg"}
         with pytest.raises(main_module.HTTPException) as exc_info:
             main_module._authorize_source(claims, operation)
 
-        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
@@ -823,6 +939,7 @@ class TestSlideRoutes:
             ({"source": ""}, {}),
             ({}, {"X-WSI-Source": "s3://slides/slide-a.svs"}),
             ({}, {"x-wsi-source": ""}),
+            ({"Source": "s3://slides/slide-a.svs"}, {}),
         ],
     )
     async def test_routes_reject_client_supplied_sources(
@@ -851,21 +968,14 @@ class TestSlideRoutes:
 
 
 class TestRateLimitScope:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("headers", "subject"),
-        [
-            ({}, "127.0.0.1"),
-            ({"X-Forwarded-For": "10.1.2.3"}, "10.1.2.3"),
-            ({"X-Forwarded-For": " 10.1.2.3 , 172.16.0.1"}, "10.1.2.3"),
-            ({"X-Forwarded-For": ""}, "127.0.0.1"),
-        ],
-    )
-    async def test_tile_and_thumbnail_scope_by_client_and_study_key(
-        self, slide_settings, headers, subject
-    ):
+    @staticmethod
+    async def _scopes(headers_list) -> list[tuple]:
         distributed = AsyncMock(
-            side_effect=[b"jpeg", (b"jpeg", {"status": "ok", "reason": "test"})]
+            side_effect=lambda *args: (
+                (b"jpeg", {"status": "ok", "reason": "test"})
+                if args[1] == "thumbnail"
+                else b"jpeg"
+            )
         )
         transport = httpx.ASGITransport(app=main_module.app, client=("127.0.0.1", 5000))
         with (
@@ -874,19 +984,54 @@ class TestRateLimitScope:
             patch.object(main_module, "_distributed_singleflight", new=distributed),
         ):
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                tile_response = await client.get(
-                    "/tiles/zxy/0/0/0", params=_query(), headers=headers
-                )
-                thumbnail_response = await client.get(
-                    "/thumbnails", params=_thumbnail_query(), headers=headers
-                )
+                for headers in headers_list:
+                    tile_response = await client.get(
+                        "/tiles/zxy/0/0/0", params=_query(), headers=headers
+                    )
+                    thumbnail_response = await client.get(
+                        "/thumbnails", params=_thumbnail_query(), headers=headers
+                    )
+                    assert tile_response.status_code == 200
+                    assert thumbnail_response.status_code == 200
+        return [call.args[2:4] for call in distributed.await_args_list]
 
-        assert tile_response.status_code == 200
-        assert thumbnail_response.status_code == 200
-        assert [call.args[2:4] for call in distributed.await_args_list] == [
-            (subject, f"{STUDY_ID}\0{SLIDE_KEY}"),
-            (subject, f"{STUDY_ID}\0{SLIDE_KEY}"),
-        ]
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "subject"),
+        [
+            ({}, "127.0.0.1"),
+            ({"X-Forwarded-For": "10.1.2.3"}, "10.1.2.3"),
+            ({"X-Forwarded-For": " 10.1.2.3 , 172.16.0.1 "}, "172.16.0.1"),
+            ({"X-Forwarded-For": "spoofed, 10.9.9.9, 172.16.0.1"}, "172.16.0.1"),
+            ({"X-Forwarded-For": ""}, "127.0.0.1"),
+            ({"X-Forwarded-For": "10.1.2.3, "}, "127.0.0.1"),
+        ],
+    )
+    async def test_tile_and_thumbnail_scope_by_ingress_client_and_key(
+        self, slide_settings, headers, subject
+    ):
+        assert await self._scopes([headers]) == [(subject, SLIDE_KEY), (subject, SLIDE_KEY)]
 
-    def test_rate_limit_scope_is_study_and_key(self):
-        assert main_module._slide_rate_limit_scope("study_a", SLIDE_KEY) == f"study_a\0{SLIDE_KEY}"
+    @pytest.mark.asyncio
+    async def test_rotating_the_leftmost_hop_does_not_create_new_buckets(
+        self, slide_settings
+    ):
+        scopes = await self._scopes(
+            [{"X-Forwarded-For": f"10.0.0.{n}, 172.16.0.1"} for n in range(5)]
+        )
+
+        assert len(scopes) == 10
+        assert set(scopes) == {("172.16.0.1", SLIDE_KEY)}
+
+    @pytest.mark.asyncio
+    async def test_study_id_does_not_change_the_scope(self, slide_settings):
+        distributed = AsyncMock(return_value=b"jpeg")
+        with (
+            patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=None)),
+            patch.object(main_module, "_distributed_singleflight", new=distributed),
+        ):
+            for study_id in ("study_a", "study_b", "study_c"):
+                response = await _get("/tiles/zxy/0/0/0", _query(studyId=study_id))
+                assert response.status_code == 200
+
+        assert {call.args[3] for call in distributed.await_args_list} == {SLIDE_KEY}

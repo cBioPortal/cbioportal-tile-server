@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ThumbnailRecord:
-    """A published thumbnail master: its sealed URI and its pixel size."""
+    """A published thumbnail master, named by its sealed URI."""
 
     uri: str
-    width: int
-    height: int
+
+
+class InvalidThumbnail(Exception):
+    """The stored thumbnail is not an image Pillow can read."""
 
 
 def _filesystem_for_uri(uri: str):
@@ -140,19 +142,29 @@ def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
         return handle.read()
 
 
+def thumbnail_size(payload: bytes) -> tuple[int, int]:
+    """The stored thumbnail's (width, height), read from its header only."""
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            return image.size
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidThumbnail(type(exc).__name__) from None
+
+
 def render_thumbnail_payload(
     payload: bytes,
-    record: ThumbnailRecord,
     requested_width: int,
     requested_height: int,
 ) -> tuple[bytes, dict[str, Any]]:
-    if requested_width >= record.width and requested_height >= record.height:
-        return payload, {"status": "ok", "reason": "master"}
-
-    with Image.open(BytesIO(payload)) as image:
-        working = image.convert("RGB")
-        working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
-        out = BytesIO()
-        working.save(out, format="JPEG", quality=settings.jpeg_quality)
+    """Fit the stored thumbnail into the requested box; never upscale."""
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            if requested_width >= image.width and requested_height >= image.height:
+                return payload, {"status": "ok", "reason": "master"}
+            working = image.convert("RGB")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidThumbnail(type(exc).__name__) from None
+    working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
+    out = BytesIO()
+    working.save(out, format="JPEG", quality=settings.jpeg_quality)
     return out.getvalue(), {"status": "ok", "reason": "resized"}
-

@@ -55,9 +55,13 @@ jobs:
           # No studyId/key/enc: refused before any source is opened.
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
             http://127.0.0.1:18080/tiles/zxy/0/0/0)" = 400
-          # A well-formed key with an enc that does not open under it.
+          # A well-formed key with an enc that does not open under it: 404, never
+          # 401/403, which only the ingress returns.
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-            'http://127.0.0.1:18080/tiles/zxy/0/0/0?studyId=study_a&key=0123456789ab&enc=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')" = 403
+            'http://127.0.0.1:18080/tiles/zxy/0/0/0?studyId=study_a&key=0123456789ab&enc=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')" = 404
+          # The same parameter in another case is a repeat (nginx $arg_ ignores case).
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            'http://127.0.0.1:18080/tiles/zxy/0/0/0?StudyID=study_b&studyId=study_a&key=0123456789ab&enc=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')" = 400
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
             http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)" = 400
           cors_headers="$(curl --fail --silent --include --request OPTIONS \
