@@ -14,7 +14,8 @@ env:
   IMAGE_NAME: cbioportal/cbioportal-tile-server
 
 jobs:
-  # Build once on amd64 and exercise health, readiness, auth, and CORS. This
+  # Build once on amd64 and exercise health, readiness, request validation,
+  # and CORS. This
   # gates publishing and runs on every pull request.
   container-smoke:
     runs-on: ubuntu-latest
@@ -25,12 +26,11 @@ jobs:
       - name: Build image
         run: docker build --pull --tag tile-server:ci .
 
-      - name: Exercise health, readiness, auth, and CORS
+      - name: Exercise health, readiness, request validation, and CORS
         shell: bash
         run: |
           set -euo pipefail
           container_id="$(docker run --detach --rm \
-            --env WSI_AUTH_SECRET=0123456789abcdef0123456789abcdef \
             --env WSI_SOURCE_SEAL_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8= \
             --env REDIS_URL= \
             --env N_WORKERS=1 \
@@ -52,12 +52,21 @@ jobs:
           done
           curl --fail --silent http://127.0.0.1:18080/health
           curl --fail --silent http://127.0.0.1:18080/ready
+          # No studyId/key/enc: refused before any source is opened.
           test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
-            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)" = 401
+            http://127.0.0.1:18080/tiles/zxy/0/0/0)" = 400
+          # A well-formed key with an enc that does not open under it: 404, never
+          # 401/403, which only the ingress returns.
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            'http://127.0.0.1:18080/tiles/zxy/0/0/0?studyId=study_a&key=0123456789ab&enc=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')" = 404
+          # The same parameter in another case is a repeat (nginx $arg_ ignores case).
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            'http://127.0.0.1:18080/tiles/zxy/0/0/0?StudyID=study_b&studyId=study_a&key=0123456789ab&enc=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA')" = 400
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)" = 400
           cors_headers="$(curl --fail --silent --include --request OPTIONS \
             --header 'Origin: https://triage-beta.cbioportal.aws.mskcc.org' \
             --header 'Access-Control-Request-Method: GET' \
-            --header 'Access-Control-Request-Headers: authorization' \
             --header 'Access-Control-Request-Private-Network: true' \
             http://127.0.0.1:18080/tiles/zxy/0/0/0?source=s3%3A%2F%2Fexample.invalid%2Fslide.svs)"
           printf '%s\n' "$cors_headers" | grep -i '^access-control-allow-origin: https://triage-beta.cbioportal.aws.mskcc.org'

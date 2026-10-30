@@ -49,7 +49,7 @@ _URI_EXTENSIONS = {
 
 
 class UnsafeSourceUri(ValueError):
-    """A capability's source URI is outside the deployment's approved objects."""
+    """A sealed source URI is outside the deployment's approved objects."""
 
 
 def source_etag(slide_id: str) -> str | None:
@@ -90,7 +90,7 @@ def check_source_uri(uri: str, *, kind: str, prefixes: Iterable[str] = ()) -> No
     """
     Accept only a plain s3:// or file:// object under an approved prefix.
 
-    The URI comes from the sealed capability and never leaves this server, so
+    The URI comes from the sealed source (`enc`) and never leaves this server, so
     the approved prefixes, not its text, are the boundary. Messages never echo it.
     """
     if kind not in _URI_EXTENSIONS:
@@ -126,7 +126,7 @@ def resolve_s3_location(slide_id: str) -> tuple[str, str, dict]:
     """
     Return (bucket, key, s3_opts) for a source URL.
 
-    The source URL must be a full s3:// URI opened from the sealed capability.
+    The source URL must be a full s3:// URI opened from the sealed source.
     """
     if not slide_id.startswith("s3://"):
         raise FileNotFoundError("Slide not found (expected s3:// URI)")

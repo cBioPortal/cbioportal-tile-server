@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Repeatable HTTP benchmark for the WSI tile-loading workload.
 
+Each ``--access-json`` file describes one slide's resource row, as for
+``single_user_pan_bench.py``: ``studyId``, ``key``, ``enc`` (the row's sealed
+source) and ``tileMetadata``. Behind the ingress, set ``WSI_BENCH_COOKIE`` to
+the browser's session cookie (for example ``SESSION=...``) so the ingress
+authorizes the study. Sealed sources and the cookie are held only in memory
+and never included in the output.
+
 Example:
-  python bench/tile_bench.py \
-    --base-url http://localhost:3001/wsi \
-    --study-id msk_spectrum_tme_2022 \
-    --slide-id 2908638 --slide-id 4186363 \
-    --bearer-token "$WSI_BENCH_TOKEN" \
+  WSI_BENCH_COOKIE='SESSION=...' python bench/tile_bench.py \
+    --base-url https://cbioportal.example.org/wsi \
+    --access-json /secure/path/slide-a.json --access-json /secure/path/slide-b.json \
     --requests 1000 --concurrency 20 --warmup 100 \
     --cache-mode warm --json-out results/nginx-warm.json
 
@@ -22,11 +27,14 @@ import argparse
 import concurrent.futures
 import json
 import math
+import os
 import random
 import statistics
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -39,11 +47,18 @@ class Result:
 
 
 @dataclass(frozen=True)
-class SlideSpec:
+class Slide:
+    params: dict[str, str]
     max_zoom: int
     tile_size: int
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class Request:
+    path: str
+    params: dict[str, str]
 
 
 def percentile(values: list[float], fraction: float) -> float | None:
@@ -57,99 +72,84 @@ def percentile(values: list[float], fraction: float) -> float | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8080")
-    parser.add_argument("--study-id", required=True)
-    parser.add_argument("--slide-id", action="append", required=True)
-    parser.add_argument("--bearer-token", default="")
+    parser.add_argument("--access-json", action="append", required=True, type=Path)
     parser.add_argument("--requests", type=int, default=1000)
     parser.add_argument("--concurrency", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260721)
-    parser.add_argument("--max-zoom", type=int, default=None)
-    parser.add_argument("--tile-grid", type=int, default=None,
-                        help="Fallback grid when metadata discovery is unavailable")
     parser.add_argument("--cache-mode", choices=("cold", "warm"), required=True)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json-out")
     return parser.parse_args()
 
 
-def discover_slide_specs(args: argparse.Namespace) -> dict[str, SlideSpec]:
-    specs: dict[str, SlideSpec] = {}
-    fallback_zoom = args.max_zoom if args.max_zoom is not None else 15
-    fallback_grid = args.tile_grid if args.tile_grid is not None else 8
-    with httpx.Client(timeout=args.timeout) as client:
-        for slide_id in args.slide_id:
-            spec = SlideSpec(
-                max_zoom=fallback_zoom,
-                tile_size=256,
-                width=fallback_grid * 256,
-                height=fallback_grid * 256,
-            )
-            if args.max_zoom is None or args.tile_grid is None:
-                url = f"{args.base_url.rstrip('/')}/tiles/{slide_id}/metadata?studyId={args.study_id}"
-                try:
-                    response = client.get(url, headers={"Authorization": f"Bearer {args.bearer_token}"} if args.bearer_token else {})
-                    if 200 <= response.status_code < 300:
-                        data = response.json()
-                        dimensions = data["dimensions"]
-                        spec = SlideSpec(
-                            max_zoom=int(data["max_zoom"]),
-                            tile_size=int(data["tile_size"]),
-                            width=int(dimensions["width"]),
-                            height=int(dimensions["height"]),
-                        )
-                except (httpx.HTTPError, ValueError, KeyError, TypeError):
-                    pass
-            specs[slide_id] = spec
-    return specs
+def read_slide(path: Path) -> Slide:
+    payload: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    params = {name: payload.get(name) for name in ("studyId", "key", "enc")}
+    for name, value in params.items():
+        if not isinstance(value, str) or not value:
+            raise SystemExit(f"{path}: access JSON is missing {name}")
+    metadata = payload.get("tileMetadata")
+    try:
+        return Slide(
+            params=params,
+            max_zoom=int(metadata["max_zoom"]),
+            tile_size=int(metadata["tile_size"]),
+            width=int(metadata["dimensions"]["width"]),
+            height=int(metadata["dimensions"]["height"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        raise SystemExit(f"{path}: access JSON is missing tileMetadata") from None
 
 
-def build_workload(args: argparse.Namespace, count: int, rng: random.Random, specs: dict[str, SlideSpec]) -> list[str]:
-    base = args.base_url.rstrip("/")
-    urls: list[str] = []
+def build_workload(count: int, rng: random.Random, slides: list[Slide]) -> list[Request]:
+    """About 95% tiles biased toward high zoom, 5% 256x256 thumbnails."""
+    requests: list[Request] = []
     for _ in range(count):
         roll = rng.random()
-        slide_id = args.slide_id[rng.randrange(len(args.slide_id))]
-        spec = specs[slide_id]
-        scope = f"studyId={args.study_id}"
+        slide = slides[rng.randrange(len(slides))]
         if roll < 0.05:
-            urls.append(f"{base}/tiles/{slide_id}/metadata?{scope}")
-        elif roll < 0.10:
-            urls.append(f"{base}/tiles/{slide_id}/thumbnail?width=256&height=256&{scope}")
-        else:
-            z_offset = rng.choices((0, 1, 2, 3, 4, 5), weights=(1, 1, 2, 3, 5, 8))[0]
-            z = max(0, spec.max_zoom - z_offset)
-            downsample = 2 ** (spec.max_zoom - z)
-            grid_x = max(1, math.ceil(spec.width / (spec.tile_size * downsample)))
-            grid_y = max(1, math.ceil(spec.height / (spec.tile_size * downsample)))
-            x = rng.randrange(grid_x)
-            y = rng.randrange(grid_y)
-            urls.append(f"{base}/tiles/{slide_id}/zxy/{z}/{x}/{y}?{scope}")
-    return urls
+            requests.append(
+                Request("/thumbnails", {**slide.params, "width": "256", "height": "256"})
+            )
+            continue
+        z_offset = rng.choices((0, 1, 2, 3, 4, 5), weights=(1, 1, 2, 3, 5, 8))[0]
+        z = max(0, slide.max_zoom - z_offset)
+        downsample = 2 ** (slide.max_zoom - z)
+        grid_x = max(1, math.ceil(slide.width / (slide.tile_size * downsample)))
+        grid_y = max(1, math.ceil(slide.height / (slide.tile_size * downsample)))
+        x = rng.randrange(grid_x)
+        y = rng.randrange(grid_y)
+        requests.append(Request(f"/tiles/zxy/{z}/{x}/{y}", slide.params))
+    return requests
 
 
 _thread_state = threading.local()
 
 
-def request(url: str, token: str, timeout: float) -> Result:
-    headers = {"Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+def send(base_url: str, item: Request, headers: dict[str, str], timeout: float) -> Result:
     started = time.perf_counter()
     try:
         client = getattr(_thread_state, "client", None)
         if client is None or client.timeout.read != timeout:
-            client = httpx.Client(timeout=timeout)
+            client = httpx.Client(timeout=timeout, headers=headers)
             _thread_state.client = client
-        response = client.get(url, headers=headers)
+        response = client.get(f"{base_url}{item.path}", params=item.params)
         return Result(response.status_code, (time.perf_counter() - started) * 1000)
     except (httpx.HTTPError, TimeoutError, OSError) as exc:
-        return Result(0, (time.perf_counter() - started) * 1000, str(exc))
+        # The exception text can carry the URL (and so `enc`); keep only its type.
+        return Result(0, (time.perf_counter() - started) * 1000, type(exc).__name__)
 
 
-def run(urls: list[str], args: argparse.Namespace) -> list[Result]:
+def run(base_url: str, requests: list[Request], args: argparse.Namespace) -> list[Result]:
+    headers = {}
+    cookie = os.environ.get("WSI_BENCH_COOKIE", "")
+    if cookie:
+        headers["Cookie"] = cookie
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        futures = [pool.submit(request, url, args.bearer_token, args.timeout) for url in urls]
+        futures = [
+            pool.submit(send, base_url, item, headers, args.timeout) for item in requests
+        ]
         return [future.result() for future in futures]
 
 
@@ -158,15 +158,16 @@ def main() -> None:
     if args.requests < 1 or args.concurrency < 1 or args.warmup < 0:
         raise SystemExit("requests and concurrency must be positive; warmup cannot be negative")
 
-    specs = discover_slide_specs(args)
+    slides = [read_slide(path) for path in args.access_json]
+    base_url = args.base_url.rstrip("/")
     rng = random.Random(args.seed)
-    warmup_urls = build_workload(args, args.warmup, rng, specs)
-    measured_urls = build_workload(args, args.requests, rng, specs)
-    if warmup_urls:
-        run(warmup_urls, args)
+    warmup = build_workload(args.warmup, rng, slides)
+    measured = build_workload(args.requests, rng, slides)
+    if warmup:
+        run(base_url, warmup, args)
 
     started = time.perf_counter()
-    results = run(measured_urls, args)
+    results = run(base_url, measured, args)
     elapsed_s = time.perf_counter() - started
     successful = [result.latency_ms for result in results if 200 <= result.status < 300]
     failures = [result for result in results if not 200 <= result.status < 300]
@@ -179,9 +180,9 @@ def main() -> None:
             "p95": round(percentile(values, 0.95) or 0, 3),
         }
     summary = {
-        "base_url": args.base_url.rstrip("/"),
-        "study_id": args.study_id,
-        "slide_ids": args.slide_id,
+        "base_url": base_url,
+        "study_ids": sorted({slide.params["studyId"] for slide in slides}),
+        "slides": len(slides),
         "cache_mode": args.cache_mode,
         "seed": args.seed,
         "warmup_requests": args.warmup,

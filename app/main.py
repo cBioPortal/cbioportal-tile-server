@@ -1,10 +1,14 @@
 """URL-bound cBioPortal WSI pixel service.
 
 The service deliberately has no clinical metadata, hierarchy, search, or
-image-id lookup. cBioPortal issues a short-lived slide capability whose
-encrypted claim carries the exact source URLs; this process validates and
-decrypts the capability and serves pixels. Browsers never supply or see a
-source URL.
+image-id lookup. Each request names a slide by its resource row's opaque key
+and that row's sealed source (`enc`), which only this process can decrypt;
+it opens `enc` and serves pixels. Browsers never supply or see a source URL.
+
+Access control is not done here: the ingress authorizes every request against
+cBioPortal (`GET /api/studies/{studyId}` with the browser's session cookie)
+before it reaches this service, which is why `studyId` is a required query
+parameter.
 """
 
 from __future__ import annotations
@@ -27,22 +31,26 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
     HTTPClientError,
 )
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fsspec.exceptions import BlocksizeMismatchError
 from tifffile import TiffFileError
 
 from . import cache as tile_cache
 from .auth import (
-    WSI_AUTH_VERSION,
-    InvalidWsiToken,
+    SOURCE_SEAL_KEY_BYTES,
+    InvalidSealedSource,
     decode_source_seal_key,
+    decrypt_sealed_claims,
     source_digest,
-    validate_wsi_auth_configuration,
-    validate_wsi_token,
 )
 from .blockcache import get_blockcache_manager
 from .config import settings
+from .sealed_source import (
+    SERVING_KEY_PATTERN,
+    SEALED_SOURCE_MAX_CHARS,
+    SEALED_SOURCE_PATTERN,
+)
 from .metrics import (
     CACHE_MISS_LEADERS,
     COALESCED_CACHE_MISS_REQUESTS,
@@ -74,6 +82,17 @@ from .thumbnail_store import (
 from .tiles import InvalidTileRequest, OverviewTooLarge, get_tile_bytes
 
 logger = logging.getLogger(__name__)
+
+# Reported by /health and /ready. 5: `studyId`+`key`+`enc` requests authorized
+# at the ingress, with no token checked here.
+ACCESS_CONTRACT_VERSION = 5
+# A plausible cBioPortal cancer study identifier; never only dots, so it cannot
+# become a `.`/`..` path segment in the ingress's `/api/studies/{studyId}`.
+STUDY_ID_PATTERN = re.compile(r"^(?!\.+$)[A-Za-z0-9_.-]{1,128}$")
+# Requested thumbnail size: a positive integer, clamped to MAX_THUMBNAIL_SIZE.
+THUMBNAIL_SIZE_PATTERN = re.compile(r"^[1-9][0-9]{0,8}$")
+DEFAULT_THUMBNAIL_SIZE = 256
+MAX_THUMBNAIL_SIZE = 2048
 
 _slides: SlideCache | None = None
 _image_operation_semaphore: asyncio.Semaphore | None = None
@@ -304,7 +323,7 @@ async def lifespan(app: FastAPI):
     global _slides, _image_operation_semaphore, _thumbnail_fetch_semaphore, _source_seal_key
     try:
         _source_seal_key = decode_source_seal_key(settings.wsi_source_seal_key)
-    except InvalidWsiToken:
+    except InvalidSealedSource:
         logger.error("WSI_SOURCE_SEAL_KEY must be standard base64 of exactly 32 bytes")
         raise RuntimeError("WSI source seal key is not configured") from None
     _slides = SlideCache(capacity=settings.max_open_slides)
@@ -362,49 +381,6 @@ app = FastAPI(
 )
 
 @app.middleware("http")
-async def require_wsi_capability(request: Request, call_next):
-    if request.scope["path"] in ("/health", "/ready", "/metrics"):
-        return await call_next(request)
-    # Browser clients send an unauthenticated OPTIONS request before any
-    # cross-origin request that includes the Authorization header.  CORS
-    # normally handles this outside the application stack, but keep the
-    # capability guard safe if middleware ordering changes.
-    if request.method == "OPTIONS":
-        return await call_next(request)
-    authorization = request.headers.get("authorization", "")
-    if not authorization.startswith("Bearer "):
-        return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
-    try:
-        claims = validate_wsi_token(
-            authorization[7:].strip(),
-            settings.wsi_auth_secret,
-            settings.wsi_auth_audience,
-            settings.wsi_auth_max_ttl,
-            seal_key=_source_seal_key,
-        )
-    except InvalidWsiToken:
-        if not settings.wsi_auth_previous_secret:
-            return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
-        try:
-            claims = validate_wsi_token(
-                authorization[7:].strip(),
-                settings.wsi_auth_previous_secret,
-                settings.wsi_auth_audience,
-                settings.wsi_auth_max_ttl,
-                seal_key=_source_seal_key,
-            )
-        except InvalidWsiToken:
-            # Preserve the same response for an invalid token regardless of
-            # which configured key was attempted.
-            return Response(
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    request.state.wsi_claims = claims
-    return await call_next(request)
-
-
-@app.middleware("http")
 async def wsi_namespace(request, call_next):
     path = request.scope["path"]
     if path == "/wsi" or path.startswith("/wsi/"):
@@ -422,9 +398,11 @@ app.add_middleware(
 )
 
 
-TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Authorization"}
-THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Authorization"}
-PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store", "Vary": "Authorization"}
+# The ingress authorizes on the session cookie, so a browser cache must not
+# reuse a response across sessions.
+TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Cookie"}
+THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Cookie"}
+PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
 
 
 async def _in_thread(fn, *args):
@@ -527,27 +505,89 @@ def _allowed_source(source: str) -> str:
     return source
 
 
-def _claims(request: Request) -> dict:
-    claims = getattr(request.state, "wsi_claims", None)
-    if not claims:
-        raise HTTPException(status_code=401, headers={"WWW-Authenticate": "Bearer"})
-    return claims
+def _single_query_value(request: Request, name: str) -> str | None:
+    """Return one query parameter, matching its name case-insensitively.
 
-def _slide_rate_limit_scope(claims: dict) -> str:
-    # A key names a row within its resource, so a capability that names its
-    # resource is scoped to it.
-    if claims.get("resource_id"):
-        return f"{claims['study_id']}\0{claims['resource_id']}\0{claims['slide_key']}"
-    return f"{claims['study_id']}\0{claims['slide_key']}"
+    nginx `$arg_` lookups ignore case, so `StudyID=a&studyId=b` could
+    authorize one study at the ingress and name another here. Any repeat,
+    in any case, is refused so both read the same value.
+    """
+    wanted = name.lower()
+    values = [
+        value
+        for param, value in request.query_params.multi_items()
+        if param.lower() == wanted
+    ]
+    if len(values) > 1:
+        raise HTTPException(status_code=400, detail=f"{name} must be given once")
+    return values[0] if values else None
 
 
-def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
-    """Return the capability-sealed source for `operation` and its claims."""
-    claims = _claims(request)
-    source = _allowed_source(
-        claims.get("tile_source" if operation == "tile" else "thumbnail_source")
-    )
+def _client_address(request: Request) -> str:
+    """The rate-limit subject: the last X-Forwarded-For entry, else the peer.
+
+    The ingress sets X-Forwarded-For to the client address it saw; if
+    anything precedes the last entry, it is client-supplied and must not
+    pick the bucket.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    last = forwarded.rsplit(",", 1)[-1].strip()
+    if last:
+        return last
+    return request.client.host if request.client else "unknown"
+
+
+def _open_slide_request(request: Request) -> tuple[str, dict]:
+    """Validate `studyId`, `key` and `enc`, and open the sealed source.
+
+    Returns the rate-limit scope (the slide's `key`; `studyId` is not bound to
+    the slide) and the decrypted claims. Malformed input is a 400; an `enc`
+    that does not open under `key` is a 404, so the service's own refusals
+    never look like the ingress's 401/403. Values are never echoed.
+    """
+    study_id = _single_query_value(request, "studyId")
+    if study_id is None or not STUDY_ID_PATTERN.fullmatch(study_id):
+        raise HTTPException(status_code=400, detail="studyId is missing or malformed")
+    key = _single_query_value(request, "key")
+    if key is None or not SERVING_KEY_PATTERN.fullmatch(key):
+        raise HTTPException(status_code=400, detail="key is missing or malformed")
+    enc = _single_query_value(request, "enc")
+    if (
+        enc is None
+        or len(enc) > SEALED_SOURCE_MAX_CHARS
+        or not SEALED_SOURCE_PATTERN.fullmatch(enc)
+    ):
+        raise HTTPException(status_code=400, detail="enc is missing or malformed")
+    if not isinstance(_source_seal_key, bytes) or len(_source_seal_key) != SOURCE_SEAL_KEY_BYTES:
+        # Fail closed: lifespan refuses to start without the key.
+        raise HTTPException(status_code=503, headers={"Retry-After": "1"}, detail="Tile service is not configured")
     try:
+        claims = decrypt_sealed_claims(enc, _source_seal_key, key)
+    except InvalidSealedSource:
+        raise HTTPException(status_code=404, detail="slide not found") from None
+    return key, claims
+
+
+def _thumbnail_size(request: Request, name: str) -> int:
+    """An optional requested thumbnail size, given at most once, clamped."""
+    value = _single_query_value(request, name)
+    if value is None:
+        return DEFAULT_THUMBNAIL_SIZE
+    if not THUMBNAIL_SIZE_PATTERN.fullmatch(value):
+        raise HTTPException(status_code=400, detail=f"{name} is malformed")
+    return min(int(value), MAX_THUMBNAIL_SIZE)
+
+
+def _authorize_source(claims: dict, operation: str) -> str:
+    """Return the sealed source for `operation` once it passes the artifact policy.
+
+    A sealed source outside the policy is a 404: the request was well formed,
+    the slide just cannot be served. The log and the response omit the URL.
+    """
+    try:
+        source = _allowed_source(
+            claims.get("tile_source" if operation == "tile" else "thumbnail_source")
+        )
         check_source_uri(
             source,
             kind="source" if operation == "tile" else "thumbnail",
@@ -557,14 +597,22 @@ def _authorize_source(request: Request, operation: str) -> tuple[str, dict]:
                 else settings.wsi_allowed_thumbnail_prefixes
             ),
         )
-    except UnsafeSourceUri:
-        raise HTTPException(status_code=403, detail="source is outside de-id policy")
-    return source, claims
+    except (HTTPException, UnsafeSourceUri) as exc:
+        logger.warning(
+            "Sealed %s source is outside the de-id policy; reason=%s",
+            operation,
+            exc.detail if isinstance(exc, HTTPException) else exc,
+        )
+        raise HTTPException(status_code=404, detail="source slide not found") from None
+    return source
 
 
-def _reject_client_source(request: Request, query_source: str | None) -> None:
-    """Refuse browser-supplied source bindings; the capability carries them."""
-    if query_source is not None or "x-wsi-source" in request.headers:
+def _reject_client_source(request: Request) -> None:
+    """Refuse browser-supplied source bindings; the sealed `enc` carries them."""
+    if (
+        any(param.lower() == "source" for param in request.query_params.keys())
+        or "x-wsi-source" in request.headers
+    ):
         raise HTTPException(
             status_code=400,
             detail="client-supplied source bindings are not accepted",
@@ -711,33 +759,32 @@ async def _run_thumbnail_fetch(record: ThumbnailRecord) -> bytes:
 def _readiness_status() -> tuple[int, dict]:
     payload = {
         "status": "ok",
-        "auth_required": True,
-        "auth_contract_version": WSI_AUTH_VERSION,
+        "auth_required": False,
+        "auth_contract_version": ACCESS_CONTRACT_VERSION,
         "n_workers": settings.n_workers,
         "release_id": settings.release_id,
         "image_git_sha": settings.image_git_sha,
         "serving_contract_version": settings.serving_contract_version,
     }
     try:
-        validate_wsi_auth_configuration(
-            settings.wsi_auth_secret,
-            settings.wsi_auth_audience,
-            settings.wsi_auth_max_ttl,
-            _source_seal_key,
-        )
+        if (
+            not isinstance(_source_seal_key, bytes)
+            or len(_source_seal_key) != SOURCE_SEAL_KEY_BYTES
+        ):
+            raise InvalidSealedSource("WSI source seal key is not configured")
         if not settings.wsi_allowed_source_prefixes or not settings.wsi_allowed_thumbnail_prefixes:
-            raise InvalidWsiToken("WSI artifact allowlists are not configured")
+            raise InvalidSealedSource("WSI artifact allowlists are not configured")
         if settings.release_id or settings.image_git_sha:
             if not settings.release_id:
-                raise InvalidWsiToken("WSI release ID is not configured")
+                raise InvalidSealedSource("WSI release ID is not configured")
             if not re.fullmatch(r"[0-9a-fA-F]{40}", settings.image_git_sha):
-                raise InvalidWsiToken("WSI image git SHA is not a full commit")
+                raise InvalidSealedSource("WSI image git SHA is not a full commit")
             if settings.serving_contract_version != "wsi-serving-v6":
-                raise InvalidWsiToken("unsupported WSI serving contract version")
+                raise InvalidSealedSource("unsupported WSI serving contract version")
         return 200, payload
-    except InvalidWsiToken:
+    except InvalidSealedSource:
         payload["status"] = "unavailable"
-        payload["reason"] = "WSI authentication or artifact policy is not configured"
+        payload["reason"] = "WSI source seal key or artifact policy is not configured"
         return 503, payload
 
 
@@ -746,7 +793,7 @@ def health():
     return {
         "status": "ok",
         "n_workers": settings.n_workers,
-        "auth_contract_version": WSI_AUTH_VERSION,
+        "auth_contract_version": ACCESS_CONTRACT_VERSION,
     }
 
 
@@ -773,10 +820,10 @@ async def tile(
     z: int,
     x: int,
     y: int,
-    source: str | None = Query(None),
 ):
-    _reject_client_source(request, source)
-    source, claims = _authorize_source(request, "tile")
+    _reject_client_source(request)
+    scope, claims = _open_slide_request(request)
+    source = _authorize_source(claims, "tile")
     cache_key = source_digest(source)
     cached = await tile_cache.get_tile(cache_key, z, x, y)
     if cached:
@@ -799,8 +846,8 @@ async def tile(
         data = await _distributed_singleflight(
             tile_key,
             "tile",
-            claims["sub"],
-            _slide_rate_limit_scope(claims),
+            _client_address(request),
+            scope,
             _build_tile,
             lambda: tile_cache.get_tile(cache_key, z, x, y),
             lambda cached: cached,
@@ -826,43 +873,33 @@ async def tile(
 
 
 @app.get("/thumbnails")
-async def thumbnail(
-    request: Request,
-    source: str | None = Query(None),
-    width: int = 256,
-    height: int = 256,
-):
-    _reject_client_source(request, source)
-    source, claims = _authorize_source(request, "thumbnail")
-    width = max(1, min(width, 2048))
-    height = max(1, min(height, 2048))
+async def thumbnail(request: Request):
+    # `tw`/`th` are ignored: the stored thumbnail's own size decides
+    # pass-through vs resize, so nothing in the request outside the cache key
+    # can change what is cached under it.
+    _reject_client_source(request)
+    width = _thumbnail_size(request, "width")
+    height = _thumbnail_size(request, "height")
+    scope, claims = _open_slide_request(request)
+    source = _authorize_source(claims, "thumbnail")
     cache_key = source_digest(source)
     cached = await tile_cache.get_thumbnail(cache_key, width, height)
     if cached:
         return Response(content=cached, media_type="image/jpeg", headers=THUMB_CACHE_HEADERS)
 
     async def _build_thumbnail():
-        record = ThumbnailRecord(
-            uri=source,
-            width=claims["thumbnail_width"],
-            height=claims["thumbnail_height"],
-        )
-        payload = await _run_thumbnail_fetch(record)
-        if width >= record.width and height >= record.height:
-            data, status = payload, {"status": "ok", "reason": "master"}
-        else:
-            resize_started = time.perf_counter()
-            try:
-                data, status = await _run_image_operation(
-                    render_thumbnail_payload,
-                    payload,
-                    record,
-                    width,
-                    height,
-                    operation_kind="thumbnail_resize",
-                )
-            finally:
-                THUMBNAIL_RESIZE_SECONDS.observe(time.perf_counter() - resize_started)
+        payload = await _run_thumbnail_fetch(ThumbnailRecord(uri=source))
+        resize_started = time.perf_counter()
+        try:
+            data, status = await _run_image_operation(
+                render_thumbnail_payload,
+                payload,
+                width,
+                height,
+                operation_kind="thumbnail_resize",
+            )
+        finally:
+            THUMBNAIL_RESIZE_SECONDS.observe(time.perf_counter() - resize_started)
         await tile_cache.set_thumbnail(cache_key, width, height, data)
         return data, status
 
@@ -871,8 +908,8 @@ async def thumbnail(
         data, status = await _distributed_singleflight(
             thumbnail_key,
             "thumbnail",
-            claims["sub"],
-            _slide_rate_limit_scope(claims),
+            _client_address(request),
+            scope,
             _build_thumbnail,
             lambda: tile_cache.get_thumbnail(cache_key, width, height),
             lambda cached: (cached, {"status": "ok", "reason": "distributed-cache"}),

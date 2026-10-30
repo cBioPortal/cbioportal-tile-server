@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ThumbnailRecord:
-    """A published thumbnail master: its sealed URI and its pixel size."""
+    """A published thumbnail master, named by its sealed URI."""
 
     uri: str
-    width: int
-    height: int
+
+
+class InvalidThumbnail(Exception):
+    """The stored thumbnail is not an image Pillow can read."""
 
 
 def _filesystem_for_uri(uri: str):
@@ -140,19 +142,41 @@ def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
         return handle.read()
 
 
+def _check_decode_size(image: Image.Image) -> None:
+    width, height = image.size
+    if width * height > settings.thumbnail_max_decode_pixels:
+        raise InvalidThumbnail("ThumbnailTooLarge")
+
+
 def render_thumbnail_payload(
     payload: bytes,
-    record: ThumbnailRecord,
     requested_width: int,
     requested_height: int,
 ) -> tuple[bytes, dict[str, Any]]:
-    if requested_width >= record.width and requested_height >= record.height:
-        return payload, {"status": "ok", "reason": "master"}
+    """Fit the stored thumbnail into the requested box; never upscale.
 
-    with Image.open(BytesIO(payload)) as image:
-        working = image.convert("RGB")
+    The header is checked against ``THUMBNAIL_MAX_DECODE_PIXELS`` before any
+    pixel is decoded.  A JPEG that already fits is returned byte for byte;
+    any other format is re-encoded to JPEG, since the response is
+    ``image/jpeg``.  A JPEG that needs shrinking is decoded at reduced scale
+    through ``Image.draft``.
+    """
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            _check_decode_size(image)
+            fits = requested_width >= image.width and requested_height >= image.height
+            if fits and image.format == "JPEG":
+                return payload, {"status": "ok", "reason": "master"}
+            if not fits:
+                image.draft("RGB", (requested_width, requested_height))
+            working = image.convert("RGB")
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise InvalidThumbnail(type(exc).__name__) from None
+    if fits:
+        reason = "reencoded"
+    else:
         working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
-        out = BytesIO()
-        working.save(out, format="JPEG", quality=settings.jpeg_quality)
-    return out.getvalue(), {"status": "ok", "reason": "resized"}
-
+        reason = "resized"
+    out = BytesIO()
+    working.save(out, format="JPEG", quality=settings.jpeg_quality)
+    return out.getvalue(), {"status": "ok", "reason": reason}

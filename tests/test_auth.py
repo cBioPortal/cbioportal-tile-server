@@ -1,18 +1,14 @@
 import base64
-import hashlib
-import hmac
 import json
-import time
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from app import auth
 from app.auth import (
-    InvalidWsiToken,
+    InvalidSealedSource,
     decode_source_seal_key,
     decrypt_sealed_claims,
-    validate_wsi_auth_configuration,
-    validate_wsi_token,
 )
 
 SLIDE_KEY = "0123456789ab"
@@ -43,7 +39,7 @@ def seal_claims(
     sealed: dict | str,
     nonce: bytes = bytes(range(12)),
 ) -> str:
-    """Produce an `enc` claim exactly as the data provider seals it (contract V6.1)."""
+    """Produce an `enc` exactly as the data provider seals it (contract V6.1)."""
     plaintext = sealed if isinstance(sealed, str) else json.dumps(sealed, separators=(",", ":"))
     ciphertext = AESGCM(seal_key).encrypt(
         nonce, plaintext.encode("utf-8"), slide_key.encode("utf-8")
@@ -51,76 +47,50 @@ def seal_claims(
     return base64.urlsafe_b64encode(nonce + ciphertext).rstrip(b"=").decode()
 
 
-def make_raw_token(secret: str, header, payload) -> str:
-    def encode(value):
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+def make_enc(
+    seal_key: bytes = SEAL_KEY, slide_key: str = SLIDE_KEY, **overrides
+) -> str:
+    """A sealed source for `slide_key` with the default test sources."""
+    return seal_claims(
+        seal_key,
+        slide_key,
+        {
+            "image_id": "slide-a",
+            "tile_source": TILE_SOURCE,
+            "thumbnail_source": THUMBNAIL_SOURCE,
+            **overrides,
+        },
+    )
 
-    encoded_header = encode(header)
-    encoded_payload = encode(payload)
-    signing_input = f"{encoded_header}.{encoded_payload}".encode()
-    signature = base64.urlsafe_b64encode(
-        hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
-    return f"{encoded_header}.{encoded_payload}.{signature}"
+
+@pytest.fixture(autouse=True)
+def _clear_sealed_source_cache():
+    auth._decrypt_sealed_claims_cached.cache_clear()
+    yield
+    auth._decrypt_sealed_claims_cached.cache_clear()
 
 
-def make_token(secret: str, **claims) -> str:
-    return make_raw_token(secret, {"alg": "HS256", "typ": "JWT"}, claims)
-
-
-def valid_claims(seal_key: bytes = SEAL_KEY, **overrides):
-    now = int(time.time())
-    slide_key = overrides.get("slide_key", SLIDE_KEY)
-    claims = {
-        "sub": "user@example.org",
-        "aud": "cbioportal-wsi",
-        "scope": "wsi:read",
-        "study_id": "study-a",
-        "slide_key": slide_key,
-        "wsi_auth_version": 4,
-        "thumbnail_width": 1024,
-        "thumbnail_height": 768,
-        "iat": now,
-        "exp": now + 300,
-        "enc": seal_claims(
-            seal_key,
-            slide_key,
-            {
-                "image_id": "slide-a",
-                "tile_source": TILE_SOURCE,
-                "thumbnail_source": THUMBNAIL_SOURCE,
-            },
-        ),
+def test_sealed_source_opens_under_its_key():
+    assert decrypt_sealed_claims(make_enc(), SEAL_KEY, SLIDE_KEY) == {
+        "image_id": "slide-a",
+        "tile_source": TILE_SOURCE,
+        "thumbnail_source": THUMBNAIL_SOURCE,
     }
-    claims.update(overrides)
-    return claims
 
 
-def make_v4_token(secret: str = "s" * 32, seal_key: bytes = SEAL_KEY, **overrides) -> str:
-    return make_token(secret, **valid_claims(seal_key, **overrides))
+@pytest.mark.parametrize(
+    "slide_key",
+    ["0123456789ab", "0123456789AB", "cycif-roi_17", "k" * 128],
+)
+def test_any_resource_key_binds_its_sealed_source(slide_key):
+    enc = make_enc(slide_key=slide_key)
+    assert decrypt_sealed_claims(enc, SEAL_KEY, slide_key)["tile_source"] == TILE_SOURCE
+    with pytest.raises(InvalidSealedSource):
+        decrypt_sealed_claims(enc, SEAL_KEY, "other-key")
 
 
-def validate(token: str, secret: str = "s" * 32, audience: str = "cbioportal-wsi", **kwargs) -> dict:
-    kwargs.setdefault("seal_key", SEAL_KEY)
-    return validate_wsi_token(token, secret, audience, **kwargs)
-
-
-def test_valid_wsi_token():
-    secret = "s" * 32
-    claims = validate(make_v4_token(secret), secret, "cbioportal-wsi")
-    assert claims["sub"] == "user@example.org"
-    assert claims["slide_key"] == SLIDE_KEY
-    assert claims["image_id"] == "slide-a"
-    assert claims["tile_source"] == TILE_SOURCE
-    assert claims["thumbnail_source"] == THUMBNAIL_SOURCE
-    assert "enc" not in claims
-
-
-def test_sealed_claims_are_decrypted_once_per_token(monkeypatch):
-    from app import auth
-
-    secret = "s" * 32
-    token = make_v4_token(secret)
+def test_sealed_source_is_decrypted_once_per_enc(monkeypatch):
+    enc = make_enc()
     calls = []
     real_aesgcm = auth.AESGCM
 
@@ -132,15 +102,22 @@ def test_sealed_claims_are_decrypted_once_per_token(monkeypatch):
             calls.append(1)
             return self._inner.decrypt(*args, **kwargs)
 
-    auth._decrypt_sealed_claims_cached.cache_clear()
     monkeypatch.setattr(auth, "AESGCM", CountingAESGCM)
-    first = validate(token, secret, "cbioportal-wsi")
+    first = decrypt_sealed_claims(enc, SEAL_KEY, SLIDE_KEY)
     for _ in range(5):
-        assert validate(token, secret, "cbioportal-wsi") == first
+        assert decrypt_sealed_claims(enc, SEAL_KEY, SLIDE_KEY) == first
     assert len(calls) == 1
     # Callers get their own copy; mutating it does not poison the cache.
     first["tile_source"] = "tampered"
-    assert validate(token, secret, "cbioportal-wsi")["tile_source"] == TILE_SOURCE
+    assert decrypt_sealed_claims(enc, SEAL_KEY, SLIDE_KEY)["tile_source"] == TILE_SOURCE
+
+
+@pytest.mark.parametrize(
+    "seal_key", [None, b"", SEAL_KEY[:31], SEAL_KEY + b"x", SEAL_KEY_B64]
+)
+def test_opening_requires_a_valid_seal_key(seal_key):
+    with pytest.raises(InvalidSealedSource, match="seal key is not configured"):
+        decrypt_sealed_claims(make_enc(), seal_key, SLIDE_KEY)
 
 
 def test_source_seal_key_decodes_contract_vector():
@@ -162,7 +139,7 @@ def test_source_seal_key_decodes_contract_vector():
     ],
 )
 def test_malformed_source_seal_key_is_rejected_without_echo(value):
-    with pytest.raises(InvalidWsiToken, match="seal key is not configured") as exc_info:
+    with pytest.raises(InvalidSealedSource, match="seal key is not configured") as exc_info:
         decode_source_seal_key(value)
     if value.strip():
         assert value.strip() not in str(exc_info.value)
@@ -190,7 +167,7 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
         (VECTOR_ENC, VECTOR_KEY, "f" * 12),
         (VECTOR_ENC, VECTOR_KEY, "0123456789abcdef0123456789abcdef"),
         (VECTOR_ENC, VECTOR_KEY, VECTOR_SLIDE_KEY.upper()),
-        # Sealed with another key, including the capability signing secret.
+        # Sealed with another key.
         (VECTOR_ENC, SEAL_KEY, VECTOR_SLIDE_KEY),
         (VECTOR_ENC, bytes(32), VECTOR_SLIDE_KEY),
         (VECTOR_ENC, b"s" * 32, VECTOR_SLIDE_KEY),
@@ -204,7 +181,7 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
     ],
 )
 def test_tampered_or_rebound_enc_is_rejected(enc, seal_key, slide_key):
-    with pytest.raises(InvalidWsiToken) as exc_info:
+    with pytest.raises(InvalidSealedSource) as exc_info:
         decrypt_sealed_claims(enc, seal_key, slide_key)
     assert "testdata" not in str(exc_info.value)
     assert VECTOR_SLIDE_KEY not in str(exc_info.value)
@@ -221,142 +198,5 @@ def test_tampered_or_rebound_enc_is_rejected(enc, seal_key, slide_key):
     ],
 )
 def test_malformed_sealed_plaintext_is_rejected(sealed):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="source binding"):
-        validate(
-            make_v4_token(secret, enc=seal_claims(SEAL_KEY, SLIDE_KEY, sealed)),
-            secret,
-            "cbioportal-wsi",
-        )
-
-
-@pytest.mark.parametrize("version", [2, 3, "4"])
-def test_unsupported_auth_version_is_rejected(version):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="unsupported WSI authorization contract"):
-        validate(make_v4_token(secret, wsi_auth_version=version), secret, "cbioportal-wsi")
-
-
-@pytest.mark.parametrize(
-    "claim",
-    ["image_id", "tile_source", "thumbnail_source"],
-)
-def test_token_must_not_expose_sealed_claims_in_plaintext(claim):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="exposes sealed"):
-        validate(
-            make_v4_token(secret, **{claim: "a" * 64}), secret, "cbioportal-wsi"
-        )
-
-
-@pytest.mark.parametrize(
-    "slide_key",
-    [None, "", "a key", "a/b", "../x", "a.b", "x" * 129, "k\0", 12345],
-)
-def test_malformed_slide_key_is_rejected(slide_key):
-    secret = "s" * 32
-    claims = valid_claims()
-    claims["slide_key"] = slide_key
-    with pytest.raises(InvalidWsiToken, match="invalid token slide"):
-        validate(make_token(secret, **claims), secret, "cbioportal-wsi")
-
-
-@pytest.mark.parametrize(
-    "slide_key",
-    ["0123456789ab", "0123456789AB", "cycif-roi_17", "k" * 128],
-)
-def test_any_well_formed_resource_key_is_accepted(slide_key):
-    # A capability may name any resource row's serving key; it is bound to the
-    # sealed source as its AAD.
-    secret = "s" * 32
-    token = make_v4_token(secret, slide_key=slide_key, resource_id="ANY_RESOURCE")
-    assert validate(token, secret, "cbioportal-wsi")["slide_key"] == slide_key
-
-
-@pytest.mark.parametrize(
-    "resource_id",
-    ["", "WSI-SAMPLE", "a\0b", "x" * 129, 12345, ["WSI_SAMPLE"]],
-)
-def test_malformed_resource_id_is_rejected(resource_id):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="invalid token resource"):
-        validate(make_v4_token(secret, resource_id=resource_id), secret, "cbioportal-wsi")
-
-
-@pytest.mark.parametrize(
-    ("secret", "audience", "max_ttl", "seal_key"),
-    [
-        ("s" * 31, "cbioportal-wsi", 300, SEAL_KEY),
-        ("s" * 32, "   ", 300, SEAL_KEY),
-        ("s" * 32, "cbioportal-wsi", 0, SEAL_KEY),
-        ("s" * 32, "cbioportal-wsi", 301, SEAL_KEY),
-        ("s" * 32, "cbioportal-wsi", 900, SEAL_KEY),
-        ("s" * 32, "cbioportal-wsi", 300, b""),
-        ("s" * 32, "cbioportal-wsi", 300, SEAL_KEY[:31]),
-        ("s" * 32, "cbioportal-wsi", 300, SEAL_KEY + b"x"),
-        ("s" * 32, "cbioportal-wsi", 300, SEAL_KEY_B64),
-    ],
-)
-def test_invalid_wsi_auth_configuration_is_rejected(secret, audience, max_ttl, seal_key):
-    with pytest.raises(InvalidWsiToken, match="not configured"):
-        validate_wsi_auth_configuration(secret, audience, max_ttl, seal_key)
-
-
-def test_token_validation_requires_seal_key():
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken, match="seal key is not configured"):
-        validate(make_v4_token(secret), secret, "cbioportal-wsi", seal_key=b"")
-
-
-@pytest.mark.parametrize("change", [
-    {"scope": "wsi:write"},
-    {"aud": "other-service"},
-    {"exp": int(time.time()) - 1},
-])
-def test_invalid_claims_are_rejected(change):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(make_v4_token(secret, **change), secret, "cbioportal-wsi")
-
-
-def test_wrong_secret_is_rejected():
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(make_v4_token(secret), "x" * 32, "cbioportal-wsi")
-
-
-def test_non_object_header_and_payload_are_rejected():
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(make_raw_token(secret, [], {}), secret, "cbioportal-wsi")
-    with pytest.raises(InvalidWsiToken):
-        validate(
-            make_raw_token(secret, {"alg": "HS256", "typ": "JWT"}, []),
-            secret,
-            "cbioportal-wsi",
-        )
-
-
-@pytest.mark.parametrize("change", [
-    {"study_id": ""},
-    {"slide_key": ""},
-    {"enc": ""},
-    {"thumbnail_width": 0},
-    {"exp": int(time.time()) + 1000},
-])
-def test_source_bound_claims_and_max_ttl_are_required(change):
-    secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(make_v4_token(secret, **change), secret, "cbioportal-wsi")
-
-
-def test_token_lifetime_cannot_exceed_configured_limit():
-    secret = "s" * 32
-    now = int(time.time())
-    with pytest.raises(InvalidWsiToken):
-        validate(
-            make_v4_token(secret, iat=now, exp=now + 11),
-            secret,
-            "cbioportal-wsi",
-            max_ttl=10,
-        )
+    with pytest.raises(InvalidSealedSource, match="source binding"):
+        decrypt_sealed_claims(seal_claims(SEAL_KEY, SLIDE_KEY, sealed), SEAL_KEY, SLIDE_KEY)
