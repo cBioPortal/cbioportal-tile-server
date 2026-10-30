@@ -9,8 +9,9 @@ At MSK, cBioPortal uses this service to show H&E and IHC whole-slide images
 alongside the patients and samples they were taken from.
 
 The service only handles pixels. It does not know about patients, samples,
-studies, slide hierarchy, or image IDs; cBioPortal owns that metadata and
-authorizes every request (see [Request flow](#request-flow)).
+studies, slide hierarchy, or image IDs; cBioPortal owns that metadata, and
+the ingress in front of this service authorizes every request against
+cBioPortal (see [Request flow](#request-flow)).
 
 ## What it serves
 
@@ -39,21 +40,24 @@ authorizes every request (see [Request flow](#request-flow)).
 
 ## Request flow
 
-1. cBioPortal authenticates the user and checks study permissions.
-2. `GET /api/wsi/v2/slides/{studyId}/{slideKey}/access` reads the materialized
-   slide row from the cBioPortal database and returns tile metadata, thumbnail
-   dimensions, and a short-lived Bearer capability. The exact tile source URL
-   and thumbnail artifact URL are in the capability's `enc` claim, sealed by
-   the data provider with a key cBioPortal does not hold; neither the database
-   nor the response carries an `imageId` or source URL.
-3. The browser sends only that capability to this service.
-4. The service verifies the capability, opens `enc` with
-   `WSI_SOURCE_SEAL_KEY`, checks the URLs against the artifact policy, and
-   reads pixels from them in object storage.
+1. cBioPortal authenticates the user and serves the study's resource data.
+   Each servable slide row carries an opaque `key` (its slide key) and its
+   `sealed_source`; neither the database nor any response carries an
+   `imageId` or source URL.
+2. The browser requests pixels by naming the slide:
+   `?studyId=<study>&key=<slide key>&enc=<sealed source>`. No `Authorization`
+   header is sent.
+3. The ingress authorizes each request before it reaches this service with an
+   auth subrequest to cBioPortal's `GET /api/studies/{studyId}`, carrying the
+   browser's session cookie. Only requests for a study the user may read are
+   forwarded.
+4. The service opens `enc` with `WSI_SOURCE_SEAL_KEY` (bound to `key`),
+   checks the URLs against the artifact policy, and reads pixels from them in
+   object storage.
 
-The tile server never resolves an image ID, queries cBioPortal metadata, or
-loads portal data files. Client-supplied source URLs (`?source=` or
-`X-WSI-Source`) are rejected.
+The tile server never resolves an image ID, queries cBioPortal metadata,
+loads portal data files, or authenticates users. Client-supplied source URLs
+(`?source=` or `X-WSI-Source`) are rejected.
 
 ## Offline preparation
 
@@ -75,11 +79,12 @@ tile server relies on this contract:
    `tile_metadata_json` must pass
    `app.metadata_contract.validate_tile_metadata`.
 4. cBioPortal core imports those files and is the sole ClickHouse writer. It
-   publishes `can_serve_tiles=true` only when every field is present, and
-   forwards `sealed_source` as the capability's `enc` claim.
+   publishes `can_serve_tiles=true` only when every field is present; the
+   frontend passes `sealed_source` verbatim as the `enc` query parameter.
 
 The tile server never reads the pipeline's tables, registries, manifests, or
-credentials; it sees only what the access bundle and capability token carry.
+credentials; it sees only what each request's `key`, `enc`, and thumbnail
+dimensions carry.
 A slide becomes servable after thumbnails are published, study files are
 exported, and cBioPortal core has imported them.
 
@@ -94,60 +99,59 @@ responsibility; this service does not validate study rows. Treat changes to thos
 the rendered output or metadata shape changes, and call the change out in the
 pull request.
 
-The frontend is read-only: it requests the backend access bundle and then
-requests `/thumbnails`; it has no object-store upload credentials.
+The frontend is read-only: it reads the slide rows from cBioPortal and then
+requests `/thumbnails` and tiles; it has no object-store upload credentials.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Public liveness probe |
-| GET | `/ready` | Public readiness probe (auth and artifact-policy configuration) |
+| GET | `/ready` | Public readiness probe (seal key and artifact-policy configuration) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
-| GET | `/tiles/zxy/{z}/{x}/{y}` | Capability-bound JPEG tile |
-| GET | `/thumbnails?width=...&height=...` | Capability-bound thumbnail resize |
+| GET | `/tiles/zxy/{z}/{x}/{y}?studyId=&key=&enc=` | JPEG tile of the sealed source |
+| GET | `/thumbnails?studyId=&key=&enc=&tw=&th=&width=&height=` | Thumbnail resize of the sealed thumbnail |
 
-The same routes are available under `/wsi`. Every pixel request requires:
+The same routes are available under `/wsi`. Every pixel request names its
+slide with query parameters, each given exactly once:
 
-```text
-Authorization: Bearer <cBioPortal slide capability>
-```
+| Parameter | Rule |
+|-----------|------|
+| `studyId` | Required; a cBioPortal study id (`^[A-Za-z0-9_.-]{1,128}$`). Not used by this service, but requiring it guarantees the ingress always has a study to authorize |
+| `key` | Required; the resource row's serving key: 1-128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-` (a whole-slide image's key is its 12-hex slide key) |
+| `enc` | Required; the row's sealed source, verbatim |
+| `tw`, `th` | Thumbnails only; the stored thumbnail's intrinsic width and height (from the row), positive integers up to 8192 |
+| `width`, `height` | Thumbnails only; requested size, clamped to 1-2048 (default 256) |
 
-Capabilities are HMAC-SHA256 JWTs (signed with `WSI_AUTH_SECRET`) with
-`scope=wsi:read`, `wsi_auth_version=4`, `study_id`, an opaque `slide_key` (the
-serving key of the cBioPortal resource row: 1-128 characters of `A-Z`, `a-z`,
-`0-9`, `_` and `-`; a whole-slide image's key is its 12-hex slide key), an
-optional `resource_id` naming that row's resource, bounded thumbnail
-dimensions, an expiry no longer
-than `WSI_AUTH_MAX_TTL`, and
-an `enc` claim. `enc` is the slide's sealed source: base64url (no padding) of
-nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes), keyed with the raw
-32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`, over JSON
+A missing or malformed parameter returns `400`. `enc` is base64url (no
+padding) of nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes),
+keyed with the raw 32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `key`, over JSON
 `{"image_id":…,"tile_source":…,"thumbnail_source":…}`. The data provider seals
-it when it publishes the slide; cBioPortal stores and forwards it verbatim and
+it when it publishes the slide; cBioPortal stores and serves it verbatim and
 cannot open it, so neither cBioPortal nor the browser sees the `image_id` or
-source URLs. The tile server decrypts it and applies the source/thumbnail URI
-policy (scheme, approved prefix, extension, no traversal) before any read.
-Requests that supply a source themselves (`?source=` or `X-WSI-Source`) are
-rejected with `400`. See `../docs/wsi-deid-slide-key-contract.md`
-(`wsi-serving-v6`).
-`/health` and `/ready` intentionally remain public for orchestration probes.
+source URLs. An `enc` that does not open under `key` (for example another
+slide's) returns `403`. The tile server then applies the source/thumbnail URI
+policy (scheme, approved prefix, extension, no traversal) before any read;
+a source outside it is refused. Requests that supply a source themselves
+(`?source=` or `X-WSI-Source`) are rejected with `400`. See
+`../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v6`).
+
+This service performs no user authentication: deploy it only behind an ingress
+that authorizes `studyId` against cBioPortal with the session cookie, and do
+not expose it directly. `/health` and `/ready` intentionally remain public
+for orchestration probes.
 
 ## Runtime configuration
 
-The service needs only pixel storage, the shared capability secret, the source
-seal key, and an optional Redis cache:
+The service needs only pixel storage, the source seal key, and an optional
+Redis cache:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AWS_ENDPOINT_URL` | — | S3-compatible object-store endpoint |
 | `AWS_ACCESS_KEY_ID` | — | Object-store access key |
 | `AWS_SECRET_ACCESS_KEY` | — | Object-store secret key |
-| `WSI_AUTH_SECRET` | — | At least 32 bytes; shared with cBioPortal |
-| `WSI_AUTH_PREVIOUS_SECRET` | — | Optional prior secret during a bounded signing-key rotation |
-| `WSI_SOURCE_SEAL_KEY` | — | Required. Standard base64 of exactly 32 random bytes; opens the `enc` claim. Shared with the data provider that seals sources, never with cBioPortal. Startup fails without it |
-| `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Capability audience |
-| `WSI_AUTH_MAX_TTL` | `300` | Maximum capability lifetime in seconds |
+| `WSI_SOURCE_SEAL_KEY` | — | Required. Standard base64 of exactly 32 random bytes; opens each request's `enc`. Shared with the data provider that seals sources, never with cBioPortal. Startup fails without it |
 | `WSI_ALLOWED_SOURCE_SCHEMES` | `s3` | Comma-separated schemes accepted in source URLs |
 | `WSI_ALLOWED_SOURCE_PREFIXES` | empty | Comma-separated approved source URI prefixes; required for publication |
 | `WSI_ALLOWED_THUMBNAIL_PREFIXES` | empty | Comma-separated approved thumbnail URI prefixes; required for publication |
@@ -168,7 +172,7 @@ seal key, and an optional Redis cache:
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |
-| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per capability subject and source; `0` disables it |
+| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per client address (first `X-Forwarded-For` hop, else the peer) and study+key; `0` disables it |
 | `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Renewable cross-worker extraction lock lease |
 | `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `60` | Maximum follower wait for another worker's extraction |
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
@@ -184,8 +188,10 @@ The online service does not generate thumbnails, consult a manifest, or write
 the registry. Production deployments must run an offline thumbnail batch; the
 on-demand worker is not a substitute.
 
-Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
-Redis is an optimization only; a cache outage does not change authorization.
+Tile responses are `private, max-age=3600` and thumbnails
+`private, max-age=300`; both vary on `Cookie`, the credential the ingress
+authorizes on. Redis is an optimization only; a cache outage does not change
+authorization.
 If a requested overview cannot be decoded within the configured pixel bound,
 the tile endpoint returns HTTP 422 with
 `{"error":"overview_requires_preprocessing"}`.
@@ -198,7 +204,7 @@ is unavailable, the service falls back to local single-flight and the image
 operation semaphore, and records the outage in metrics.
 
 The `/metrics` endpoint is intended for internal monitoring and is not a WSI
-capability endpoint. Production ingress should expose only the tile,
+pixel endpoint. Production ingress should expose only the tile,
 thumbnail, health, and readiness paths; scrape `/metrics` through the internal
 Kubernetes service. Important metrics include image-operation queue time,
 thumbnail fetch/resize latency and fetch-slot queue time, slide-open latency,
@@ -209,29 +215,30 @@ miss-lock outcomes, and cache-miss rate-limit decisions.
 
 ```bash
 python3 tools/write_dev_env.py
-printf 'WSI_AUTH_SECRET=%s\nWSI_SOURCE_SEAL_KEY=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -base64 32)" "$(openssl rand -hex 24)" >> .env
+printf 'WSI_SOURCE_SEAL_KEY=%s\nREDIS_PASSWORD=%s\n' "$(openssl rand -base64 32)" "$(openssl rand -hex 24)" >> .env
 docker compose up --build
 ```
 
-The compose file is a local rehearsal. Configure the same secret, audience,
-and compatible TTL in cBioPortal and this service, and the same
-`WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
+The compose file is a local rehearsal with no ingress in front of the
+service, so it performs no study authorization; do not expose it. Use the
+same `WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
 produced.
 
 ## Local slide tests
 
 For CI-safe local slide tests, set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file`,
-include `file:///app/testdata/` in both prefix allowlists, and issue a v4
-capability whose `enc` seals the mounted file URIs with `WSI_SOURCE_SEAL_KEY`
-(see `seal_claims` in `tests/test_auth.py`). The normal
+include `file:///app/testdata/` in both prefix allowlists, and request with
+an `enc` that seals the mounted file URIs with `WSI_SOURCE_SEAL_KEY` under the
+request's `key` (see `seal_claims` in `tests/test_auth.py`). The normal
 production default accepts only `s3` URLs.
 
 ## PHI-safe operation
 
-Do not log source URLs, patient IDs, slide IDs, or token contents. Request
-logs may retain operation type, dimensions, status, timing, and exception
-class. Keep the backend hierarchy and access endpoint behind normal
-cBioPortal authentication and study authorization.
+Do not log source URLs, patient IDs, slide IDs, or `enc` values. Request
+logs (including the ingress's) may retain operation type, dimensions, status,
+timing, and exception class; they should drop query strings, since `enc` and
+`key` travel there. Keep the backend resource data behind normal cBioPortal
+authentication and study authorization.
 
 ## Tests
 
@@ -244,7 +251,7 @@ uv export --all-groups --no-emit-project --format requirements-txt \
 ## Container publication
 
 The `Build and publish container` workflow builds every pull request and runs
-the same health, readiness, authentication, CORS, and Gunicorn-startup smoke
+the same health, readiness, request-validation, CORS, and Gunicorn-startup smoke
 checks used for the triage canary.  A push to `main` publishes only an
 immutable full-commit tag to Docker Hub:
 

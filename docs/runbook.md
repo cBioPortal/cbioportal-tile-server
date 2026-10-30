@@ -1,38 +1,45 @@
 # cBioPortal WSI tile-server runbook
 
-This service is a capability-bound pixel reader. cBioPortal owns authentication,
-study authorization, hierarchy, and the slide access bundle. The tile server
-does not resolve image IDs, query Databricks, read a resource index, search,
-or expose clinical metadata.
+This service is a plain pixel renderer. cBioPortal owns authentication,
+study authorization, hierarchy, and the slide rows; the ingress enforces study
+authorization on every pixel request. The tile server does not resolve image
+IDs, query Databricks, read a resource index, search, authenticate users, or
+expose clinical metadata.
 
 ## Source of truth
 
-- `../cbioportal` serves `/api/wsi/v2/hierarchy/{studyId}/{patientId}` and
-  `/api/wsi/v2/slides/{studyId}/{slideKey}/access` from ClickHouse.
-- `../cbioportal-frontend` requests that access bundle and sends only the
-  returned Bearer capability to this service; it never sees or sends a
-  source URL.
+- `../cbioportal` serves the study's resource data, whose WSI rows carry each
+  slide's opaque `key` and `sealed_source`.
+- `../cbioportal-frontend` requests pixels with
+  `?studyId=<study>&key=<slide key>&enc=<sealed source>` (thumbnails add
+  `tw`/`th`, the row's thumbnail dimensions); it never sees or sends a source
+  URL, and sends no `Authorization` header.
 - The deployment repository owns ingress, probes, secrets, and rollout
-  resources.
+  resources, including the auth subrequest below.
 
-The backend access response is the only online input needed beyond the shared
-secret and the source seal key. It contains `slideKey`, thumbnail dimensions,
-intrinsic tile metadata, and a `wsi_auth_version=4` token signed with
-`WSI_AUTH_SECRET`. The token's `enc` claim is the slide's sealed source: the
-real `image_id` and both source URLs encrypted by the data provider with
-AES-256-GCM under the raw 32-byte `WSI_SOURCE_SEAL_KEY` (AAD = `slide_key`).
-cBioPortal stores and forwards it verbatim and cannot decrypt it. The tile
-server opens it, applies `check_source_uri` (scheme, approved prefix,
-extension, no traversal), and reads only those URLs. v2 and v3 tokens are
-rejected. Contract: `wsi-serving-v6`
+`enc` is the slide's sealed source: the real `image_id` and both source URLs
+encrypted by the data provider with AES-256-GCM under the raw 32-byte
+`WSI_SOURCE_SEAL_KEY` (AAD = the slide's `key`). cBioPortal stores and serves
+it verbatim and cannot decrypt it. The tile server opens it, applies
+`check_source_uri` (scheme, approved prefix, extension, no traversal), and
+reads only those URLs. An `enc` that does not open under the request's `key`
+returns `403`. Contract: `wsi-serving-v6`
 (`../docs/wsi-deid-slide-key-contract.md`).
 
 ## Production topology
 
-The existing `/wsi` ingress may route to this service. Keep `/health` and
-`/ready` public for orchestration; all other routes require a Bearer token.
-Ingress and deployment configuration are authoritative for timeouts, network
-policy, worker count, and block-cache volumes.
+The existing `/wsi` ingress routes to this service and must authorize every
+pixel request before forwarding it: an nginx `auth_request` subrequest to
+cBioPortal's `GET /api/studies/{studyId}` (`studyId` from the request's query
+string), forwarding the browser's `Cookie` header. Forward only on `2xx`.
+The tile server requires `studyId` (`400` without it) so the ingress always
+has a study to check, and refuses repeated `studyId`/`key`/`enc` parameters so
+the ingress and service cannot read different values. Never expose the
+service without that ingress. Keep `/health` and `/ready` public for
+orchestration. Ingress and deployment configuration are authoritative for
+timeouts, network policy, worker count, and block-cache volumes. The ingress
+should overwrite `X-Forwarded-For` (the cache-miss rate limit is keyed on its
+first hop) and should not log query strings.
 
 ## Required environment
 
@@ -40,18 +47,15 @@ policy, worker count, and block-cache volumes.
 AWS_ENDPOINT_URL=<S3-compatible endpoint>
 AWS_ACCESS_KEY_ID=<object-store key>
 AWS_SECRET_ACCESS_KEY=<object-store secret>
-WSI_AUTH_SECRET=<same at-least-32-byte secret as cBioPortal>
 WSI_SOURCE_SEAL_KEY=<standard base64 of the 32-byte key the data provider seals sources with>
-WSI_AUTH_AUDIENCE=cbioportal-wsi
-WSI_AUTH_MAX_TTL=300
 WSI_ALLOWED_SOURCE_SCHEMES=s3
 WSI_ALLOWED_SOURCE_PREFIXES=<approved source URI prefixes>
 WSI_ALLOWED_THUMBNAIL_PREFIXES=<approved thumbnail URI prefixes>
 REDIS_URL=<password-protected Redis URL>
 ```
 
-The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
-server TTL lower than the backend TTL. Authentication is mandatory for pixel routes.
+`WSI_AUTH_SECRET`, `WSI_AUTH_PREVIOUS_SECRET`, `WSI_AUTH_AUDIENCE`, and
+`WSI_AUTH_MAX_TTL` are no longer read and can be removed.
 The URI prefix allowlists are a de-identification boundary; leave them empty
 only for an isolated non-publishing unit test.
 
@@ -63,21 +67,26 @@ curl -fsS https://cbioportal.example.org/wsi/ready
 curl -i https://cbioportal.example.org/wsi/tiles/zxy/0/0/0
 ```
 
-The final command must return `401` without `Authorization`. With a fresh
-bundle from cBioPortal, use only the returned token:
+Through the ingress, the final command must be refused (no study to
+authorize); directly against the service it returns `400`. With a session
+cookie for a user who can read the study and a slide row's `key` and
+`sealed_source`:
 
 ```bash
-curl -fsS \
-  -H "Authorization: Bearer ${WSI_TOKEN}" \
+curl -fsS -G -H "Cookie: SESSION=${SESSION}" \
+  --data-urlencode "studyId=${STUDY_ID}" \
+  --data-urlencode "key=${SLIDE_KEY}" \
+  --data-urlencode "enc=${ENC}" \
   "https://cbioportal.example.org/wsi/tiles/zxy/0/0/0"
 ```
 
-Also verify that adding `?source=...` or an `X-WSI-Source` header returns
-`400`, that changing one character of the token returns `401`, that an
-expired token returns `401`, and that a v2 or v3 token returns `401`.
+Also verify that the same request without the cookie, or with a study the
+user cannot read, is refused by the ingress; that adding `source=...` or an
+`X-WSI-Source` header returns `400`; and that swapping in another slide's
+`key` (keeping `enc`) returns `403`. `tests/smoke.py` runs these checks.
 
 `WSI_SOURCE_SEAL_KEY` is required: the process refuses to start, `/ready`
-returns `503`, and every pixel request returns `401` unless it decodes to
+returns `503`, and every pixel request returns `503` unless it decodes to
 exactly 32 bytes. It is held only by the data provider that seals sources and
 by this service; never give it to cBioPortal. Rotating it means re-sealing
 every published `sealed_source` and re-importing the study files.
@@ -108,22 +117,20 @@ The frontend only requests `/thumbnails` and never uploads artifacts.
 
 ## Response and cache policy
 
-- Tiles: `private, max-age=3600`, vary on `Authorization`.
-- Thumbnails: `private, max-age=300`, vary on `Authorization`.
+- Tiles: `private, max-age=3600`, vary on `Cookie`.
+- Thumbnails: `private, max-age=300`, vary on `Cookie`.
 - Redis is an optimization, never an authorization boundary.
 - Overview decodes that exceed `MAX_DECODE_PIXELS` return HTTP 422 with
   `overview_requires_preprocessing`.
 
-Application logs must not include tokens, source URLs, patient IDs, or slide
-IDs. Keep operation type, dimensions, status, timing, and exception class.
+Application logs must not include `enc` values, source URLs, patient IDs, or
+slide IDs. Keep operation type, dimensions, status, timing, and exception class.
 
 ## Local integration
 
-The local cBioPortal compose rehearsal should pass the same
-`WSI_AUTH_SECRET`/audience to the backend and tile server, and give the tile
-server the `WSI_SOURCE_SEAL_KEY` the local study's sealed sources were
-produced with. For mounted local
-slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and include
-`file:///app/testdata/` in both URI prefix allowlists; production should remain
-`s3` only. Generate a v4 access bundle through the backend before
-testing a pixel request.
+The local cBioPortal compose rehearsal should give the tile server the
+`WSI_SOURCE_SEAL_KEY` the local study's sealed sources were produced with, and
+route `/wsi` through an ingress that performs the study auth subrequest. For
+mounted local slides, explicitly set `WSI_ALLOWED_SOURCE_SCHEMES=s3,file` and
+include `file:///app/testdata/` in both URI prefix allowlists; production
+should remain `s3` only.

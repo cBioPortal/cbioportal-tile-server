@@ -8,6 +8,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from fsspec.exceptions import BlocksizeMismatchError
 from tifffile import TiffFileError
 
+import app.auth as auth_module
 import app.main as main_module
 from tests.test_auth import (
     SEAL_KEY,
@@ -15,11 +16,8 @@ from tests.test_auth import (
     SLIDE_KEY,
     THUMBNAIL_SOURCE,
     TILE_SOURCE,
-    make_v4_token,
-    seal_claims,
+    make_enc,
 )
-
-WSI_SECRET = "s" * 32
 
 
 class TestReadinessIdentity:
@@ -38,8 +36,8 @@ class TestReadinessIdentity:
             "wsi_allowed_thumbnail_prefixes",
             ("s3://mskmind-bkt/wsi-thumbnails/",),
         )
-        with patch.object(main_module, "validate_wsi_auth_configuration"):
-            status, payload = main_module._readiness_status()
+        monkeypatch.setattr(main_module, "_source_seal_key", SEAL_KEY)
+        status, payload = main_module._readiness_status()
 
         assert status == 200
         assert payload["release_id"] == "candidate-1"
@@ -56,15 +54,14 @@ class TestReadinessIdentity:
             "wsi_allowed_thumbnail_prefixes",
             ("s3://mskmind-bkt/wsi-thumbnails/",),
         )
-        with patch.object(main_module, "validate_wsi_auth_configuration"):
-            status, payload = main_module._readiness_status()
+        monkeypatch.setattr(main_module, "_source_seal_key", SEAL_KEY)
+        status, payload = main_module._readiness_status()
 
         assert status == 503
         assert payload["status"] == "unavailable"
 
     @pytest.mark.parametrize("seal_key", [None, b"short", SEAL_KEY.hex().encode()])
     def test_invalid_source_seal_key_fails_readiness(self, monkeypatch, seal_key):
-        monkeypatch.setattr(main_module.settings, "wsi_auth_secret", WSI_SECRET)
         monkeypatch.setattr(main_module, "_source_seal_key", seal_key)
         monkeypatch.setattr(main_module.settings, "release_id", "")
         monkeypatch.setattr(main_module.settings, "image_git_sha", "")
@@ -523,7 +520,7 @@ class TestThumbnailFetchRetry:
 
 class TestCorsPreflight:
     @pytest.mark.asyncio
-    async def test_preflight_does_not_require_slide_capability(self):
+    async def test_preflight_is_answered_without_slide_parameters(self):
         transport = httpx.ASGITransport(app=main_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.options(
@@ -531,13 +528,11 @@ class TestCorsPreflight:
                 headers={
                     "Origin": "https://cbioportal.mskcc.org",
                     "Access-Control-Request-Method": "GET",
-                    "Access-Control-Request-Headers": "Authorization",
                 },
             )
 
         assert response.status_code == 200
         assert response.headers["access-control-allow-origin"] == "https://cbioportal.mskcc.org"
-        assert "authorization" in response.headers["access-control-allow-headers"].lower()
     @pytest.mark.asyncio
     async def test_private_network_preflight_allows_browser_access(self):
         transport = httpx.ASGITransport(app=main_module.app)
@@ -547,7 +542,6 @@ class TestCorsPreflight:
                 headers={
                     "Origin": "https://cbioportal.mskcc.org",
                     "Access-Control-Request-Method": "GET",
-                    "Access-Control-Request-Headers": "Authorization",
                     "Access-Control-Request-Private-Network": "true",
                 },
             )
@@ -563,7 +557,6 @@ class TestCorsPreflight:
                 headers={
                     "Origin": "https://untrusted.example",
                     "Access-Control-Request-Method": "GET",
-                    "Access-Control-Request-Headers": "Authorization",
                     "Access-Control-Request-Private-Network": "true",
                 },
             )
@@ -573,224 +566,327 @@ class TestCorsPreflight:
         assert "access-control-allow-origin" not in response.headers
 
     @pytest.mark.asyncio
-    async def test_unauthenticated_tile_get_remains_protected(self):
+    async def test_tile_get_without_slide_parameters_is_rejected(self):
         transport = httpx.ASGITransport(app=main_module.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             response = await client.get(
-                "/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs",
+                "/tiles/zxy/0/0/0",
                 headers={"Origin": "https://cbioportal.mskcc.org"},
             )
 
-        assert response.status_code == 401
+        assert response.status_code == 400
 
 
 @pytest.fixture
-def wsi_auth_settings(monkeypatch):
-    monkeypatch.setattr(main_module.settings, "wsi_auth_secret", WSI_SECRET)
-    monkeypatch.setattr(main_module.settings, "wsi_auth_previous_secret", "")
+def slide_settings(monkeypatch):
+    auth_module._decrypt_sealed_claims_cached.cache_clear()
     monkeypatch.setattr(main_module.settings, "wsi_source_seal_key", SEAL_KEY_B64)
     monkeypatch.setattr(main_module, "_source_seal_key", SEAL_KEY)
-    monkeypatch.setattr(main_module.settings, "wsi_auth_audience", "cbioportal-wsi")
-    monkeypatch.setattr(main_module.settings, "wsi_auth_max_ttl", 300)
     monkeypatch.setattr(main_module.settings, "wsi_allowed_source_schemes", ["s3", "file"])
     monkeypatch.setattr(main_module.settings, "wsi_allowed_source_prefixes", ["s3://slides/"])
     monkeypatch.setattr(main_module.settings, "wsi_allowed_thumbnail_prefixes", ["s3://thumbs/"])
 
 
-def _bearer(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
+STUDY_ID = "study_a"
+OTHER_SLIDE_KEY = "ba9876543210"
 
 
-def _request_with_capability(token: str) -> httpx.Request:
-    """A tile request carrying the claims the capability middleware would attach."""
-    request = httpx.Request("GET", "http://test/tiles/zxy/0/0/0")
-    request.state = type("State", (), {})()
-    request.state.wsi_claims = main_module.validate_wsi_token(
-        token, WSI_SECRET, "cbioportal-wsi", seal_key=SEAL_KEY
-    )
-    return request
+def _query(**overrides) -> dict:
+    params = {"studyId": STUDY_ID, "key": SLIDE_KEY, "enc": make_enc()}
+    params.update(overrides)
+    return {name: value for name, value in params.items() if value is not None}
 
 
-class TestSourceBinding:
+def _thumbnail_query(**overrides) -> dict:
+    return _query(**{"tw": "1024", "th": "768", "width": "128", "height": "96", **overrides})
+
+
+async def _get(path: str, params=None, headers=None) -> httpx.Response:
+    transport = httpx.ASGITransport(app=main_module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.get(path, params=params, headers=headers)
+
+
+class TestSlideRoutes:
     @pytest.mark.asyncio
-    async def test_tile_and_thumbnail_share_slide_rate_limit_scope(self):
-        source = "s3://bucket/slide.svs"
-        claims = {"sub": "subject", "study_id": "study-a", "slide_key": SLIDE_KEY}
-        distributed_results = [
-            b"jpeg",
-            (b"jpeg", {"status": "ok", "reason": "test"}),
-        ]
-
-        with (
-            patch.object(main_module, "_authorize_source", return_value=(source, claims)),
-            patch.object(main_module.tile_cache, "get_tile", return_value=None),
-            patch.object(main_module.tile_cache, "get_thumbnail", return_value=None),
-            patch.object(
-                main_module,
-                "_distributed_singleflight",
-                side_effect=distributed_results,
-            ) as distributed,
-        ):
-            tile_response = await main_module.tile(
-                httpx.Request("GET", "http://test/tiles/zxy/0/0/0"),
-                0,
-                0,
-                0,
-                None,
-            )
-            thumbnail_response = await main_module.thumbnail(
-                httpx.Request("GET", "http://test/thumbnails"),
-                None,
-                256,
-                256,
-            )
-
-        assert tile_response.status_code == 200
-        assert thumbnail_response.status_code == 200
-        assert [call.args[3] for call in distributed.await_args_list] == [
-            f"study-a\0{SLIDE_KEY}",
-            f"study-a\0{SLIDE_KEY}",
-        ]
-
-    def test_rate_limit_scope_includes_the_resource_when_named(self):
-        claims = {"study_id": "study-a", "slide_key": SLIDE_KEY}
-        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0{SLIDE_KEY}"
-        claims["resource_id"] = "WSI_SAMPLE"
-        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0WSI_SAMPLE\0{SLIDE_KEY}"
-
-    @pytest.mark.asyncio
-    async def test_metrics_bypasses_capability_guard(self):
-        scope = {
-            "type": "http",
-            "path": "/metrics",
-            "headers": [],
-            "method": "GET",
-        }
-        starlette_request = main_module.Request(scope, receive=lambda: None)
-
-        async def call_next(request):
-            return main_module.Response(status_code=204)
-
-        response = await main_module.require_wsi_capability(starlette_request, call_next)
-        assert response.status_code == 204
-
     @pytest.mark.parametrize(
-        ("operation", "expected"),
-        [("tile", TILE_SOURCE), ("thumbnail", THUMBNAIL_SOURCE)],
-    )
-    def test_authorize_source_uses_decrypted_capability_source(
-        self, wsi_auth_settings, operation, expected
-    ):
-        request = _request_with_capability(make_v4_token(WSI_SECRET))
-
-        source, claims = main_module._authorize_source(request, operation)
-
-        assert source == expected
-        assert claims["slide_key"] == SLIDE_KEY
-
-    @pytest.mark.parametrize(
-        ("operation", "sealed"),
+        ("path", "params", "cache_fn", "expected", "cache_control"),
         [
-            # Outside the approved prefix.
-            ("tile", {"tile_source": "s3://other/slide-a.svs"}),
-            ("thumbnail", {"thumbnail_source": "s3://other/slide-a.jpg"}),
-            # Wrong artifact extension for the operation.
-            ("tile", {"tile_source": "s3://slides/slide-a.jpg"}),
-            ("thumbnail", {"thumbnail_source": "s3://thumbs/slide-a.svs"}),
-            # Query strings, traversal and embedded credentials.
-            ("tile", {"tile_source": "s3://slides/slide-a.svs?versionId=1"}),
-            ("thumbnail", {"thumbnail_source": "s3://thumbs/../private/slide-a.jpg"}),
-            ("tile", {"tile_source": "s3://user:pass@slides/slide-a.svs"}),
-            # Unsupported schemes.
-            ("tile", {"tile_source": "https://slides/slide-a.svs"}),
-            ("tile", {"tile_source": "gs://slides/slide-a.svs"}),
+            ("/tiles/zxy/0/0/0", _query, "get_tile", TILE_SOURCE, "private, max-age=3600"),
+            ("/wsi/tiles/zxy/0/0/0", _query, "get_tile", TILE_SOURCE, "private, max-age=3600"),
+            ("/thumbnails", _thumbnail_query, "get_thumbnail", THUMBNAIL_SOURCE, "private, max-age=300"),
+            ("/wsi/thumbnails", _thumbnail_query, "get_thumbnail", THUMBNAIL_SOURCE, "private, max-age=300"),
         ],
     )
-    def test_authorize_source_rejects_decrypted_source_outside_policy(
-        self, wsi_auth_settings, operation, sealed
-    ):
-        enc = seal_claims(
-            SEAL_KEY,
-            SLIDE_KEY,
-            {
-                "image_id": "slide-a",
-                "tile_source": TILE_SOURCE,
-                "thumbnail_source": THUMBNAIL_SOURCE,
-                **sealed,
-            },
-        )
-        request = _request_with_capability(make_v4_token(WSI_SECRET, enc=enc))
-
-        with pytest.raises(main_module.HTTPException) as exc_info:
-            main_module._authorize_source(request, operation)
-
-        assert exc_info.value.status_code in (400, 403)
-        assert "s3://" not in str(exc_info.value.detail)
-        assert "slide-a" not in str(exc_info.value.detail)
-
-class TestCapabilityRoutes:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("path", "cache_fn", "expected"),
-        [
-            ("/tiles/zxy/0/0/0", "get_tile", TILE_SOURCE),
-            ("/wsi/thumbnails?width=128&height=96", "get_thumbnail", THUMBNAIL_SOURCE),
-        ],
-    )
-    async def test_routes_serve_decrypted_source(
-        self, wsi_auth_settings, path, cache_fn, expected
+    async def test_routes_serve_the_sealed_source(
+        self, slide_settings, path, params, cache_fn, expected, cache_control
     ):
         cached = AsyncMock(return_value=b"image")
-        transport = httpx.ASGITransport(app=main_module.app)
         with patch.object(main_module.tile_cache, cache_fn, new=cached):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.get(path, headers=_bearer(make_v4_token(WSI_SECRET)))
+            response = await _get(path, params())
 
         assert response.status_code == 200
         assert response.content == b"image"
         assert cached.await_args.args[0] == main_module.source_digest(expected)
+        assert response.headers["cache-control"] == cache_control
+        assert response.headers["vary"] == "Cookie"
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_uses_intrinsic_dimensions_from_the_request(
+        self, slide_settings
+    ):
+        records = []
+
+        async def fetch(record):
+            records.append(record)
+            return b"master"
+
+        async def run_image_operation(fn, payload, record, width, height, **kwargs):
+            return b"resized", {"status": "ok", "reason": "resized"}
+
+        with (
+            patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=None)),
+            patch.object(main_module.tile_cache, "set_thumbnail", new=AsyncMock()),
+            patch.object(main_module.tile_cache, "try_acquire_miss_lock", new=AsyncMock(return_value=None)),
+            patch.object(main_module, "_run_thumbnail_fetch", side_effect=fetch),
+            patch.object(main_module, "_run_image_operation", side_effect=run_image_operation),
+        ):
+            response = await _get("/thumbnails", _thumbnail_query(tw="2000", th="1500"))
+
+        assert response.status_code == 200
+        assert response.content == b"resized"
+        assert response.headers["x-thumbnail-reason"] == "resized"
+        assert [(r.uri, r.width, r.height) for r in records] == [
+            (THUMBNAIL_SOURCE, 2000, 1500)
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
     @pytest.mark.parametrize(
-        ("query", "headers"),
+        "overrides",
         [
-            ("?source=s3%3A%2F%2Fslides%2Fslide-a.svs", {}),
-            ("?source=", {}),
-            ("", {"X-WSI-Source": "s3://slides/slide-a.svs"}),
-            ("", {"x-wsi-source": ""}),
+            {"studyId": None},
+            {"studyId": ""},
+            {"studyId": "study a"},
+            {"studyId": "study/a"},
+            {"studyId": "s" * 129},
+            {"key": None},
+            {"key": ""},
+            {"key": "a/b"},
+            {"key": "a.b"},
+            {"key": "k" * 129},
+            {"enc": None},
+            {"enc": ""},
+            {"enc": "not+base64url"},
+            {"enc": "A" * 4097},
         ],
     )
-    async def test_routes_reject_client_supplied_sources(
-        self, wsi_auth_settings, path, query, headers
+    async def test_missing_or_malformed_slide_parameters_are_rejected(
+        self, slide_settings, path, overrides
     ):
-        transport = httpx.ASGITransport(app=main_module.app)
+        params = (_query if path.startswith("/tiles") else _thumbnail_query)(**overrides)
         with (
             patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=b"x")),
             patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=b"x")),
         ):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.get(
-                    path + query,
-                    headers={**_bearer(make_v4_token(WSI_SECRET)), **headers},
-                )
+            response = await _get(path, params)
 
         assert response.status_code == 400
         assert "s3://" not in response.text
 
     @pytest.mark.asyncio
-    async def test_previous_secret_verifies_signature_and_seal_key_opens_enc(
-        self, wsi_auth_settings, monkeypatch
+    @pytest.mark.parametrize("name", ["studyId", "key", "enc"])
+    async def test_repeated_slide_parameters_are_rejected(self, slide_settings, name):
+        params = list(_query().items()) + [(name, _query()[name])]
+        with patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=b"x")):
+            response = await _get("/tiles/zxy/0/0/0", params)
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"tw": None},
+            {"th": None},
+            {"tw": ""},
+            {"tw": "0"},
+            {"th": "-1"},
+            {"tw": "8193"},
+            {"th": "99999"},
+            {"tw": "1.5"},
+            {"th": "abc"},
+            {"tw": "01"},
+        ],
+    )
+    async def test_missing_or_malformed_thumbnail_dimensions_are_rejected(
+        self, slide_settings, overrides
     ):
-        previous = "p" * 32
-        monkeypatch.setattr(main_module.settings, "wsi_auth_previous_secret", previous)
-        get_tile = AsyncMock(return_value=b"tile")
-        transport = httpx.ASGITransport(app=main_module.app)
-        with patch.object(main_module.tile_cache, "get_tile", new=get_tile):
-            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                response = await client.get(
-                    "/tiles/zxy/0/0/0", headers=_bearer(make_v4_token(previous))
-                )
+        with patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=b"x")):
+            response = await _get("/thumbnails", _thumbnail_query(**overrides))
+
+        assert response.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            # Another slide's sealed source presented under this key.
+            {"enc": make_enc(slide_key=OTHER_SLIDE_KEY)},
+            # This slide's sealed source presented under another key.
+            {"key": OTHER_SLIDE_KEY},
+            # Sealed with a different seal key.
+            {"enc": make_enc(seal_key=bytes(32))},
+            # Well-formed but not a sealed source.
+            {"enc": "A" * 40},
+        ],
+    )
+    async def test_enc_that_does_not_open_under_the_key_is_forbidden(
+        self, slide_settings, path, overrides
+    ):
+        params = (_query if path.startswith("/tiles") else _thumbnail_query)(**overrides)
+        cached = AsyncMock(return_value=b"x")
+        with (
+            patch.object(main_module.tile_cache, "get_tile", new=cached),
+            patch.object(main_module.tile_cache, "get_thumbnail", new=cached),
+        ):
+            response = await _get(path, params)
+
+        assert response.status_code == 403
+        assert SLIDE_KEY not in response.text
+        assert OTHER_SLIDE_KEY not in response.text
+        cached.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_requests_fail_closed_without_a_seal_key(
+        self, slide_settings, monkeypatch
+    ):
+        monkeypatch.setattr(main_module, "_source_seal_key", None)
+        with patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=b"x")):
+            response = await _get("/tiles/zxy/0/0/0", _query())
+
+        assert response.status_code == 503
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "sealed"),
+        [
+            # Outside the approved prefix.
+            ("/tiles/zxy/0/0/0", {"tile_source": "s3://other/slide-a.svs"}),
+            ("/thumbnails", {"thumbnail_source": "s3://other/slide-a.jpg"}),
+            # Wrong artifact extension for the operation.
+            ("/tiles/zxy/0/0/0", {"tile_source": "s3://slides/slide-a.jpg"}),
+            ("/thumbnails", {"thumbnail_source": "s3://thumbs/slide-a.svs"}),
+            # Query strings, traversal and embedded credentials.
+            ("/tiles/zxy/0/0/0", {"tile_source": "s3://slides/slide-a.svs?versionId=1"}),
+            ("/thumbnails", {"thumbnail_source": "s3://thumbs/../private/slide-a.jpg"}),
+            ("/tiles/zxy/0/0/0", {"tile_source": "s3://user:pass@slides/slide-a.svs"}),
+            # Unsupported schemes.
+            ("/tiles/zxy/0/0/0", {"tile_source": "https://slides/slide-a.svs"}),
+            ("/tiles/zxy/0/0/0", {"tile_source": "gs://slides/slide-a.svs"}),
+        ],
+    )
+    async def test_sealed_source_outside_policy_is_refused(
+        self, slide_settings, path, sealed
+    ):
+        enc = make_enc(**sealed)
+        params = (_query if path.startswith("/tiles") else _thumbnail_query)(enc=enc)
+        cached = AsyncMock(return_value=b"x")
+        with (
+            patch.object(main_module.tile_cache, "get_tile", new=cached),
+            patch.object(main_module.tile_cache, "get_thumbnail", new=cached),
+        ):
+            response = await _get(path, params)
+
+        assert response.status_code in (400, 403)
+        assert "s3://" not in response.text
+        assert "slide-a" not in response.text
+        cached.assert_not_awaited()
+
+    @pytest.mark.parametrize("operation", ["tile", "thumbnail"])
+    def test_source_outside_the_prefix_allowlist_is_forbidden(
+        self, slide_settings, operation
+    ):
+        claims = {"tile_source": "s3://other/slide-a.svs", "thumbnail_source": "s3://other/slide-a.jpg"}
+        with pytest.raises(main_module.HTTPException) as exc_info:
+            main_module._authorize_source(claims, operation)
+
+        assert exc_info.value.status_code == 403
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
+    @pytest.mark.parametrize(
+        ("extra", "headers"),
+        [
+            ({"source": "s3://slides/slide-a.svs"}, {}),
+            ({"source": ""}, {}),
+            ({}, {"X-WSI-Source": "s3://slides/slide-a.svs"}),
+            ({}, {"x-wsi-source": ""}),
+        ],
+    )
+    async def test_routes_reject_client_supplied_sources(
+        self, slide_settings, path, extra, headers
+    ):
+        params = (_query if path.startswith("/tiles") else _thumbnail_query)()
+        params.update(extra)
+        with (
+            patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=b"x")),
+            patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=b"x")),
+        ):
+            response = await _get(path, params, headers)
+
+        assert response.status_code == 400
+        assert "s3://" not in response.text
+
+    @pytest.mark.asyncio
+    async def test_authorization_header_is_neither_required_nor_used(self, slide_settings):
+        cached = AsyncMock(return_value=b"tile")
+        with patch.object(main_module.tile_cache, "get_tile", new=cached):
+            response = await _get(
+                "/tiles/zxy/0/0/0", _query(), {"Authorization": "Bearer not-a-token"}
+            )
 
         assert response.status_code == 200
-        assert get_tile.await_args.args[0] == main_module.source_digest(TILE_SOURCE)
+
+
+class TestRateLimitScope:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("headers", "subject"),
+        [
+            ({}, "127.0.0.1"),
+            ({"X-Forwarded-For": "10.1.2.3"}, "10.1.2.3"),
+            ({"X-Forwarded-For": " 10.1.2.3 , 172.16.0.1"}, "10.1.2.3"),
+            ({"X-Forwarded-For": ""}, "127.0.0.1"),
+        ],
+    )
+    async def test_tile_and_thumbnail_scope_by_client_and_study_key(
+        self, slide_settings, headers, subject
+    ):
+        distributed = AsyncMock(
+            side_effect=[b"jpeg", (b"jpeg", {"status": "ok", "reason": "test"})]
+        )
+        transport = httpx.ASGITransport(app=main_module.app, client=("127.0.0.1", 5000))
+        with (
+            patch.object(main_module.tile_cache, "get_tile", new=AsyncMock(return_value=None)),
+            patch.object(main_module.tile_cache, "get_thumbnail", new=AsyncMock(return_value=None)),
+            patch.object(main_module, "_distributed_singleflight", new=distributed),
+        ):
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                tile_response = await client.get(
+                    "/tiles/zxy/0/0/0", params=_query(), headers=headers
+                )
+                thumbnail_response = await client.get(
+                    "/thumbnails", params=_thumbnail_query(), headers=headers
+                )
+
+        assert tile_response.status_code == 200
+        assert thumbnail_response.status_code == 200
+        assert [call.args[2:4] for call in distributed.await_args_list] == [
+            (subject, f"{STUDY_ID}\0{SLIDE_KEY}"),
+            (subject, f"{STUDY_ID}\0{SLIDE_KEY}"),
+        ]
+
+    def test_rate_limit_scope_is_study_and_key(self):
+        assert main_module._slide_rate_limit_scope("study_a", SLIDE_KEY) == f"study_a\0{SLIDE_KEY}"

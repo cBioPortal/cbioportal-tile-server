@@ -1,4 +1,4 @@
-"""Shape of the sealed slide source carried in a capability's `enc` claim.
+"""Shape of the sealed slide source (`enc`) a tile request names with its key.
 
 The data provider seals `{image_id, tile_source, thumbnail_source}` with
 WSI_SOURCE_SEAL_KEY (AAD = slide_key); only this server can open it. These
@@ -12,11 +12,11 @@ import base64
 import re
 
 SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{12}$")
-# The key a capability names: the serving key of a cBioPortal resource row. A
+# The key a request names: the serving key of a cBioPortal resource row. A
 # whole-slide image's key is its slide key (SLIDE_KEY_PATTERN); other resources
 # may use any key of this shape. It is the AAD of the row's sealed source.
 CAPABILITY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-# The cBioPortal resource a capability's row belongs to (optional claim).
+# The cBioPortal resource a row belongs to.
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,128}$")
 # SEALED_SOURCE is base64url without padding of nonce(12) || AES-256-GCM
 # ciphertext (at least one byte) || tag(16).

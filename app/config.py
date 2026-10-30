@@ -43,19 +43,13 @@ class Settings:
     serving_contract_version: str = field(
         default_factory=lambda: _env_str("WSI_SERVING_CONTRACT_VERSION", "wsi-serving-v6")
     )
-    # WSI request authentication
-    wsi_auth_secret: str = field(default_factory=lambda: _env_str("WSI_AUTH_SECRET"))
-    wsi_auth_previous_secret: str = field(
-        default_factory=lambda: _env_str("WSI_AUTH_PREVIOUS_SECRET")
-    )
-    # Standard base64 of the 32-byte AES-256-GCM key that opens the `enc`
-    # claim. Shared only with the data provider that seals slide sources; the
-    # cBioPortal backend never holds it. Required: startup fails without it.
+    # Standard base64 of the 32-byte AES-256-GCM key that opens a request's
+    # sealed source (`enc`). Shared only with the data provider that seals
+    # slide sources; the cBioPortal backend never holds it. Required: startup
+    # fails without it.
     wsi_source_seal_key: str = field(
         default_factory=lambda: _env_str("WSI_SOURCE_SEAL_KEY"), repr=False
     )
-    wsi_auth_audience: str = field(default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi"))
-    wsi_auth_max_ttl: int = field(default_factory=lambda: _env_int("WSI_AUTH_MAX_TTL", 300))
     wsi_allowed_source_schemes: list[str] = field(
         default_factory=lambda: _env_csv("WSI_ALLOWED_SOURCE_SCHEMES", "s3")
     )

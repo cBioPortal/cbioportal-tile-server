@@ -18,12 +18,10 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
 
-      # ── WSI capability authentication ────────────────────────────────────
-      WSI_AUTH_SECRET: ${WSI_AUTH_SECRET:?WSI_AUTH_SECRET must be set}
-      # Opens the capability's sealed source; standard base64 of 32 bytes.
+      # ── Sealed slide sources ─────────────────────────────────────────────
+      # Opens each request's sealed source (`enc`); standard base64 of 32
+      # bytes. Access control is the ingress's job, not this service's.
       WSI_SOURCE_SEAL_KEY: ${WSI_SOURCE_SEAL_KEY:?WSI_SOURCE_SEAL_KEY must be set}
-      WSI_AUTH_AUDIENCE: ${WSI_AUTH_AUDIENCE:-cbioportal-wsi}
-      WSI_AUTH_MAX_TTL: ${WSI_AUTH_MAX_TTL:-300}
       WSI_ALLOWED_SOURCE_SCHEMES: ${WSI_ALLOWED_SOURCE_SCHEMES:-s3}
       # Keep the online service on the same de-identification boundary as the
       # study-file exporter. Every deployment must provide both allowlists.

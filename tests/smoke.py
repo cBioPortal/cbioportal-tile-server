@@ -1,13 +1,20 @@
-"""Read-only smoke test for the capability-bound WSI pixel service.
+"""Read-only smoke test for the WSI pixel service.
 
-The v4 Bearer capability carries the sealed tile and thumbnail sources, so
-no source URL is passed to the service.
+A slide is named by its resource row's study, key, and sealed source (`enc`),
+taken from cBioPortal's resource data; no source URL is passed to the
+service. Behind the ingress, pass the browser's session cookie so the ingress
+authorizes the study. The sealed source and cookie are read from the
+environment so they never appear in shell history.
 
 Example:
-    python tests/smoke.py --host http://localhost:8081 --bearer-token "$WSI_TOKEN"
+    export WSI_SMOKE_ENC=...            # the row's sealed source
+    export WSI_SMOKE_COOKIE='SESSION=...'  # optional, only behind the ingress
+    python tests/smoke.py --host http://localhost:8081 \
+        --study-id study_a --key 0123456789ab --tw 1024 --th 768
 """
 
 import argparse
+import os
 import sys
 
 import requests
@@ -21,11 +28,20 @@ def check(label: str, response: requests.Response, expected_status: int = 200) -
     return ok
 
 
-def run_smoke(host: str, bearer_token: str) -> bool:
+def run_smoke(
+    host: str,
+    study_id: str,
+    key: str,
+    enc: str,
+    thumbnail_width: int,
+    thumbnail_height: int,
+    cookie: str = "",
+) -> bool:
     host = host.rstrip("/")
-    headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
     session = requests.Session()
-    session.headers.update(headers)
+    if cookie:
+        session.headers["Cookie"] = cookie
+    slide = {"studyId": study_id, "key": key, "enc": enc}
     passed = failed = 0
 
     print(f"\nSmoke test: {host}")
@@ -38,20 +54,33 @@ def run_smoke(host: str, bearer_token: str) -> bool:
     ok = check("/ready", response)
     passed += int(ok); failed += int(not ok)
 
-    response = session.get(f"{host}/tiles/zxy/0/0/0", timeout=30)
+    response = session.get(f"{host}/tiles/zxy/0/0/0", params=slide, timeout=30)
     ok = check("/tiles/zxy/0/0/0", response) and response.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
-    response = session.get(f"{host}/thumbnails?width=256&height=256", timeout=30)
+    response = session.get(
+        f"{host}/thumbnails",
+        params={**slide, "tw": thumbnail_width, "th": thumbnail_height, "width": 256, "height": 256},
+        timeout=30,
+    )
     ok = check("/thumbnails", response) and response.headers.get("content-type", "").startswith("image/")
     passed += int(ok); failed += int(not ok)
 
-    response = session.get(f"{host}/tiles/zxy/0/0/0?source=s3%3A%2F%2Fbucket%2Fslide.svs", timeout=30)
+    response = session.get(
+        f"{host}/tiles/zxy/0/0/0",
+        params={**slide, "source": "s3://bucket/slide.svs"},
+        timeout=30,
+    )
     ok = check("client-supplied source rejected", response, 400)
     passed += int(ok); failed += int(not ok)
 
-    unauthenticated = requests.get(f"{host}/tiles/zxy/0/0/0", timeout=30)
-    ok = check("unauthenticated tile", unauthenticated, 401)
+    response = session.get(f"{host}/tiles/zxy/0/0/0", timeout=30)
+    ok = check("tile without slide parameters", response, 400)
+    passed += int(ok); failed += int(not ok)
+
+    rebound = "f" * 12 if key != "f" * 12 else "e" * 12
+    response = session.get(f"{host}/tiles/zxy/0/0/0", params={**slide, "key": rebound}, timeout=30)
+    ok = check("sealed source under another key", response, 403)
     passed += int(ok); failed += int(not ok)
 
     print(f"\n  Passed: {passed}   Failed: {failed}")
@@ -61,9 +90,24 @@ def run_smoke(host: str, bearer_token: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="http://localhost:8081")
-    parser.add_argument("--bearer-token", default="")
+    parser.add_argument("--study-id", required=True)
+    parser.add_argument("--key", required=True)
+    parser.add_argument("--tw", type=int, required=True, help="intrinsic thumbnail width")
+    parser.add_argument("--th", type=int, required=True, help="intrinsic thumbnail height")
     args = parser.parse_args()
-    sys.exit(0 if run_smoke(args.host, args.bearer_token) else 1)
+    enc = os.environ.get("WSI_SMOKE_ENC", "")
+    if not enc:
+        parser.error("set WSI_SMOKE_ENC to the slide's sealed source")
+    ok = run_smoke(
+        args.host,
+        args.study_id,
+        args.key,
+        enc,
+        args.tw,
+        args.th,
+        os.environ.get("WSI_SMOKE_COOKIE", ""),
+    )
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
