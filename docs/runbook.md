@@ -25,8 +25,7 @@ it verbatim and cannot decrypt it. The tile server opens it, applies
 reads only those URLs. An `enc` that does not open under the request's `key`
 returns `404` (`slide not found`); a sealed source outside the URI policy
 returns `404` (`source slide not found`) and is logged without its URL.
-Contract: `wsi-serving-v6`
-(`../docs/wsi-deid-slide-key-contract.md`).
+The serving contract version is `wsi-serving-v6`.
 
 ## Production topology
 
@@ -37,8 +36,8 @@ string), forwarding the browser's `Cookie` header. Forward only on `2xx`.
 The tile server requires `studyId` (`400` without it) so the ingress always
 has a study to check, and refuses a repeated `studyId`, `key`, `enc`,
 `width` or `height`, matching names case-insensitively as nginx `$arg_`
-does, so the ingress and service cannot read different values. Never expose
-the service without that ingress. Keep `/health` and `/ready` public for
+does, so the ingress and service cannot read different values. Other
+parameters are ignored. Never expose the service without that ingress. Keep `/health` and `/ready` public for
 orchestration. Ingress and deployment configuration are authoritative for
 timeouts, network policy, worker count, and block-cache volumes.
 
@@ -47,18 +46,38 @@ The ingress check relies on the browser sending the portal session cookie
 with each pixel request, and the service sets no credentialed CORS, so a
 cross-origin deployment would fail closed rather than work.
 
-The ingress should set `X-Forwarded-For` to the client address it sees: the
-cache-miss rate limit is keyed on the last `X-Forwarded-For` entry (else the
-peer address) and the slide `key`. It must not log query strings for `/wsi`,
-because `enc` is a bearer value for its slide.
+Working ingress-nginx and plain nginx configurations are in the README's
+[Ingress](../README.md#ingress) section. In short:
+
+- The auth subrequest takes the study from `$request_uri` through a `map`:
+  inside an auth subrequest `$arg_studyId` is empty.
+- An auth cache, if any, must be keyed on the session cookie (and any other
+  credential the portal accepts) and the study. A key without the session
+  cookie lets one user's approval authorize another user's request.
+- The ingress must set `X-Forwarded-For` to the client address
+  (ingress-nginx: `compute-full-forwarded-for: "false"`; `use-forwarded-headers`
+  `"true"` only behind a trusted L7 load balancer listed in
+  `proxy-real-ip-cidr`). The cache-miss rate limit is keyed on the last
+  `X-Forwarded-For` entry (else the peer address) and the slide `key`; if a
+  hop appends its own peer address instead, every request carries the same
+  last entry and all clients share one bucket.
+- The ingress must not log query strings for `/wsi`, because `enc` is a
+  bearer value for its slide.
 
 | Status | Returned by | Meaning |
 |--------|-------------|---------|
-| `401`, `403` | Ingress only | No session, or the user cannot read `studyId` |
+| `401`, `403` | Ingress only | No session, or the user cannot read `studyId`; the service never returns them |
 | `400` | Service | Missing, malformed, or repeated parameter; client-supplied source |
-| `404` | Service | `enc` does not open under `key`; sealed source outside the URI policy; object missing |
+| `404` | Service | `enc` does not open under `key`; sealed source outside the URI policy; source or thumbnail object missing; tile outside the slide |
+| `422` | Service | Overview tile needs preprocessing (`overview_requires_preprocessing`) |
 | `429` | Service | Cache-miss rate limit (`Retry-After`) |
-| `503` | Service | Busy, source temporarily unavailable, or seal key not configured |
+| `500` | Service | Unexpected slide read failure |
+| `502` | Service | Stored thumbnail unreadable, over `THUMBNAIL_MAX_DECODE_PIXELS`, or unavailable |
+| `503` | Service | Busy, source temporarily unavailable, or seal key not configured (`Retry-After`) |
+
+Under ingress-nginx, a study the portal answers `404` for reaches the client
+as a `500` from the ingress, since `auth_request` accepts only `2xx`, `401`,
+and `403`.
 
 ## Required environment
 
@@ -73,8 +92,6 @@ WSI_ALLOWED_THUMBNAIL_PREFIXES=<approved thumbnail URI prefixes>
 REDIS_URL=<password-protected Redis URL>
 ```
 
-`WSI_AUTH_SECRET`, `WSI_AUTH_PREVIOUS_SECRET`, `WSI_AUTH_AUDIENCE`, and
-`WSI_AUTH_MAX_TTL` are no longer read and can be removed.
 The URI prefix allowlists are a de-identification boundary; leave them empty
 only for an isolated non-publishing unit test.
 
@@ -102,7 +119,11 @@ curl -fsS -G -H "Cookie: SESSION=${SESSION}" \
 Also verify that the same request without the cookie, or with a study the
 user cannot read, is refused by the ingress; that adding `source=...` or an
 `X-WSI-Source` header returns `400`; and that swapping in another slide's
-`key` (keeping `enc`) returns `404`. `tests/smoke.py` runs these checks.
+`key` (keeping `enc`) returns `404`. `tests/smoke.py` runs these checks
+except the unreadable-study one: with `WSI_SMOKE_COOKIE` set it targets the
+ingress and requires the parameterless tile request to be refused and the
+cookieless slide request to return `401` or `403`; without it, it targets the
+service directly and requires `400` for the parameterless request.
 
 `WSI_SOURCE_SEAL_KEY` is required: the process refuses to start, `/ready`
 returns `503`, and every pixel request returns `503` unless it decodes to
@@ -112,19 +133,18 @@ every published `sealed_source` and re-importing the study files.
 
 ## Data preparation
 
-The offline pipeline loads each WSI slide row with:
+Each servable slide's row in the study's resource data carries a
+`metadata.serving` object:
 
 ```text
-slide_key, sealed_source, tile_metadata_json,
+key, sealed_source, tile_metadata_json,
 thumbnail_width, thumbnail_height, thumbnail_content_type
 ```
 
 `sealed_source` seals the `image_id`, source URL, and thumbnail URL with
-`WSI_SOURCE_SEAL_KEY`; the study files never carry them in clear.
-
-The cBioPortal core importer publishes `can_serve_tiles=true` only when all
-fields are complete; otherwise the hierarchy reports the slide as unavailable.
-No registry or manifest is mounted into the online tile-server pod.
+`WSI_SOURCE_SEAL_KEY`; the study files never carry them in clear. A slide row
+without a `serving` object is not viewable. No registry or manifest is
+mounted into the online tile-server pod.
 
 Thumbnail generation, study-file export, and any batch scheduling are owned by
 the deployment's offline preparation pipeline, not this repository. A slide

@@ -2,14 +2,22 @@
 
 A slide is named by its resource row's study, key, and sealed source (`enc`),
 taken from cBioPortal's resource data; no source URL is passed to the
-service. Behind the ingress, pass the browser's session cookie so the ingress
-authorizes the study. The sealed source and cookie are read from the
-environment so they never appear in shell history.
+service. The sealed source and cookie are read from the environment so they
+never appear in shell history.
+
+`WSI_SMOKE_COOKIE` selects the target:
+
+- Set (the browser's portal session cookie): the host is the ingress, for
+  example `https://cbioportal.example.org/wsi`. A tile request without slide
+  parameters must be refused (any non-200), and the slide request without
+  the cookie must be refused with 401 or 403.
+- Unset: the host is the service itself. A tile request without slide
+  parameters must return 400.
 
 Example:
-    export WSI_SMOKE_ENC=...            # the row's sealed source
-    export WSI_SMOKE_COOKIE='SESSION=...'  # optional, only behind the ingress
-    python tests/smoke.py --host http://localhost:8081 \
+    export WSI_SMOKE_ENC=...               # the row's sealed source
+    export WSI_SMOKE_COOKIE='SESSION=...'  # only when targeting the ingress
+    python tests/smoke.py --host https://cbioportal.example.org/wsi \
         --study-id study_a --key 0123456789ab
 """
 
@@ -20,8 +28,16 @@ import sys
 import requests
 
 
-def check(label: str, response: requests.Response, expected_status: int = 200) -> bool:
-    ok = response.status_code == expected_status
+# Any status but 200: the ingress may refuse a request without a study with
+# 400, 401, 403 or 5xx depending on its configuration.
+REFUSED = frozenset(range(100, 600)) - {200}
+
+def check(label: str, response: requests.Response, expected_status=200) -> bool:
+    """Pass when the status equals `expected_status`, or is in it if a set."""
+    if isinstance(expected_status, (set, frozenset)):
+        ok = response.status_code in expected_status
+    else:
+        ok = response.status_code == expected_status
     print(f"  {'✓' if ok else '✗'} {label:42s} HTTP {response.status_code}")
     if not ok:
         print(f"    → {response.text[:200]}")
@@ -73,8 +89,16 @@ def run_smoke(
     passed += int(ok); failed += int(not ok)
 
     response = session.get(f"{host}/tiles/zxy/0/0/0", timeout=30)
-    ok = check("tile without slide parameters", response, 400)
+    if cookie:
+        ok = check("tile without slide parameters (refused)", response, REFUSED)
+    else:
+        ok = check("tile without slide parameters", response, 400)
     passed += int(ok); failed += int(not ok)
+
+    if cookie:
+        response = requests.get(f"{host}/tiles/zxy/0/0/0", params=slide, timeout=30)
+        ok = check("tile without the session cookie", response, {401, 403})
+        passed += int(ok); failed += int(not ok)
 
     rebound = "f" * 12 if key != "f" * 12 else "e" * 12
     response = session.get(f"{host}/tiles/zxy/0/0/0", params={**slide, "key": rebound}, timeout=30)

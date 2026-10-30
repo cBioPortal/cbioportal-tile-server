@@ -129,8 +129,9 @@ repeat:
 | `width`, `height` | Thumbnails only; optional requested size, a positive integer clamped to 2048 (default 256) |
 
 A missing, malformed, or repeated parameter returns `400`. Any other parameter
-is ignored. A thumbnail is passed through when the stored thumbnail already
-fits in `width`×`height` and downsized otherwise (never upscaled); the
+is ignored, including `tw` and `th`. A stored JPEG thumbnail that already
+fits in `width`×`height` is passed through unchanged; one in another format
+is re-encoded to JPEG, and a larger one is downsized (never upscaled). The
 stored thumbnail's own size decides, never the request. `enc` is base64url (no
 padding) of nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes),
 keyed with the raw 32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `key`, over JSON
@@ -152,15 +153,217 @@ and is logged without its URL. Requests that supply a source themselves
 | `422` | Service | Overview tile needs preprocessing (`overview_requires_preprocessing`) |
 | `429` | Service | Cache-miss rate limit (`Retry-After`) |
 | `500` | Service | Unexpected slide read failure |
-| `502` | Service | Stored thumbnail unreadable or unavailable |
+| `502` | Service | Stored thumbnail unreadable, over `THUMBNAIL_MAX_DECODE_PIXELS`, or unavailable |
 | `503` | Service | Busy, source temporarily unavailable, or seal key not configured (`Retry-After`) |
 
-See `../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v6`).
+The serving contract version is `wsi-serving-v6` (reported by `/ready` as
+`serving_contract_version` when a release is configured).
 
 This service performs no user authentication: deploy it only behind an ingress
 that authorizes `studyId` against cBioPortal with the session cookie, on the
-portal's own origin, and do not expose it directly. `/health` and `/ready`
-intentionally remain public for orchestration probes.
+portal's own origin, and do not expose it directly (see
+[Ingress](#ingress)). `/health` and `/ready` intentionally remain public for
+orchestration probes.
+
+## Ingress
+
+The ingress in front of `/wsi` does four things:
+
+1. **Authorizes every pixel request** with an auth subrequest to the portal's
+   `GET /api/studies/{studyId}`, forwarding the browser's `Cookie` (and
+   `Authorization`, if the portal accepts tokens) header, and forwards the
+   request only on `2xx`.
+2. **Caches that decision, if at all, per credential and study.** The cache
+   key must include the session cookie (and every other credential the portal
+   accepts) and the study. An auth cache keyed without the session cookie
+   lets one user's approval authorize another user's request for the same
+   study for as long as the entry lives.
+3. **Sets `X-Forwarded-For` to the client address** it sees, replacing any
+   client-supplied value. The cache-miss rate limit uses the last
+   `X-Forwarded-For` entry as the client. If any hop appends instead of
+   setting (an ingress that appends its peer behind a load balancer, or a
+   proxy between the ingress and the service), the last entry is that hop's
+   own address for every request, and all clients share one rate-limit
+   bucket.
+4. **Logs `/wsi` requests without query strings.** `enc` is a bearer value
+   for its slide.
+
+`/health` and `/ready` are routed without auth. `/metrics` is not routed.
+
+The study id has to come from the original request line. Inside an nginx
+auth subrequest `$arg_studyId` is empty, because the subrequest has its own
+(empty) query string, while `$request_uri` is still the original request's.
+Both examples therefore extract the study with a `map` on `$request_uri`. The
+map refuses an id that is only dots, and maps a missing or malformed study to
+`!`, which is not a study id, so the portal refuses it rather than receiving
+`/api/studies/`:
+
+```nginx
+map $request_uri $wsi_study {
+    "~[?&]studyId=(?<study>(?!\.+(&|$))[A-Za-z0-9_.-]{1,128})(&|$)" $study;
+    default "!";
+}
+```
+
+### ingress-nginx
+
+Put the `map` in the controller ConfigMap as `http-snippet`, together with
+the forwarding settings:
+
+```yaml
+# ingress-nginx controller ConfigMap
+data:
+  http-snippet: |
+    map $request_uri $wsi_study {
+        "~[?&]studyId=(?<study>(?!\.+(&|$))[A-Za-z0-9_.-]{1,128})(&|$)" $study;
+        default "!";
+    }
+  # X-Forwarded-For is set to $remote_addr, never appended to.
+  compute-full-forwarded-for: "false"
+  # "true" only when a trusted L7 load balancer sits in front of the
+  # controller; then list its addresses in proxy-real-ip-cidr so
+  # $remote_addr is the client it reports. Otherwise leave it "false".
+  use-forwarded-headers: "false"
+```
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wsi-pixels
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "http://cbioportal.<namespace>.svc.cluster.local:8080/api/studies/$wsi_study"
+    nginx.ingress.kubernetes.io/auth-method: GET
+    # Session cookie, bearer token, and study: one entry per credential and study.
+    nginx.ingress.kubernetes.io/auth-cache-key: "$cookie_SESSION$http_authorization$wsi_study"
+    nginx.ingress.kubernetes.io/auth-cache-duration: "200 30s"
+    # Request lines carry enc; do not write them to the access log.
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cbioportal.example.org
+      http:
+        paths:
+          - path: /wsi/tiles/
+            pathType: Prefix
+            backend: {service: {name: cbioportal-tile-server, port: {number: 8080}}}
+          - path: /wsi/thumbnails
+            pathType: Exact
+            backend: {service: {name: cbioportal-tile-server, port: {number: 8080}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wsi-probes
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cbioportal.example.org
+      http:
+        paths:
+          - path: /wsi/health
+            pathType: Exact
+            backend: {service: {name: cbioportal-tile-server, port: {number: 8080}}}
+          - path: /wsi/ready
+            pathType: Exact
+            backend: {service: {name: cbioportal-tile-server, port: {number: 8080}}}
+```
+
+Notes:
+
+- ingress-nginx's auth location sets `proxy_pass_request_headers on`, so the
+  original request headers, including `Cookie` and `Authorization`, reach
+  `auth-url` without further configuration. It also sends
+  `X-Original-URL` with the full original URL, query string included; the
+  portal must not log that header.
+- Use the portal's session cookie name in `auth-cache-key` (`SESSION` with
+  Spring Session). Keep `auth-cache-duration` short: a revoked session or
+  permission stays authorized until its entry expires. Omit both annotations
+  to authorize every request without caching.
+- `auth_request` understands only `2xx`, `401`, and `403`. A study the portal
+  answers `404` for (unknown, or `!`) becomes a `500` from the ingress, which
+  is still a refusal.
+- `enable-access-log: "false"` drops access logs for these paths. To keep a
+  path-only log instead, define a log format in `http-snippet` (see the
+  `wsi_no_query` format below) and add a `configuration-snippet` with
+  `access_log /var/log/nginx/access.log wsi_no_query;`; that needs snippet
+  annotations enabled on the controller. nginx error-log lines include the
+  request line, so keep error logs at the default level and treat them as
+  sensitive.
+- The service serves the same routes under `/wsi`, so no rewrite is needed.
+
+### Plain nginx
+
+```nginx
+map $request_uri $wsi_study {
+    "~[?&]studyId=(?<study>(?!\.+(&|$))[A-Za-z0-9_.-]{1,128})(&|$)" $study;
+    default "!";
+}
+
+# Log the path only: the query string carries enc.
+map $request_uri $wsi_log_path {
+    "~^(?<path>[^?]*)" $path;
+}
+log_format wsi_no_query '$remote_addr - $remote_user [$time_local] "$request_method $wsi_log_path" '
+                        '$status $body_bytes_sent "$http_user_agent"';
+
+upstream portal { server portal:8080; }
+upstream tile_server { server tile-server:8080; }
+
+server {
+    listen 80;
+
+    # Probes stay open.
+    location ~ ^/wsi/(health|ready)$ {
+        proxy_pass http://tile_server;
+    }
+
+    # Tiles and thumbnails: forwarded only when the portal says the session
+    # may read the study the request names.
+    location ~ ^/wsi/(tiles|thumbnails)(/.*)?$ {
+        if ($wsi_study = "!") {
+            return 400;
+        }
+        access_log /var/log/nginx/access.log wsi_no_query;
+        auth_request /_wsi_study_access;
+        proxy_pass http://tile_server;
+        proxy_set_header Host $http_host;
+        # The rate-limit subject; replaces anything the client sent.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        # The tile server needs no portal session.
+        proxy_set_header Cookie "";
+        proxy_read_timeout 120s;
+    }
+
+    location = /_wsi_study_access {
+        internal;
+        proxy_pass http://portal/api/studies/$wsi_study;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length "";
+        # Explicit, although subrequests forward the original headers.
+        proxy_set_header Cookie $http_cookie;
+        proxy_set_header Host $http_host;
+        proxy_set_header Accept application/json;
+        # auth_request only understands 2xx/401/403; an unknown study is a 403.
+        proxy_intercept_errors on;
+        error_page 404 = @wsi_study_unknown;
+    }
+
+    location @wsi_study_unknown {
+        return 403;
+    }
+
+    location / {
+        proxy_pass http://portal;
+        proxy_set_header Host $http_host;
+    }
+}
+```
+
+This example caches nothing. To cache, add `proxy_cache` to the auth
+location with `proxy_cache_key "$cookie_SESSION$http_authorization$wsi_study";`
+and a short `proxy_cache_valid 200 30s;`, for the reason above.
 
 ## Runtime configuration
 
@@ -189,11 +392,11 @@ Redis cache:
 | `TILE_SIZE` | `256` | Tile edge length |
 | `JPEG_QUALITY` | `85` | JPEG encoding quality |
 | `MAX_DECODE_PIXELS` | `16777216` | Maximum on-demand tile decode |
-| `THUMBNAIL_MAX_DECODE_PIXELS` | `16777216` | Maximum thumbnail decode |
+| `THUMBNAIL_MAX_DECODE_PIXELS` | `16777216` | Maximum source-level decode when rendering a thumbnail offline, and maximum stored-thumbnail size the service decodes (a larger one returns `502`) |
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |
-| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per client address (the last `X-Forwarded-For` entry, which the ingress sets, else the peer) and slide `key`; `0` disables it |
+| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per client address and slide `key`; `0` disables it. The client address is the last `X-Forwarded-For` entry (else the peer), so the ingress must set that header to the client address (see [Ingress](#ingress)) |
 | `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Renewable cross-worker extraction lock lease |
 | `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `60` | Maximum follower wait for another worker's extraction |
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
@@ -202,12 +405,12 @@ Redis cache:
 
 Thumbnail artifacts are generated offline (see
 [Offline preparation](#offline-preparation)); their dimensions, content
-type, tile metadata, and sealed source (which carries the URL) are loaded into
-the cBioPortal WSI slide table. A slide is
-published with `can_serve_tiles=false` until all of those fields are present.
-The online service does not generate thumbnails, consult a manifest, or write
-the registry. Production deployments must run an offline thumbnail batch; the
-on-demand worker is not a substitute.
+type, tile metadata, and sealed source (which carries the URLs) travel in each
+slide row's `metadata.serving` object in the study's resource data. A slide
+row without a `serving` object is not viewable. The online service does not
+generate thumbnails or consult a manifest. Production deployments must run an
+offline thumbnail batch; the service never renders a thumbnail from the source
+image.
 
 Tile responses are `private, max-age=3600` and thumbnails
 `private, max-age=300`; both vary on `Cookie`, the credential the ingress
@@ -257,8 +460,9 @@ production default accepts only `s3` URLs.
 
 Do not log source URLs, patient IDs, slide IDs, or `enc` values. Request
 logs may retain operation type, dimensions, status, timing, and exception
-class. The ingress must not log query strings for `/wsi`: `enc` is a bearer
-value for its slide, and `key` travels there too. Keep the backend resource data behind normal cBioPortal
+class. The ingress must not log query strings for `/wsi` (see
+[Ingress](#ingress)): `enc` is a bearer value for its slide, and `key`
+travels there too. Keep the backend resource data behind normal cBioPortal
 authentication and study authorization.
 
 ## Tests
