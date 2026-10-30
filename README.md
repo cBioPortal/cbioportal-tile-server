@@ -50,7 +50,8 @@ cBioPortal (see [Request flow](#request-flow)).
 3. The ingress authorizes each request before it reaches this service with an
    auth subrequest to cBioPortal's `GET /api/studies/{studyId}`, carrying the
    browser's session cookie. Only requests for a study the user may read are
-   forwarded.
+   forwarded; a `401` or `403` always comes from the ingress, never from this
+   service.
 4. The service opens `enc` with `WSI_SOURCE_SEAL_KEY` (bound to `key`),
    checks the URLs against the artifact policy, and reads pixels from them in
    object storage.
@@ -58,6 +59,11 @@ cBioPortal (see [Request flow](#request-flow)).
 The tile server never resolves an image ID, queries cBioPortal metadata,
 loads portal data files, or authenticates users. Client-supplied source URLs
 (`?source=` or `X-WSI-Source`) are rejected.
+
+The service must be served same-origin with cBioPortal (for example under
+`/wsi` on the portal host): the ingress check relies on the browser sending
+the portal session cookie with each pixel request, and the service sets no
+credentialed CORS (`CORS_ORIGINS` never allows credentials).
 
 ## Offline preparation
 
@@ -82,8 +88,7 @@ tile server relies on this contract:
    frontend passes `sealed_source` verbatim as the `enc` query parameter.
 
 The tile server never reads the pipeline's tables, registries, manifests, or
-credentials; it sees only what each request's `key`, `enc`, and thumbnail
-dimensions carry.
+credentials; it sees only what each request's `key` and `enc` carry.
 A slide becomes servable after thumbnails are published, study files are
 exported, and cBioPortal core has imported them.
 
@@ -109,36 +114,53 @@ requests `/thumbnails` and tiles; it has no object-store upload credentials.
 | GET | `/ready` | Public readiness probe (seal key and artifact-policy configuration) |
 | GET | `/metrics` | Internal Prometheus/OpenMetrics scrape endpoint |
 | GET | `/tiles/zxy/{z}/{x}/{y}?studyId=&key=&enc=` | JPEG tile of the sealed source |
-| GET | `/thumbnails?studyId=&key=&enc=&tw=&th=&width=&height=` | Thumbnail resize of the sealed thumbnail |
+| GET | `/thumbnails?studyId=&key=&enc=&width=&height=` | Thumbnail resize of the sealed thumbnail |
 
 The same routes are available under `/wsi`. Every pixel request names its
-slide with query parameters, each given exactly once:
+slide with query parameters, each given at most once. Names are matched
+case-insensitively, as nginx `$arg_` lookups are, so `StudyID=a&studyId=b` is a
+repeat:
 
 | Parameter | Rule |
 |-----------|------|
-| `studyId` | Required; a cBioPortal study id (`^[A-Za-z0-9_.-]{1,128}$`). Not used by this service, but requiring it guarantees the ingress always has a study to authorize |
+| `studyId` | Required; a cBioPortal study id (`^(?!\.+$)[A-Za-z0-9_.-]{1,128}$`, so never only dots). Not used by this service, but requiring it guarantees the ingress always has a study to authorize |
 | `key` | Required; the resource row's serving key: 1-128 characters of `A-Z`, `a-z`, `0-9`, `_` and `-` (a whole-slide image's key is its 12-hex slide key) |
 | `enc` | Required; the row's sealed source, verbatim |
-| `tw`, `th` | Thumbnails only; the stored thumbnail's intrinsic width and height (from the row), positive integers up to 8192 |
-| `width`, `height` | Thumbnails only; requested size, clamped to 1-2048 (default 256) |
+| `width`, `height` | Thumbnails only; optional requested size, a positive integer clamped to 2048 (default 256) |
 
-A missing or malformed parameter returns `400`. `enc` is base64url (no
+A missing, malformed, or repeated parameter returns `400`. Any other parameter
+is ignored. A thumbnail is passed through when the stored thumbnail already
+fits in `width`×`height` and downsized otherwise (never upscaled); the
+stored thumbnail's own size decides, never the request. `enc` is base64url (no
 padding) of nonce (12 bytes) || AES-256-GCM ciphertext || tag (16 bytes),
 keyed with the raw 32-byte `WSI_SOURCE_SEAL_KEY`, AAD = `key`, over JSON
 `{"image_id":…,"tile_source":…,"thumbnail_source":…}`. The data provider seals
 it when it publishes the slide; cBioPortal stores and serves it verbatim and
 cannot open it, so neither cBioPortal nor the browser sees the `image_id` or
 source URLs. An `enc` that does not open under `key` (for example another
-slide's) returns `403`. The tile server then applies the source/thumbnail URI
-policy (scheme, approved prefix, extension, no traversal) before any read;
-a source outside it is refused. Requests that supply a source themselves
-(`?source=` or `X-WSI-Source`) are rejected with `400`. See
-`../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v6`).
+slide's) returns `404` (`slide not found`). The tile server then applies the
+source/thumbnail URI policy (scheme, approved prefix, extension, no traversal)
+before any read; a source outside it returns `404` (`source slide not found`)
+and is logged without its URL. Requests that supply a source themselves
+(`?source=` or `X-WSI-Source`) are rejected with `400`.
+
+| Status | Returned by | Meaning |
+|--------|-------------|---------|
+| `401`, `403` | Ingress only | No session, or the user cannot read `studyId` |
+| `400` | Service | Missing, malformed, or repeated parameter; client-supplied source |
+| `404` | Service | `enc` does not open under `key`; sealed source outside the URI policy; source or thumbnail object missing; tile outside the slide |
+| `422` | Service | Overview tile needs preprocessing (`overview_requires_preprocessing`) |
+| `429` | Service | Cache-miss rate limit (`Retry-After`) |
+| `500` | Service | Unexpected slide read failure |
+| `502` | Service | Stored thumbnail unreadable or unavailable |
+| `503` | Service | Busy, source temporarily unavailable, or seal key not configured (`Retry-After`) |
+
+See `../docs/wsi-deid-slide-key-contract.md` (`wsi-serving-v6`).
 
 This service performs no user authentication: deploy it only behind an ingress
-that authorizes `studyId` against cBioPortal with the session cookie, and do
-not expose it directly. `/health` and `/ready` intentionally remain public
-for orchestration probes.
+that authorizes `studyId` against cBioPortal with the session cookie, on the
+portal's own origin, and do not expose it directly. `/health` and `/ready`
+intentionally remain public for orchestration probes.
 
 ## Runtime configuration
 
@@ -171,12 +193,12 @@ Redis cache:
 | `MAX_OPEN_SLIDES` | `64` | Open-slide LRU capacity |
 | `MAX_IMAGE_OPERATIONS` | `2` | Concurrent pixel operations per worker |
 | `N_WORKERS` | `4` | Gunicorn worker count |
-| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per client address (first `X-Forwarded-For` hop, else the peer) and study+key; `0` disables it |
+| `CACHE_MISS_RATE_LIMIT_PER_MINUTE` | `120` | Shared Redis limit for cache-miss leaders per client address (the last `X-Forwarded-For` entry, which the ingress sets, else the peer) and slide `key`; `0` disables it |
 | `CACHE_MISS_LOCK_TTL_SECONDS` | `120` | Renewable cross-worker extraction lock lease |
 | `CACHE_MISS_WAIT_TIMEOUT_SECONDS` | `60` | Maximum follower wait for another worker's extraction |
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache, namespaced by each source's ETag so a slide rewritten in place never reuses old blocks |
-| `CORS_ORIGINS` | internal cBioPortal origins | Allowed browser origins |
+| `CORS_ORIGINS` | internal cBioPortal origins | Origins allowed uncredentialed cross-origin reads; pixel requests are same-origin, so this is not an access path |
 
 Thumbnail artifacts are generated offline (see
 [Offline preparation](#offline-preparation)); their dimensions, content
@@ -234,9 +256,9 @@ production default accepts only `s3` URLs.
 ## PHI-safe operation
 
 Do not log source URLs, patient IDs, slide IDs, or `enc` values. Request
-logs (including the ingress's) may retain operation type, dimensions, status,
-timing, and exception class; they should drop query strings, since `enc` and
-`key` travel there. Keep the backend resource data behind normal cBioPortal
+logs may retain operation type, dimensions, status, timing, and exception
+class. The ingress must not log query strings for `/wsi`: `enc` is a bearer
+value for its slide, and `key` travels there too. Keep the backend resource data behind normal cBioPortal
 authentication and study authorization.
 
 ## Tests

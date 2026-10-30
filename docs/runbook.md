@@ -11,9 +11,9 @@ expose clinical metadata.
 - `../cbioportal` serves the study's resource data, whose WSI rows carry each
   slide's opaque `key` and `sealed_source`.
 - `../cbioportal-frontend` requests pixels with
-  `?studyId=<study>&key=<slide key>&enc=<sealed source>` (thumbnails add
-  `tw`/`th`, the row's thumbnail dimensions); it never sees or sends a source
-  URL, and sends no `Authorization` header.
+  `?studyId=<study>&key=<slide key>&enc=<sealed source>` (thumbnails add the
+  optional requested `width`/`height`); it never sees or sends a source URL,
+  and sends no `Authorization` header.
 - The deployment repository owns ingress, probes, secrets, and rollout
   resources, including the auth subrequest below.
 
@@ -23,7 +23,9 @@ encrypted by the data provider with AES-256-GCM under the raw 32-byte
 it verbatim and cannot decrypt it. The tile server opens it, applies
 `check_source_uri` (scheme, approved prefix, extension, no traversal), and
 reads only those URLs. An `enc` that does not open under the request's `key`
-returns `403`. Contract: `wsi-serving-v6`
+returns `404` (`slide not found`); a sealed source outside the URI policy
+returns `404` (`source slide not found`) and is logged without its URL.
+Contract: `wsi-serving-v6`
 (`../docs/wsi-deid-slide-key-contract.md`).
 
 ## Production topology
@@ -33,13 +35,30 @@ pixel request before forwarding it: an nginx `auth_request` subrequest to
 cBioPortal's `GET /api/studies/{studyId}` (`studyId` from the request's query
 string), forwarding the browser's `Cookie` header. Forward only on `2xx`.
 The tile server requires `studyId` (`400` without it) so the ingress always
-has a study to check, and refuses repeated `studyId`/`key`/`enc` parameters so
-the ingress and service cannot read different values. Never expose the
-service without that ingress. Keep `/health` and `/ready` public for
+has a study to check, and refuses a repeated `studyId`, `key`, `enc`,
+`width` or `height`, matching names case-insensitively as nginx `$arg_`
+does, so the ingress and service cannot read different values. Never expose
+the service without that ingress. Keep `/health` and `/ready` public for
 orchestration. Ingress and deployment configuration are authoritative for
-timeouts, network policy, worker count, and block-cache volumes. The ingress
-should overwrite `X-Forwarded-For` (the cache-miss rate limit is keyed on its
-first hop) and should not log query strings.
+timeouts, network policy, worker count, and block-cache volumes.
+
+Serve the service same-origin with cBioPortal (`/wsi` on the portal host).
+The ingress check relies on the browser sending the portal session cookie
+with each pixel request, and the service sets no credentialed CORS, so a
+cross-origin deployment would fail closed rather than work.
+
+The ingress should set `X-Forwarded-For` to the client address it sees: the
+cache-miss rate limit is keyed on the last `X-Forwarded-For` entry (else the
+peer address) and the slide `key`. It must not log query strings for `/wsi`,
+because `enc` is a bearer value for its slide.
+
+| Status | Returned by | Meaning |
+|--------|-------------|---------|
+| `401`, `403` | Ingress only | No session, or the user cannot read `studyId` |
+| `400` | Service | Missing, malformed, or repeated parameter; client-supplied source |
+| `404` | Service | `enc` does not open under `key`; sealed source outside the URI policy; object missing |
+| `429` | Service | Cache-miss rate limit (`Retry-After`) |
+| `503` | Service | Busy, source temporarily unavailable, or seal key not configured |
 
 ## Required environment
 
@@ -83,7 +102,7 @@ curl -fsS -G -H "Cookie: SESSION=${SESSION}" \
 Also verify that the same request without the cookie, or with a study the
 user cannot read, is refused by the ingress; that adding `source=...` or an
 `X-WSI-Source` header returns `400`; and that swapping in another slide's
-`key` (keeping `enc`) returns `403`. `tests/smoke.py` runs these checks.
+`key` (keeping `enc`) returns `404`. `tests/smoke.py` runs these checks.
 
 `WSI_SOURCE_SEAL_KEY` is required: the process refuses to start, `/ready`
 returns `503`, and every pixel request returns `503` unless it decodes to

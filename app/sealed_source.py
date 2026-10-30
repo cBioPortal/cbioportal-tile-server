@@ -15,7 +15,7 @@ SLIDE_KEY_PATTERN = re.compile(r"^[0-9a-f]{12}$")
 # The key a request names: the serving key of a cBioPortal resource row. A
 # whole-slide image's key is its slide key (SLIDE_KEY_PATTERN); other resources
 # may use any key of this shape. It is the AAD of the row's sealed source.
-CAPABILITY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+SERVING_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # The cBioPortal resource a row belongs to.
 RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,128}$")
 # SEALED_SOURCE is base64url without padding of nonce(12) || AES-256-GCM

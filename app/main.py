@@ -47,7 +47,7 @@ from .auth import (
 from .blockcache import get_blockcache_manager
 from .config import settings
 from .sealed_source import (
-    CAPABILITY_KEY_PATTERN,
+    SERVING_KEY_PATTERN,
     SEALED_SOURCE_MAX_CHARS,
     SEALED_SOURCE_PATTERN,
 )
@@ -549,7 +549,7 @@ def _open_slide_request(request: Request) -> tuple[str, dict]:
     if study_id is None or not STUDY_ID_PATTERN.fullmatch(study_id):
         raise HTTPException(status_code=400, detail="studyId is missing or malformed")
     key = _single_query_value(request, "key")
-    if key is None or not CAPABILITY_KEY_PATTERN.fullmatch(key):
+    if key is None or not SERVING_KEY_PATTERN.fullmatch(key):
         raise HTTPException(status_code=400, detail="key is missing or malformed")
     enc = _single_query_value(request, "enc")
     if (
