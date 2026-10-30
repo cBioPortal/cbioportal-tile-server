@@ -72,14 +72,13 @@ tile server relies on this contract:
 2. The pipeline seals each servable slide's `image_id`, tile source URL, and
    thumbnail URL into `sealed_source` (the `enc` format above, keyed with
    `WSI_SOURCE_SEAL_KEY`, AAD = `slide_key`).
-3. Each slide row in the cBioPortal WSI study files (`meta_wsi.txt`/
-   `data_wsi.txt`) carries `slide_key`, `sealed_source`,
+3. Each servable slide's row in the study's resource data files carries a
+   `metadata.serving` object with `key` (the slide key), `sealed_source`,
    `tile_metadata_json`, `thumbnail_width`, `thumbnail_height`, and
    `thumbnail_content_type`, and never the `image_id` or URLs.
    `tile_metadata_json` must pass
    `app.metadata_contract.validate_tile_metadata`.
-4. cBioPortal core imports those files and is the sole ClickHouse writer. It
-   publishes `can_serve_tiles=true` only when every field is present; the
+4. cBioPortal core imports those files and is the sole ClickHouse writer. The
    frontend passes `sealed_source` verbatim as the `enc` query parameter.
 
 The tile server never reads the pipeline's tables, registries, manifests, or
