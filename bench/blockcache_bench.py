@@ -165,7 +165,7 @@ def main():
     print(f"Speedup (warm cache vs direct ECS): {speedup:.1f}×  "
           f"({direct_p95:.0f} ms → {warm_p95:.0f} ms at p95)")
     if warm_p95 < 20:
-        print("✅ BlockCache delivers sub-20ms p95 — ECS latency is no longer the bottleneck")
+        print("✅ BlockCache delivers sub-20ms p95 — ECS latency is not the bottleneck")
     elif warm_p95 < 50:
         print("✅ BlockCache sufficient for interactive tile serving")
     else:

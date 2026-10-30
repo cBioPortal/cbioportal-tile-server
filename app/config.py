@@ -152,7 +152,7 @@ class Settings:
     slide_s3_max_connections: int = field(
         default_factory=lambda: _env_int("SLIDE_S3_MAX_CONNECTIONS", 16)
     )
-    # RATE_LIMIT_PER_MINUTE is retained as a one-release compatibility alias.
+    # RATE_LIMIT_PER_MINUTE is read when CACHE_MISS_RATE_LIMIT_PER_MINUTE is unset.
     cache_miss_rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int(
             "CACHE_MISS_RATE_LIMIT_PER_MINUTE",

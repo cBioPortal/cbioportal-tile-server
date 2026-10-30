@@ -526,8 +526,9 @@ def _single_query_value(request: Request, name: str) -> str | None:
 def _client_address(request: Request) -> str:
     """The rate-limit subject: the last X-Forwarded-For entry, else the peer.
 
-    The ingress appends (or sets) the address it saw as the last entry;
-    anything before it is client-supplied and must not pick the bucket.
+    The ingress sets X-Forwarded-For to the client address it saw; if
+    anything precedes the last entry, it is client-supplied and must not
+    pick the bucket.
     """
     forwarded = request.headers.get("x-forwarded-for", "")
     last = forwarded.rsplit(",", 1)[-1].strip()

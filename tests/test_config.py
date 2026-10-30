@@ -136,7 +136,7 @@ class TestOtherSettings:
         )
         assert s.cache_miss_rate_limit_per_minute == 120
 
-    def test_cache_miss_rate_limit_accepts_legacy_alias(self):
+    def test_cache_miss_rate_limit_reads_rate_limit_per_minute_when_unset(self):
         s = make_settings(RATE_LIMIT_PER_MINUTE="7")
         assert s.cache_miss_rate_limit_per_minute == 7
 

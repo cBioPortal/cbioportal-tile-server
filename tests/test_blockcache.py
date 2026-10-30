@@ -72,7 +72,7 @@ def test_slide_cache_directory_changes_with_the_source_etag(tmp_path, monkeypatc
     with patch.object(blockcache.os, "getpid", return_value=101):
         old = blockcache.cache_directory_for_slide(source, '"old"')
         new = blockcache.cache_directory_for_slide(source, '"new"')
-        legacy = blockcache.cache_directory_for_slide(source)
+        unversioned = blockcache.cache_directory_for_slide(source)
 
-    assert len({old, new, legacy}) == 3
+    assert len({old, new, unversioned}) == 3
     assert old.parent == new.parent == tmp_path
