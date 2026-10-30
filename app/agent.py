@@ -75,7 +75,12 @@ from .auth import scoped_user_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
 from .sealed_source import SLIDE_KEY_PATTERN
-from .research import _load_manifest, _similar_slides_for_model, search_regions_for_agent
+from .research import (
+    _load_manifest,
+    _similar_slides_for_model,
+    region_model,
+    search_regions_for_agent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +140,7 @@ SlideKey = Annotated[str, Field(pattern=SLIDE_KEY_PATTERN.pattern)]
 class EmbeddingContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider: Literal["quiltnet"]
+    provider: Literal["quiltnet", "keep_adapter"]
     scope: Literal["study"]
     slide_ids: list[SlideKey] = Field(default_factory=list, max_length=200)
 
@@ -213,6 +218,8 @@ class AgentRunContext:
     retrieval_candidates: dict[str, dict[str, Any]] = field(default_factory=dict)
     retrieval_runs: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_tool_error: dict[str, Any] | None = None
+    # Tool failures not yet reported to the client as `tool.error` events.
+    tool_errors: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AgentCommitResponse(BaseModel):
@@ -1634,6 +1641,97 @@ async def propose_viewer_action(
     return json.dumps({"proposal_id": created.id, "status": created.status})
 
 
+async def _run_tool(run_context: AgentRunContext, name: str, call: Any) -> str:
+    """Run a shared tool implementation for the Agents SDK path.
+
+    Failures are returned to the model as ``{"error": ...}`` (as the Bedrock
+    loop does) and queued for the client as `tool.error` events.
+    """
+    try:
+        result = await call
+    except Exception as exc:
+        error = _provider_error(exc)
+        run_context.last_tool_error = error
+        run_context.tool_errors.append({"name": name, **error})
+        logger.warning(
+            "WSI tool failed (%s): %s: %s", name, type(exc).__name__, str(exc)
+        )
+        return json.dumps({"error": error})
+    run_context.last_tool_error = None
+    return json.dumps(result)
+
+
+@function_tool
+async def wsi_find_regions(
+    context: RunContextWrapper[AgentRunContext],
+    query: str,
+    positive_concepts: list[str] | None = None,
+    negative_concepts: list[str] | None = None,
+    top_k: int = 5,
+) -> str:
+    """Find tissue or morphology regions on the current slide from a text description.
+
+    Results are normalized to the full slide (0..1000) and stored as a
+    retrieval run; propose them as annotations with
+    wsi_propose_retrieval_annotations and the run's retrieval_run_id and ranks.
+
+    Args:
+        query: The user's natural-language description of the tissue to find.
+        positive_concepts: Up to 4 concepts to include, when the user states them.
+        negative_concepts: Up to 2 concepts to exclude, when the user states them.
+        top_k: Number of regions to return (1-10).
+    """
+    run_context = _tool_context(context)
+    return await _run_tool(
+        run_context,
+        "wsi_find_regions",
+        _find_regions(run_context, query, positive_concepts, negative_concepts, top_k),
+    )
+
+
+@function_tool
+async def wsi_propose_retrieval_annotations(
+    context: RunContextWrapper[AgentRunContext],
+    retrieval_run_id: str,
+    ranks: list[int],
+    label: str,
+    layer_name: str,
+    color: str,
+    confidence: float,
+    rationale: str,
+) -> str:
+    """Propose ranked regions of a retrieval run as one reversible annotation batch.
+
+    The server resolves each rank's coordinates; the user approves the batch.
+
+    Args:
+        retrieval_run_id: The retrieval_run_id returned by wsi_find_regions.
+        ranks: 1-50 unique ranks from that run.
+        label: Annotation label.
+        layer_name: Annotation layer name.
+        color: Hex color such as #ef4444.
+        confidence: Confidence between 0 and 1.
+        rationale: Short reason for the proposal.
+    """
+    run_context = _tool_context(context)
+    return await _run_tool(
+        run_context,
+        "wsi_propose_retrieval_annotations",
+        _propose_retrieval_annotations(
+            run_context,
+            {
+                "retrieval_run_id": retrieval_run_id,
+                "ranks": ranks,
+                "label": label,
+                "layer_name": layer_name,
+                "color": color,
+                "confidence": confidence,
+                "rationale": rationale,
+            },
+        ),
+    )
+
+
 def _agent_instructions() -> str:
     return """You are the cBioPortal WSI research-support assistant.
 
@@ -1661,9 +1759,12 @@ user's natural-language description.  The retrieval service expands and
 tokenizes the description into pathology concepts; do not make the user
 guess a model vocabulary.  You may provide positive_concepts and
 negative_concepts when the user explicitly states inclusions or exclusions.
-Always set model to quiltnet_pmb for region searches; the other published
-embeddings are slide-level indexes and do not return tile regions.
-Similarity is a research ranking, not a diagnostic confidence score.
+The server chooses the tile-level region model; you do not need to name it.
+The slide-level embeddings used for similar-slide search do not return tile
+regions.  Similarity is a research ranking, not a diagnostic confidence score;
+when the result carries warnings (for example weak matches or a fallback),
+tell the user.  To annotate results, call wsi_propose_retrieval_annotations
+with the retrieval_run_id and the ranks the user wants.
 """
 
 
@@ -1682,12 +1783,19 @@ def _build_agent() -> Agent:
             propose_annotation_update,
             propose_annotation_delete,
             propose_viewer_action,
+            wsi_find_regions,
+            wsi_propose_retrieval_annotations,
         ],
     )
 
 
-def _agent_input(request: ChatRequest) -> list[dict[str, Any]]:
+def _agent_input(
+    request: ChatRequest,
+    retrieval_runs: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     context = request.context.model_dump(exclude={"viewport": {"image_data_url"}})
+    if retrieval_runs:
+        context["retrieval_runs"] = _retrieval_prompt_context(retrieval_runs)
     history = [message.model_dump() for message in request.history]
     prompt = json.dumps(
         {
@@ -1804,20 +1912,20 @@ def _bedrock_tools() -> list[dict[str, Any]]:
         {
             "toolSpec": {
                 "name": "wsi_find_regions",
-                "description": "Find tumor or tissue regions on the current slide using the live QuiltNet tile-retrieval index. Results are normalized to the full slide and each candidate_id can be used by an annotation proposal.",
+                "description": f"Find tumor or tissue regions on the current slide from a text description using the live tile-retrieval index ({region_model()}). Results are normalized to the full slide and are stored as a retrieval run whose ranks can be proposed as annotations.",
                 "inputSchema": {"json": {"type": "object", "properties": {
                     "query": {"type": "string"},
                     "positive_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 4},
                     "negative_concepts": {"type": "array", "items": {"type": "string"}, "maxItems": 2},
-                    "model": {"type": "string", "enum": ["quiltnet_pmb"]},
+                    "model": {"type": "string", "enum": [region_model()]},
                     "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
-                }, "required": ["query", "model"]}},
+                }, "required": ["query"]}},
             }
         },
         {
             "toolSpec": {
                 "name": "wsi_propose_retrieval_annotations",
-                "description": "Create one atomic, reversible annotation proposal batch from ranked candidates in a server-owned retrieval run. Use this for QuiltNet results; the server resolves candidate coordinates.",
+                "description": "Create one atomic, reversible annotation proposal batch from ranked candidates in a server-owned retrieval run. Use this for wsi_find_regions results; the server resolves candidate coordinates.",
                 "inputSchema": {"json": {"type": "object", "properties": {
                     "retrieval_run_id": {"type": "string"},
                     "ranks": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 50},
@@ -1911,139 +2019,160 @@ def _validate_annotation_input(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _find_regions(
+    run_context: AgentRunContext,
+    query: str,
+    positive_concepts: Any = None,
+    negative_concepts: Any = None,
+    top_k: Any = 5,
+) -> dict[str, Any]:
+    """Search the current slide with the configured region model.
+
+    The ranked regions are stored as a server-owned retrieval run so a later
+    proposal can refer to them by run ID and rank.
+    """
+    manifest = await _load_manifest()
+    query_plan = None
+    if isinstance(positive_concepts, list) or isinstance(negative_concepts, list):
+        query_plan = {
+            "primary": query.strip(),
+            "positive": positive_concepts if isinstance(positive_concepts, list) else [],
+            "negative": negative_concepts if isinstance(negative_concepts, list) else [],
+        }
+    try:
+        limit = min(10, max(1, int(top_k)))
+    except (TypeError, ValueError):
+        limit = 5
+    model = region_model()
+    result = await search_regions_for_agent(
+        manifest,
+        run_context.context.study_id,
+        run_context.context.slide_id,
+        model,
+        limit,
+        query,
+        run_context.context.viewport.slide_width,
+        run_context.context.viewport.slide_height,
+        query_plan,
+    )
+    retrieval_run_id = str(uuid.uuid4())
+    regions = [
+        {**region, "retrieval_run_id": retrieval_run_id}
+        for region in result.get("regions", [])
+        if isinstance(region, dict)
+    ]
+    for region in regions:
+        if isinstance(region.get("candidate_id"), str):
+            run_context.retrieval_candidates[region["candidate_id"]] = region
+    await _store_retrieval_candidates(run_context, regions)
+    run_context.retrieval_runs[retrieval_run_id] = {
+        "run_id": retrieval_run_id,
+        "source_fingerprint": run_context.context.viewport.source_fingerprint,
+        "viewer_generation": run_context.context.viewport.viewer_generation,
+        "model": model,
+        "query": query,
+        "regions": regions,
+    }
+    await _store_retrieval_run(run_context, retrieval_run_id, model, query, regions)
+    return {
+        **result,
+        "model": model,
+        "regions": regions,
+        "retrieval_run_id": retrieval_run_id,
+        "normalized_coordinate_space": "0..1000",
+    }
+
+
+async def _propose_retrieval_annotations(
+    run_context: AgentRunContext, arguments: dict[str, Any]
+) -> dict[str, Any]:
+    """Create one annotation-batch proposal from ranks of a retrieval run."""
+    retrieval_run_id = arguments.get("retrieval_run_id")
+    if not isinstance(retrieval_run_id, str) or not retrieval_run_id:
+        raise ValueError("A retrieval_run_id is required")
+    retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
+    if retrieval_run is None:
+        run_context.retrieval_runs = await _load_retrieval_runs(run_context)
+        retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
+    if retrieval_run is None:
+        raise ValueError("The retrieval run is expired or unavailable; run a fresh search")
+    source_fingerprint = retrieval_run.get("source_fingerprint")
+    current_fingerprint = run_context.context.viewport.source_fingerprint
+    if source_fingerprint and source_fingerprint != current_fingerprint:
+        raise ValueError("The retrieval run belongs to a changed slide source; run a fresh search")
+    ranks = arguments.get("ranks")
+    if (
+        not isinstance(ranks, list)
+        or not 1 <= len(ranks) <= 50
+        or any(not isinstance(rank, int) or isinstance(rank, bool) or rank < 1 for rank in ranks)
+        or len(set(ranks)) != len(ranks)
+    ):
+        raise ValueError("ranks must contain 1-50 unique positive integers")
+    regions_by_rank = {
+        region.get("rank"): region
+        for region in retrieval_run.get("regions", [])
+        if isinstance(region, dict) and isinstance(region.get("rank"), int)
+    }
+    selected = []
+    for rank in ranks:
+        region = regions_by_rank.get(rank)
+        if region is None:
+            raise ValueError(f"Retrieval rank {rank} is unavailable; run a fresh search")
+        candidate_id = region.get("candidate_id")
+        if not isinstance(candidate_id, str) or not isinstance(region.get("points"), list):
+            raise ValueError("The retrieval run contains an invalid candidate")
+        run_context.retrieval_candidates[candidate_id] = region
+        selected.append(
+            _canonicalize_annotation(
+                {
+                    "geometry_type": "rectangle",
+                    "points": region["points"],
+                    "coordinate_space": "retrieved_candidate",
+                    "candidate_id": candidate_id,
+                    "retrieval_run_id": retrieval_run_id,
+                    "label": arguments.get("label"),
+                    "layer_name": arguments.get("layer_name"),
+                    "color": arguments.get("color"),
+                    "confidence": arguments.get("confidence"),
+                },
+                run_context,
+            )
+        )
+    payload = {
+        "annotations": selected,
+        "retrieval_run_id": retrieval_run_id,
+        "rationale": _safe_rationale(str(arguments.get("rationale", ""))),
+        "context": _context_snapshot(run_context.context),
+    }
+    action = await _insert_action(run_context, "annotation_batch", payload)
+    return {
+        "proposal_id": action.id,
+        "status": action.status,
+        "retrieval_run_id": retrieval_run_id,
+        "ranks": ranks,
+    }
+
+
 async def _bedrock_tool(
     name: str, arguments: dict[str, Any], run_context: AgentRunContext
 ) -> dict[str, Any]:
     if name == "wsi_find_regions":
-        manifest = await _load_manifest()
-        positive = arguments.get("positive_concepts")
-        negative = arguments.get("negative_concepts")
-        query_plan = None
-        if isinstance(positive, list) or isinstance(negative, list):
-            query_plan = {
-                "primary": str(arguments.get("query", "")).strip(),
-                "positive": positive if isinstance(positive, list) else [],
-                "negative": negative if isinstance(negative, list) else [],
-            }
-        requested_model = str(arguments.get("model", "quiltnet_pmb"))
-        if requested_model != "quiltnet_pmb":
+        requested_model = arguments.get("model")
+        if requested_model not in (None, "", region_model()):
             logger.warning(
-                "Ignoring unsupported region model %s; using quiltnet_pmb",
-                requested_model,
+                "Ignoring unsupported region model %s; using %s",
+                str(requested_model)[:100],
+                region_model(),
             )
-        result = await search_regions_for_agent(
-            manifest,
-            run_context.context.study_id,
-            run_context.context.slide_id,
-            "quiltnet_pmb",
-            min(10, max(1, int(arguments.get("top_k", 5)))),
-            str(arguments.get("query", "")),
-            run_context.context.viewport.slide_width,
-            run_context.context.viewport.slide_height,
-            query_plan,
-        )
-        retrieval_run_id = str(uuid.uuid4())
-        regions = [
-            {
-                **region,
-                "retrieval_run_id": retrieval_run_id,
-            }
-            for region in result.get("regions", [])
-            if isinstance(region, dict)
-        ]
-        result = {
-            **result,
-            "regions": regions,
-            "retrieval_run_id": retrieval_run_id,
-        }
-        for region in regions:
-            if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
-                run_context.retrieval_candidates[region["candidate_id"]] = region
-        await _store_retrieval_candidates(
+        return await _find_regions(
             run_context,
-            regions,
-        )
-        run_context.retrieval_runs[retrieval_run_id] = {
-            "run_id": retrieval_run_id,
-            "source_fingerprint": run_context.context.viewport.source_fingerprint,
-            "viewer_generation": run_context.context.viewport.viewer_generation,
-            "model": "quiltnet_pmb",
-            "query": str(arguments.get("query", "")),
-            "regions": regions,
-        }
-        await _store_retrieval_run(
-            run_context,
-            retrieval_run_id,
-            "quiltnet_pmb",
             str(arguments.get("query", "")),
-            regions,
+            arguments.get("positive_concepts"),
+            arguments.get("negative_concepts"),
+            arguments.get("top_k", 5),
         )
-        return {**result, "normalized_coordinate_space": "0..1000"}
     if name == "wsi_propose_retrieval_annotations":
-        retrieval_run_id = arguments.get("retrieval_run_id")
-        if not isinstance(retrieval_run_id, str) or not retrieval_run_id:
-            raise ValueError("A retrieval_run_id is required")
-        retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
-        if retrieval_run is None:
-            run_context.retrieval_runs = await _load_retrieval_runs(run_context)
-            retrieval_run = run_context.retrieval_runs.get(retrieval_run_id)
-        if retrieval_run is None:
-            raise ValueError("The retrieval run is expired or unavailable; run a fresh search")
-        source_fingerprint = retrieval_run.get("source_fingerprint")
-        current_fingerprint = run_context.context.viewport.source_fingerprint
-        if source_fingerprint and source_fingerprint != current_fingerprint:
-            raise ValueError("The retrieval run belongs to a changed slide source; run a fresh search")
-        ranks = arguments.get("ranks")
-        if (
-            not isinstance(ranks, list)
-            or not 1 <= len(ranks) <= 50
-            or any(not isinstance(rank, int) or isinstance(rank, bool) or rank < 1 for rank in ranks)
-            or len(set(ranks)) != len(ranks)
-        ):
-            raise ValueError("ranks must contain 1-50 unique positive integers")
-        regions_by_rank = {
-            region.get("rank"): region
-            for region in retrieval_run.get("regions", [])
-            if isinstance(region, dict) and isinstance(region.get("rank"), int)
-        }
-        selected = []
-        for rank in ranks:
-            region = regions_by_rank.get(rank)
-            if region is None:
-                raise ValueError(f"Retrieval rank {rank} is unavailable; run a fresh search")
-            candidate_id = region.get("candidate_id")
-            if not isinstance(candidate_id, str) or not isinstance(region.get("points"), list):
-                raise ValueError("The retrieval run contains an invalid candidate")
-            run_context.retrieval_candidates[candidate_id] = region
-            selected.append(
-                _canonicalize_annotation(
-                    {
-                        "geometry_type": "rectangle",
-                        "points": region["points"],
-                        "coordinate_space": "retrieved_candidate",
-                        "candidate_id": candidate_id,
-                        "retrieval_run_id": retrieval_run_id,
-                        "label": arguments["label"],
-                        "layer_name": arguments["layer_name"],
-                        "color": arguments["color"],
-                        "confidence": arguments["confidence"],
-                    },
-                    run_context,
-                )
-            )
-        payload = {
-            "annotations": selected,
-            "retrieval_run_id": retrieval_run_id,
-            "rationale": _safe_rationale(str(arguments["rationale"])),
-            "context": _context_snapshot(run_context.context),
-        }
-        action = await _insert_action(run_context, "annotation_batch", payload)
-        return {
-            "proposal_id": action.id,
-            "status": action.status,
-            "retrieval_run_id": retrieval_run_id,
-            "ranks": ranks,
-        }
+        return await _propose_retrieval_annotations(run_context, arguments)
     if name == "wsi_find_similar_slides":
         manifest = await _load_manifest()
         row = next(
@@ -2120,6 +2249,31 @@ def _bedrock_user_content(
     return content
 
 
+async def _load_retrieval_state(run_context: AgentRunContext) -> None:
+    """Load this session's stored retrieval candidates and runs."""
+    run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
+    run_context.retrieval_runs = await _load_retrieval_runs(run_context)
+    for retrieval_run in run_context.retrieval_runs.values():
+        for region in retrieval_run.get("regions", []):
+            if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
+                run_context.retrieval_candidates[region["candidate_id"]] = region
+
+
+async def _proposal_events(run_context: AgentRunContext, user_sub: str):
+    """Yield the run's proposals and its completion event."""
+    for proposal_id in run_context.proposal_ids:
+        proposal = await _get_action(proposal_id, user_sub)
+        if proposal:
+            yield _sse("proposal", proposal.model_dump())
+    completion: dict[str, Any] = {
+        "proposal_ids": run_context.proposal_ids,
+        "success": run_context.last_tool_error is None,
+    }
+    if run_context.last_tool_error:
+        completion["error"] = run_context.last_tool_error
+    yield _sse("complete", completion)
+
+
 async def _stream_bedrock(request: ChatRequest, user_sub: str):
     run_context = AgentRunContext(
         user_sub=user_sub,
@@ -2127,12 +2281,7 @@ async def _stream_bedrock(request: ChatRequest, user_sub: str):
         context=request.context,
         request_id=request.request_id,
     )
-    run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
-    run_context.retrieval_runs = await _load_retrieval_runs(run_context)
-    for retrieval_run in run_context.retrieval_runs.values():
-        for region in retrieval_run.get("regions", []):
-            if isinstance(region, dict) and isinstance(region.get("candidate_id"), str):
-                run_context.retrieval_candidates[region["candidate_id"]] = region
+    await _load_retrieval_state(run_context)
     messages: list[dict[str, Any]] = [
         {"role": "user", "content": _bedrock_user_content(request, run_context.retrieval_runs)}
     ]
@@ -2174,17 +2323,8 @@ async def _stream_bedrock(request: ChatRequest, user_sub: str):
                 result_content = {"json": {"error": error}}
             results.append({"toolResult": {"toolUseId": tool_use.get("toolUseId"), "content": [result_content]}})
         messages.append({"role": "user", "content": results})
-    for proposal_id in run_context.proposal_ids:
-        proposal = await _get_action(proposal_id, user_sub)
-        if proposal:
-            yield _sse("proposal", proposal.model_dump())
-    completion: dict[str, Any] = {
-        "proposal_ids": run_context.proposal_ids,
-        "success": run_context.last_tool_error is None,
-    }
-    if run_context.last_tool_error:
-        completion["error"] = run_context.last_tool_error
-    yield _sse("complete", completion)
+    async for chunk in _proposal_events(run_context, user_sub):
+        yield chunk
 
 
 def _sse(event: str, payload: Any) -> str:
@@ -2211,13 +2351,13 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
         request_id=request.request_id,
     )
     try:
-        run_context.retrieval_candidates = await _load_retrieval_candidates(run_context)
+        await _load_retrieval_state(run_context)
     except Exception:
-        logger.exception("Failed to load persisted WSI retrieval candidates")
+        logger.exception("Failed to load persisted WSI retrieval state")
     try:
         result = Runner.run_streamed(
             _build_agent(),
-            _agent_input(request),
+            _agent_input(request, run_context.retrieval_runs),
             context=run_context,
             max_turns=6,
         )
@@ -2227,16 +2367,19 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
                 if getattr(data, "type", "") == "response.output_text.delta":
                     yield _sse("message.delta", {"text": data.delta})
             elif event.type == "run_item_stream_event":
-                item = getattr(event, "item", None)
-                raw = getattr(item, "raw_item", None)
-                tool_name = raw.get("name", "") if isinstance(raw, dict) else ""
-                if tool_name:
-                    yield _sse("tool.called", {"name": tool_name})
-        for proposal_id in run_context.proposal_ids:
-            proposal = await _get_action(proposal_id, user_sub)
-            if proposal:
-                yield _sse("proposal", proposal.model_dump())
-        yield _sse("complete", {"proposal_ids": run_context.proposal_ids})
+                if getattr(event, "name", "") == "tool_called":
+                    raw = getattr(getattr(event, "item", None), "raw_item", None)
+                    tool_name = (
+                        raw.get("name", "") if isinstance(raw, dict) else getattr(raw, "name", "")
+                    )
+                    if tool_name:
+                        yield _sse("tool.called", {"name": str(tool_name)})
+            while run_context.tool_errors:
+                yield _sse("tool.error", run_context.tool_errors.pop(0))
+        while run_context.tool_errors:
+            yield _sse("tool.error", run_context.tool_errors.pop(0))
+        async for chunk in _proposal_events(run_context, user_sub):
+            yield chunk
     except asyncio.CancelledError:
         raise
     except Exception:
