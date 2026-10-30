@@ -194,7 +194,9 @@ seal key, and an optional Redis cache:
 | `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
 | `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
 | `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
-| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal QuiltNet retrieval worker URL; enable with the `research` Compose profile |
+| `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |
+| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal region retrieval worker URL (the QuiltNet worker is the `research` Compose profile) |
+| `WSI_RESEARCH_EMBEDDING_URLS` | — | Optional per-model worker URLs, `model=url,model=url`; other models use `WSI_RESEARCH_EMBEDDING_URL` |
 | `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
 | `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
 | `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
@@ -210,9 +212,20 @@ on-demand worker is not a substitute.
 
 When enabled, `/research/v1` exposes only study-scoped, bounded references to
 published model assets and candidate regions. `/research/v1/mcp` provides the
-same read-only region and similar-slide tools to cBioAgent. Bedrock annotation
-tools create pending proposals in the agent action store; the browser applies
-them through `/annotations/batch` only after user approval.
+same read-only region and similar-slide tools to cBioAgent. The assistant's
+annotation tools (on every provider) create pending proposals in the agent
+action store; the browser applies them through `/annotations/batch` only after
+user approval. Its `wsi_find_regions` tool searches the current slide with
+`WSI_RESEARCH_REGION_MODEL` and stores the ranked regions as a retrieval run;
+`wsi_propose_retrieval_annotations` turns chosen ranks of that run into one
+annotation-batch proposal.
+
+`reef_v2_hoptimus1_keep` scores stored REEF v2 H-optimus-1 tile features,
+mapped into KEEP text space, in a separate worker. Its manifest entries carry
+the slide's internal image ID, which the tile server sends only to that worker;
+API responses, assistant tool output and stored retrieval runs keep only the
+documented region fields. `tools/build_keep_manifest.py` builds such a
+manifest from the slide table's sealed sources and prints counts only.
 
 Semantic search is served by the optional `quiltnet-search` Compose service.
 Start it with `WSI_RESEARCH_EMBEDDING_URL=http://quiltnet-search:8080 docker
