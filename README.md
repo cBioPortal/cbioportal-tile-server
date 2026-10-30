@@ -156,8 +156,8 @@ and is logged without its URL. Requests that supply a source themselves
 | `502` | Service | Stored thumbnail unreadable, over `THUMBNAIL_MAX_DECODE_PIXELS`, or unavailable |
 | `503` | Service | Busy, source temporarily unavailable, or seal key not configured (`Retry-After`) |
 
-The serving contract version is `wsi-serving-v6` (reported by `/ready` as
-`serving_contract_version` when a release is configured).
+The serving contract version is `wsi-serving-v6`, reported by `/ready` as
+`serving_contract_version`.
 
 This service performs no user authentication: deploy it only behind an ingress
 that authorizes `studyId` against cBioPortal with the session cookie, on the
