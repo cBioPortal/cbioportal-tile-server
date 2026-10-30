@@ -78,7 +78,6 @@ from .thumbnail_store import (
     initialize_runtime_store,
     read_thumbnail_bytes,
     render_thumbnail_payload,
-    thumbnail_size,
 )
 from .tiles import InvalidTileRequest, OverviewTooLarge, get_tile_bytes
 
@@ -874,9 +873,9 @@ async def tile(
 
 @app.get("/thumbnails")
 async def thumbnail(request: Request):
-    # `tw`/`th`, if a client still sends them, are ignored: the stored
-    # thumbnail's own size decides pass-through vs resize, so nothing in the
-    # request outside the cache key can change what is cached under it.
+    # `tw`/`th` are ignored: the stored thumbnail's own size decides
+    # pass-through vs resize, so nothing in the request outside the cache key
+    # can change what is cached under it.
     _reject_client_source(request)
     width = _thumbnail_size(request, "width")
     height = _thumbnail_size(request, "height")
@@ -889,21 +888,17 @@ async def thumbnail(request: Request):
 
     async def _build_thumbnail():
         payload = await _run_thumbnail_fetch(ThumbnailRecord(uri=source))
-        master_width, master_height = thumbnail_size(payload)
-        if width >= master_width and height >= master_height:
-            data, status = payload, {"status": "ok", "reason": "master"}
-        else:
-            resize_started = time.perf_counter()
-            try:
-                data, status = await _run_image_operation(
-                    render_thumbnail_payload,
-                    payload,
-                    width,
-                    height,
-                    operation_kind="thumbnail_resize",
-                )
-            finally:
-                THUMBNAIL_RESIZE_SECONDS.observe(time.perf_counter() - resize_started)
+        resize_started = time.perf_counter()
+        try:
+            data, status = await _run_image_operation(
+                render_thumbnail_payload,
+                payload,
+                width,
+                height,
+                operation_kind="thumbnail_resize",
+            )
+        finally:
+            THUMBNAIL_RESIZE_SECONDS.observe(time.perf_counter() - resize_started)
         await tile_cache.set_thumbnail(cache_key, width, height, data)
         return data, status
 

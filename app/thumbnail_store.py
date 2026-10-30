@@ -142,13 +142,10 @@ def read_thumbnail_bytes(record: ThumbnailRecord) -> bytes:
         return handle.read()
 
 
-def thumbnail_size(payload: bytes) -> tuple[int, int]:
-    """The stored thumbnail's (width, height), read from its header only."""
-    try:
-        with Image.open(BytesIO(payload)) as image:
-            return image.size
-    except (OSError, ValueError, Image.DecompressionBombError) as exc:
-        raise InvalidThumbnail(type(exc).__name__) from None
+def _check_decode_size(image: Image.Image) -> None:
+    width, height = image.size
+    if width * height > settings.thumbnail_max_decode_pixels:
+        raise InvalidThumbnail("ThumbnailTooLarge")
 
 
 def render_thumbnail_payload(
@@ -156,15 +153,30 @@ def render_thumbnail_payload(
     requested_width: int,
     requested_height: int,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Fit the stored thumbnail into the requested box; never upscale."""
+    """Fit the stored thumbnail into the requested box; never upscale.
+
+    The header is checked against ``THUMBNAIL_MAX_DECODE_PIXELS`` before any
+    pixel is decoded.  A JPEG that already fits is returned byte for byte;
+    any other format is re-encoded to JPEG, since the response is
+    ``image/jpeg``.  A JPEG that needs shrinking is decoded at reduced scale
+    through ``Image.draft``.
+    """
     try:
         with Image.open(BytesIO(payload)) as image:
-            if requested_width >= image.width and requested_height >= image.height:
+            _check_decode_size(image)
+            fits = requested_width >= image.width and requested_height >= image.height
+            if fits and image.format == "JPEG":
                 return payload, {"status": "ok", "reason": "master"}
+            if not fits:
+                image.draft("RGB", (requested_width, requested_height))
             working = image.convert("RGB")
     except (OSError, ValueError, Image.DecompressionBombError) as exc:
         raise InvalidThumbnail(type(exc).__name__) from None
-    working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
+    if fits:
+        reason = "reencoded"
+    else:
+        working.thumbnail((requested_width, requested_height), Image.Resampling.LANCZOS)
+        reason = "resized"
     out = BytesIO()
     working.save(out, format="JPEG", quality=settings.jpeg_quality)
-    return out.getvalue(), {"status": "ok", "reason": "resized"}
+    return out.getvalue(), {"status": "ok", "reason": reason}

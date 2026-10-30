@@ -686,6 +686,30 @@ class TestSlideRoutes:
         assert writes[0][3] == master
 
     @pytest.mark.asyncio
+    async def test_thumbnail_reencodes_a_png_master_to_jpeg(self, slide_settings):
+        out = BytesIO()
+        Image.new("RGB", (100, 50), (120, 140, 160)).save(out, format="PNG")
+        response, _, writes = await self._serve_thumbnail(_thumbnail_query(), out.getvalue())
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/jpeg"
+        assert response.headers["x-thumbnail-reason"] == "reencoded"
+        assert Image.open(BytesIO(response.content)).format == "JPEG"
+        assert writes[0][3] == response.content
+
+    @pytest.mark.asyncio
+    async def test_thumbnail_over_the_decode_cap_is_a_502_and_not_cached(
+        self, slide_settings, monkeypatch
+    ):
+        monkeypatch.setattr(main_module.settings, "thumbnail_max_decode_pixels", 1024 * 768 - 1)
+        response, _, writes = await self._serve_thumbnail(
+            _thumbnail_query(), _jpeg((1024, 768))
+        )
+
+        assert response.status_code == 502
+        assert writes == []
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "lie",
         [
@@ -713,7 +737,7 @@ class TestSlideRoutes:
         assert Image.open(BytesIO(lying_writes[0][3])).size == (128, 96)
 
     @pytest.mark.asyncio
-    async def test_repeated_legacy_thumbnail_dimensions_are_ignored(self, slide_settings):
+    async def test_repeated_tw_th_parameters_are_ignored(self, slide_settings):
         params = list(_thumbnail_query().items()) + [("tw", "1"), ("tw", "2"), ("TH", "3")]
         response, _, _ = await self._serve_thumbnail(params, _jpeg((1024, 768)))
 

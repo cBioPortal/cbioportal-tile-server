@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from app import thumbnail_store
 
@@ -95,11 +95,40 @@ class TestThumbnailStore:
         assert image.size == (256, 128)
         assert status == {"status": "ok", "reason": "resized"}
 
-    def test_size_is_read_from_the_stored_thumbnail(self):
-        assert thumbnail_store.thumbnail_size(_jpeg_bytes((1024, 512))) == (1024, 512)
+    def test_png_master_that_fits_is_reencoded_to_jpeg(self):
+        image = Image.new("RGBA", (64, 32), (120, 140, 160, 255))
+        out = BytesIO()
+        image.save(out, format="PNG")
+
+        result, status = thumbnail_store.render_thumbnail_payload(out.getvalue(), 128, 96)
+
+        reencoded = Image.open(BytesIO(result))
+        assert reencoded.format == "JPEG"
+        assert reencoded.size == (64, 32)
+        assert status == {"status": "ok", "reason": "reencoded"}
+
+    def test_header_over_the_decode_cap_is_invalid(self, monkeypatch):
+        monkeypatch.setattr(thumbnail_store.settings, "thumbnail_max_decode_pixels", 1024 * 512 - 1)
+
+        for width, height in ((256, 256), (4096, 4096)):
+            with pytest.raises(thumbnail_store.InvalidThumbnail, match="ThumbnailTooLarge"):
+                thumbnail_store.render_thumbnail_payload(_jpeg_bytes((1024, 512)), width, height)
+
+    def test_jpeg_resize_decodes_through_draft(self, monkeypatch):
+        calls = []
+        original = JpegImagePlugin.JpegImageFile.draft
+
+        def draft(self, mode, size):
+            calls.append((mode, size))
+            return original(self, mode, size)
+
+        monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", draft)
+
+        result, _ = thumbnail_store.render_thumbnail_payload(_jpeg_bytes((2048, 1024)), 256, 256)
+
+        assert calls[0] == ("RGB", (256, 256))
+        assert Image.open(BytesIO(result)).size == (256, 128)
 
     def test_unreadable_thumbnail_is_invalid(self):
-        with pytest.raises(thumbnail_store.InvalidThumbnail):
-            thumbnail_store.thumbnail_size(b"not an image")
         with pytest.raises(thumbnail_store.InvalidThumbnail):
             thumbnail_store.render_thumbnail_payload(b"not an image", 16, 16)
