@@ -118,11 +118,17 @@ async def test_semantic_search_uses_worker_response(local_manifest, monkeypatch)
     row = research._find_slide(await research._load_manifest(), "study-a", "slide-a")
 
     class FakeResponse:
+        status_code = 200
+
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {"regions": [{"candidate_id": "tile-1", "points": []}]}
+            return {
+                "regions": [
+                    {"candidate_id": "tile-1", "points": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}
+                ]
+            }
 
     class FakeClient:
         def __init__(self, *args, **kwargs):

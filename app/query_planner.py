@@ -45,8 +45,12 @@ def _unique(values: list[str], limit: int) -> list[str]:
     return result
 
 
-def build_query_plan(query: str) -> dict[str, Any]:
-    """Return a compact, editable plan without requiring a second LLM call."""
+def build_query_plan(query: str, *, expand: bool = True) -> dict[str, Any]:
+    """Return a compact, editable plan without requiring a second LLM call.
+
+    ``expand`` adds the QuiltNet vocabulary synonyms below; without it the
+    plan carries only the user's own concepts.
+    """
     normalized = _clean(query)
     if not normalized:
         return {"primary": "", "positive": [], "negative": [], "summary": ""}
@@ -59,13 +63,14 @@ def build_query_plan(query: str) -> dict[str, Any]:
     negative = _unique(
         [part for part in _SEPARATORS.split(negative_text) if part], 2
     )
-    haystack = positive_text.casefold()
-    for trigger, expansions in _EXPANSIONS:
-        if trigger in haystack:
-            positive.extend(expansions)
-    for trigger, expansions in _EXPANSIONS:
-        if trigger in negative_text.casefold():
-            negative.extend(expansions[:1])
+    if expand:
+        haystack = positive_text.casefold()
+        for trigger, expansions in _EXPANSIONS:
+            if trigger in haystack:
+                positive.extend(expansions)
+        for trigger, expansions in _EXPANSIONS:
+            if trigger in negative_text.casefold():
+                negative.extend(expansions[:1])
     positive = _unique(positive, 4)
     negative = _unique(negative, 2)
     summary = f"Searching for {positive[0] if positive else normalized}"

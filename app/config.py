@@ -209,10 +209,20 @@ class Settings:
     research_rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int("WSI_RESEARCH_RATE_LIMIT_PER_MINUTE", 30)
     )
-    # QuiltNet retrieval runs in a separate process because its model and
-    # feature tensors are much larger than the pixel-serving workers.
+    # Region retrieval runs in a separate worker process because its models
+    # and feature tensors are much larger than the pixel-serving workers.
     research_embedding_url: str = field(
         default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URL")
+    )
+    # Optional per-model worker URLs, "model=url,model=url"; a model not
+    # listed here uses WSI_RESEARCH_EMBEDDING_URL.
+    research_embedding_urls: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URLS")
+    )
+    # The tile-level model used for text-to-region search (the viewer's
+    # region-search default and the assistant's wsi_find_regions tool).
+    research_region_model: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_REGION_MODEL", "quiltnet_pmb")
     )
     research_embedding_timeout_seconds: float = field(
         default_factory=lambda: _env_float("WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS", 60.0)

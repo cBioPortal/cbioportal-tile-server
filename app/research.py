@@ -8,6 +8,7 @@ does not expose S3 credentials or let a model choose an arbitrary source.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -35,6 +36,27 @@ _manifest_lock = asyncio.Lock()
 _manifest_cache: tuple[str, float, dict[str, Any]] | None = None
 _rate_lock = asyncio.Lock()
 _rate_windows: dict[str, list[float]] = {}
+
+QUILTNET_MODEL = "quiltnet_pmb"
+KEEP_ADAPTER_MODEL = "reef_v2_hoptimus1_keep"
+# Tile-level models that answer text-to-region search, with the capabilities
+# a manifest entry gets when it lists none.
+REGION_SEARCH_MODELS: dict[str, list[str]] = {
+    QUILTNET_MODEL: ["text_search", "tile_search"],
+    KEEP_ADAPTER_MODEL: ["text_search"],
+}
+# Models the tile server can score itself when no worker URL is configured.
+_IN_PROCESS_MODELS = frozenset({QUILTNET_MODEL})
+# Manifest model-record fields that are internal identifiers.  They travel to
+# the retrieval worker only and are scrubbed from anything a worker returns.
+_PRIVATE_MODEL_FIELDS = ("image_id",)
+_REGION_TEXT_LIMIT = 200
+_RETRIEVAL_MODE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+def region_model() -> str:
+    """The configured tile-level model for text-to-region search."""
+    return str(getattr(settings, "research_region_model", "") or "").strip() or QUILTNET_MODEL
 
 
 class ResearchModel(BaseModel):
@@ -64,7 +86,7 @@ class ResearchSlide(BaseModel):
 
 class RegionSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=500)
-    model: str = Field(default="quiltnet_pmb", min_length=1, max_length=100)
+    model: str = Field(default_factory=region_model, min_length=1, max_length=100)
     top_k: int = Field(default=10, ge=1, le=50)
     query_plan: dict[str, Any] | None = None
     review_mode: str = Field(default="semantic", pattern=r"^(semantic|review)$")
@@ -145,8 +167,8 @@ def _models(row: dict[str, Any]) -> list[ResearchModel]:
         if not isinstance(model, dict) or not model.get("id"):
             continue
         value = dict(model)
-        if not value.get("capabilities") and value.get("id") == "quiltnet_pmb":
-            value["capabilities"] = ["text_search", "tile_search"]
+        if not value.get("capabilities") and value.get("id") in REGION_SEARCH_MODELS:
+            value["capabilities"] = list(REGION_SEARCH_MODELS[value["id"]])
         result.append(ResearchModel(**value))
     return result
 
@@ -165,17 +187,22 @@ def _model_record(row: dict[str, Any], model_id: str) -> dict[str, Any]:
     )
 
 
-def _plan_for_request(query: str, supplied: dict[str, Any] | None) -> dict[str, Any]:
+def _plan_for_request(
+    query: str, supplied: dict[str, Any] | None, model: str = QUILTNET_MODEL
+) -> dict[str, Any]:
+    # The synonym expansions are tuned to the QuiltNet text vocabulary; other
+    # models receive the user's own concepts.
+    expand = model == QUILTNET_MODEL
     if supplied is None:
-        return build_query_plan(query)
+        return build_query_plan(query, expand=expand)
     positive = supplied.get("positive")
     negative = supplied.get("negative")
     if not isinstance(positive, list) or not isinstance(negative, list):
-        return build_query_plan(query)
+        return build_query_plan(query, expand=expand)
     clean_positive = [str(item).strip() for item in positive[:4] if str(item).strip()]
     clean_negative = [str(item).strip() for item in negative[:2] if str(item).strip()]
     if not clean_positive:
-        return build_query_plan(query)
+        return build_query_plan(query, expand=expand)
     return {
         "primary": str(supplied.get("primary") or clean_positive[0]),
         "positive": clean_positive,
@@ -257,6 +284,99 @@ def _bounded_regions(
     return selected
 
 
+def _worker_url(model: str) -> str:
+    """The retrieval worker base URL for ``model`` ('' when none is set)."""
+    for item in str(getattr(settings, "research_embedding_urls", "") or "").split(","):
+        name, separator, url = item.partition("=")
+        if separator and name.strip() == model and url.strip():
+            return url.strip()
+    return str(getattr(settings, "research_embedding_url", "") or "").strip()
+
+
+def _private_values(model_record: dict[str, Any]) -> set[str]:
+    return {
+        str(model_record[name]).strip()
+        for name in _PRIVATE_MODEL_FIELDS
+        if str(model_record.get(name) or "").strip()
+    }
+
+
+def _public_text(value: Any, private: set[str], limit: int = _REGION_TEXT_LIMIT) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:limit]
+    if not text or any(secret in text for secret in private):
+        return None
+    return text
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
+def _worker_regions(
+    regions: list[Any], model: str, model_record: dict[str, Any], top_k: int
+) -> list[dict[str, Any]]:
+    """Keep only the documented region fields a worker returns.
+
+    Regions reach the assistant, its stored retrieval runs and API clients, so
+    unknown fields are dropped and no text may carry a private model-record
+    value.
+    """
+    private = _private_values(model_record)
+    selected: list[dict[str, Any]] = []
+    for region in regions:
+        if not isinstance(region, dict):
+            continue
+        points = region.get("points")
+        if not isinstance(points, list):
+            continue
+        clean_points = []
+        for point in points[:100]:
+            if not isinstance(point, dict):
+                continue
+            x, y = _finite_number(point.get("x")), _finite_number(point.get("y"))
+            if x is None or y is None:
+                continue
+            clean_points.append({"x": max(0.0, min(1000.0, x)), "y": max(0.0, min(1000.0, y))})
+        if len(clean_points) < 2:
+            continue
+        candidate_id = _public_text(region.get("candidate_id"), private, 128)
+        if candidate_id is None:
+            candidate_id = hashlib.sha1(
+                json.dumps([model, clean_points], separators=(",", ":")).encode()
+            ).hexdigest()[:16]
+        clean: dict[str, Any] = {
+            "candidate_id": candidate_id,
+            "model": model,
+            "points": clean_points,
+            "rank": len(selected) + 1,
+        }
+        for name in ("score", "similarity", "relative_score"):
+            number = _finite_number(region.get(name))
+            if number is not None:
+                clean[name] = number
+        verification = _public_text(region.get("verification"), private, 64)
+        if verification is not None:
+            clean["verification"] = verification
+        label = _public_text(region.get("label"), private)
+        if label is not None:
+            clean["label"] = label
+        concepts = region.get("matched_concepts")
+        if isinstance(concepts, list):
+            clean["matched_concepts"] = [
+                text
+                for text in (_public_text(item, private) for item in concepts[:8])
+                if text is not None
+            ]
+        selected.append(clean)
+        if len(selected) >= top_k:
+            break
+    return selected
+
+
 async def _semantic_regions(
     row: dict[str, Any],
     model: str,
@@ -264,7 +384,12 @@ async def _semantic_regions(
     query_plan: dict[str, Any],
     slide_width: int | None,
     slide_height: int | None,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    """Ask the model's retrieval worker for ranked regions.
+
+    Returns ``{"regions", "retrieval_mode", "warnings"}`` with sanitized
+    regions; raises RuntimeError when semantic search is unavailable.
+    """
     model_record = _model_record(row, model)
     width = slide_width or model_record.get("slide_width") or row.get("slide_width")
     height = slide_height or model_record.get("slide_height") or row.get("slide_height")
@@ -278,25 +403,34 @@ async def _semantic_regions(
         "slide_width": width,
         "slide_height": height,
     }
-    endpoint = str(getattr(settings, "research_embedding_url", "") or "").strip()
+    endpoint = _worker_url(model)
     if endpoint:
         url = endpoint.rstrip("/") + "/v1/search"
         try:
             async with httpx.AsyncClient(timeout=settings.research_embedding_timeout_seconds) as client:
                 response = await client.post(url, json=payload)
+            if response.status_code == 404:
+                raise RuntimeError("Region-search features are not available for this slide")
             response.raise_for_status()
             result = response.json()
-            regions = result.get("regions") if isinstance(result, dict) else None
-            if not isinstance(regions, list):
-                raise RuntimeError("QuiltNet retrieval worker returned no regions")
-            return [region for region in regions if isinstance(region, dict)]
         except (httpx.HTTPError, ValueError) as exc:
-            raise RuntimeError("QuiltNet retrieval worker is unavailable") from exc
-    if bool(getattr(settings, "research_embedding_in_process", False)):
+            raise RuntimeError("The region retrieval worker is unavailable") from exc
+        regions = result.get("regions") if isinstance(result, dict) else None
+        if not isinstance(regions, list):
+            raise RuntimeError("The region retrieval worker returned no regions")
+        private = _private_values(model_record)
+        mode = result.get("retrieval_mode")
+        warning = _public_text(result.get("warning"), private, 500)
+        return {
+            "regions": _worker_regions(regions, model, model_record, top_k),
+            "retrieval_mode": mode if isinstance(mode, str) and _RETRIEVAL_MODE.fullmatch(mode) else "semantic",
+            "warnings": [warning] if warning else [],
+        }
+    if model in _IN_PROCESS_MODELS and bool(getattr(settings, "research_embedding_in_process", False)):
         try:
             from .quiltnet_retrieval import get_retriever
 
-            return await asyncio.to_thread(
+            regions = await asyncio.to_thread(
                 get_retriever().search,
                 model_id=model,
                 model_record=model_record,
@@ -307,17 +441,22 @@ async def _semantic_regions(
             )
         except Exception as exc:
             raise RuntimeError("In-process QuiltNet retrieval is unavailable") from exc
-    raise RuntimeError("QuiltNet retrieval worker is not configured")
+        return {
+            "regions": _worker_regions(regions, model, model_record, top_k),
+            "retrieval_mode": "semantic",
+            "warnings": [],
+        }
+    raise RuntimeError("The region retrieval worker is not configured")
 
 
 async def _search_result(
     row: dict[str, Any],
     data: RegionSearchRequest,
 ) -> dict[str, Any]:
-    query_plan = _plan_for_request(data.query, data.query_plan)
+    query_plan = _plan_for_request(data.query, data.query_plan, data.model)
     warnings: list[str] = []
     try:
-        regions = await _semantic_regions(
+        semantic = await _semantic_regions(
             row,
             data.model,
             data.top_k,
@@ -325,17 +464,19 @@ async def _search_result(
             data.slide_width,
             data.slide_height,
         )
-        retrieval_mode = "semantic"
+        regions = semantic["regions"]
+        retrieval_mode = semantic["retrieval_mode"]
         warnings.append(
             "Similarity is a research ranking, not a diagnostic confidence score."
         )
+        warnings.extend(semantic["warnings"])
     except RuntimeError as exc:
         if not settings.research_static_fallback:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         regions = _bounded_regions(row, data.model, data.top_k, data.query)
         retrieval_mode = "published_label_fallback"
         warnings.append(
-            "QuiltNet semantic retrieval is unavailable; showing only published label matches."
+            f"Semantic region retrieval is unavailable ({exc}); showing only published label matches."
         )
         logger.warning("Semantic research search fell back to published labels: %s", exc)
     return {
@@ -352,9 +493,13 @@ async def research_health() -> dict[str, Any]:
     return {
         "enabled": bool(settings.research_enabled),
         "configured": bool(_manifest_uri()),
+        "region_model": region_model(),
         "semantic_configured": bool(
-            getattr(settings, "research_embedding_url", "")
-            or getattr(settings, "research_embedding_in_process", False)
+            _worker_url(region_model())
+            or (
+                region_model() in _IN_PROCESS_MODELS
+                and getattr(settings, "research_embedding_in_process", False)
+            )
         ),
     }
 
@@ -560,9 +705,19 @@ async def search_regions_for_agent(
     query_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run the same semantic search used by the direct viewer control."""
-    row = _find_slide(manifest, study_id, slide_id)
-    if model not in {item.id for item in _models(row)}:
-        return {"regions": [], "query_plan": _plan_for_request(query, query_plan), "retrieval_mode": "none", "warnings": []}
+    try:
+        row = _find_slide(manifest, study_id, slide_id)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        row = None
+    if row is None or model not in {item.id for item in _models(row)}:
+        return {
+            "regions": [],
+            "query_plan": _plan_for_request(query, query_plan, model),
+            "retrieval_mode": "none",
+            "warnings": ["Region search is not published for this slide."],
+        }
     data = RegionSearchRequest(
         query=query or "slide regions",
         model=model,
