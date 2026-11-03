@@ -38,7 +38,8 @@ async def test_postgres_round_trip_uses_real_timestamp_columns():
     await agent.init_db(db_url=dsn)
 
     suffix = uuid.uuid4().hex
-    slide_id = f"integration-slide-{suffix}"
+    # Slide keys are 12 lowercase hex characters.
+    slide_id = suffix[:12]
     user_sub = f"integration-user-{suffix}"
     context = _context(slide_id, f"integration-patient-{suffix}")
     run_context = agent.AgentRunContext(
