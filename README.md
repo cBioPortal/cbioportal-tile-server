@@ -177,6 +177,29 @@ seal key, and an optional Redis cache:
 | `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
 | `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued annotation capabilities |
+| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Dev-only compatibility for legacy seeded rows under the synthetic local-development subject |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
+| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
+| `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
+| `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
+| `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
+| `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
+| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_MODEL` | `BEDROCK_AGENT_MODEL` | Assistant model for any provider: Bedrock model ID, OpenAI model, or Databricks serving endpoint name |
+| `DATABRICKS_HOST` | profile `host` | Workspace URL for `WSI_AGENT_PROVIDER=databricks`; the OpenAI Responses API is called at `<host>/serving-endpoints` |
+| `DATABRICKS_TOKEN` / `DATABRICKS_TOKEN_FILE` | profile `token` | Workspace token (or a file holding it) for the Databricks provider |
+| `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
+| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
+| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
+| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
+| `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
+| `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
+| `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |
+| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal region retrieval worker URL (the QuiltNet worker is the `research` Compose profile) |
+| `WSI_RESEARCH_EMBEDDING_URLS` | — | Optional per-model worker URLs, `model=url,model=url`; other models use `WSI_RESEARCH_EMBEDDING_URL` |
+| `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
+| `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
+| `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
 
 Thumbnail artifacts are generated offline (see
 [Offline preparation](#offline-preparation)); their dimensions, content
@@ -186,6 +209,29 @@ published with `can_serve_tiles=false` until all of those fields are present.
 The online service does not generate thumbnails, consult a manifest, or write
 the registry. Production deployments must run an offline thumbnail batch; the
 on-demand worker is not a substitute.
+
+When enabled, `/research/v1` exposes only study-scoped, bounded references to
+published model assets and candidate regions. `/research/v1/mcp` provides the
+same read-only region and similar-slide tools to cBioAgent. The assistant's
+annotation tools (on every provider) create pending proposals in the agent
+action store; the browser applies them through `/annotations/batch` only after
+user approval. Its `wsi_find_regions` tool searches the current slide with
+`WSI_RESEARCH_REGION_MODEL` and stores the ranked regions as a retrieval run;
+`wsi_propose_retrieval_annotations` turns chosen ranks of that run into one
+annotation-batch proposal.
+
+`reef_v2_hoptimus1_keep` scores stored REEF v2 H-optimus-1 tile features,
+mapped into KEEP text space, in a separate worker. Its manifest entries carry
+the slide's internal image ID, which the tile server sends only to that worker;
+API responses, assistant tool output and stored retrieval runs keep only the
+documented region fields. `tools/build_keep_manifest.py` builds such a
+manifest from the slide table's sealed sources and prints counts only.
+
+Semantic search is served by the optional `quiltnet-search` Compose service.
+Start it with `WSI_RESEARCH_EMBEDDING_URL=http://quiltnet-search:8080 docker
+compose --profile research up --build`; the tile server remains the
+authorization boundary and the worker receives only manifest artifact
+references and the interpreted query plan.
 
 Tile and thumbnail responses are private-cacheable and vary on `Authorization`.
 Redis is an optimization only; a cache outage does not change authorization.
@@ -220,6 +266,19 @@ The compose file is a local rehearsal. Configure the same secret, audience,
 and compatible TTL in cBioPortal and this service, and the same
 `WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
 produced.
+
+The optional WSI research assistant is disabled by default. Enable it only in
+an environment with an approved secret manager or a read-only mounted key
+file, set `OPENAI_API_KEY_FILE` to the path visible inside the container, and
+set `WSI_AGENT_ENABLED=true`. The browser receives only the short-lived WSI
+capability; the OpenAI credential stays in the tile-server process. Assistant
+annotation and viewer changes are persisted as pending proposals and require
+explicit approval in the viewer before application.
+
+With `WSI_AGENT_PROVIDER=databricks` the assistant runs through the same
+Agents SDK path against a Databricks model-serving endpoint named by
+`WSI_AGENT_MODEL` (for example `databricks-gpt-5-6-terra`). The workspace
+token stays in the tile-server process and Agents SDK tracing is disabled.
 
 ## Local slide tests
 
