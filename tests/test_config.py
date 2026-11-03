@@ -145,16 +145,6 @@ class TestOtherSettings:
         s = make_settings(RATE_LIMIT_PER_MINUTE="7")
         assert s.cache_miss_rate_limit_per_minute == 7
 
-    def test_test_slide_map_defaults_empty(self):
-        s = make_settings()
-        assert s.test_slide_map == {}
-
-    def test_test_slide_map_reads_json_file(self, tmp_path):
-        map_file = tmp_path / "slide-map.json"
-        map_file.write_text('{"slide-a":"/app/testdata/slide-a.svs"}')
-        s = make_settings(WSI_TEST_SLIDE_MAP_FILE=str(map_file))
-        assert s.test_slide_map == {"slide-a": "/app/testdata/slide-a.svs"}
-
     def test_annotation_database_url_from_env(self):
         s = make_settings(ANNOTATION_DATABASE_URL="postgresql://user:pass@host/db")
         assert s.annotation_database_url == "postgresql://user:pass@host/db"

@@ -10,7 +10,7 @@ def test_failed_open_wakes_all_waiters_and_allows_retry():
     release = threading.Event()
     errors = []
 
-    def fail_open(slide_id, logger):
+    def fail_open(slide_id, logger, **kwargs):
         entered.set()
         release.wait(1)
         raise OSError("open failed")
@@ -44,7 +44,7 @@ def test_same_slide_operations_are_serialized():
     lock = threading.Lock()
     entered = threading.Event()
 
-    def open_slide(slide_id, logger):
+    def open_slide(slide_id, logger, **kwargs):
         return MagicMock(), None
 
     def operation(slide):
@@ -93,7 +93,7 @@ def test_concurrent_cold_open_calls_opener_once():
     release = threading.Event()
     opened = []
 
-    def open_slide(slide_id, logger):
+    def open_slide(slide_id, logger, **kwargs):
         opened.append(slide_id)
         entered.set()
         release.wait(1)
@@ -123,7 +123,7 @@ def test_capacity_one_never_closes_an_active_slide():
     release = threading.Event()
     second_done = threading.Event()
 
-    def open_slide(slide_id, logger):
+    def open_slide(slide_id, logger, **kwargs):
         slide = MagicMock(name=slide_id)
         opened[slide_id] = slide
         return slide, None
@@ -152,3 +152,37 @@ def test_capacity_one_never_closes_an_active_slide():
 
     assert second_done.is_set()
     assert opened["a"].close.called
+
+
+def test_cold_open_reads_the_source_etag_and_opens_against_it():
+    slide = MagicMock()
+    with (
+        patch("app.slides._source_etag", return_value='"etag-1"') as source_etag,
+        patch("app.slides._open_slide", return_value=(slide, None)) as open_slide,
+        patch("app.slides.cache_lease_for_slide", return_value=None) as lease,
+    ):
+        cache = SlideCache(1)
+        assert cache.run("s3://bucket/slide.svs", lambda value: value) is slide
+        assert cache.run("s3://bucket/slide.svs", lambda value: value) is slide
+
+    # One HEAD per cold open; a cached handle is reused without another.
+    source_etag.assert_called_once_with("s3://bucket/slide.svs")
+    lease.assert_called_once_with("s3://bucket/slide.svs", '"etag-1"')
+    open_slide.assert_called_once_with("s3://bucket/slide.svs", ANY, etag='"etag-1"')
+
+
+def test_repair_purges_the_cache_of_the_etag_it_was_opened_at():
+    with (
+        patch("app.slides._source_etag", side_effect=['"old"', '"new"']),
+        patch("app.slides._open_slide", return_value=(MagicMock(), None)) as open_slide,
+        patch("app.slides.cache_lease_for_slide", return_value=None),
+        patch("app.slides.purge_slide_cache") as purge,
+    ):
+        cache = SlideCache(1)
+        cache.run("s3://bucket/slide.svs", lambda value: value)
+        assert cache.repair("s3://bucket/slide.svs")
+        cache.run("s3://bucket/slide.svs", lambda value: value)
+
+    purge.assert_any_call("s3://bucket/slide.svs", '"old"')
+    # The reopened handle belongs to the new object.
+    assert open_slide.call_args_list[-1].kwargs == {"etag": '"new"'}

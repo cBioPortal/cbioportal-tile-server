@@ -308,6 +308,24 @@ class TestTransientSourceFailures:
         assert run.call_count == 2
         repair.assert_called_once_with("s3://bucket/slide.svs")
 
+    def test_source_replaced_in_place_is_reopened_not_retried(self):
+        from s3fs.utils import FileExpired
+
+        slides = object.__new__(main_module.SlideCache)
+        # FileExpired is an EBUSY OSError, which would otherwise read as transient.
+        error = FileExpired(filename="bucket/slide.svs", e_tag='"old"')
+        with (
+            patch.object(main_module, "_slides", slides),
+            patch.object(main_module.SlideCache, "run", side_effect=[error, b"jpeg"]) as run,
+            patch.object(main_module.SlideCache, "repair", return_value=True) as repair,
+        ):
+            assert main_module._run_slide_operation(
+                "s3://bucket/slide.svs", lambda _: None
+            ) == b"jpeg"
+
+        assert run.call_count == 2
+        repair.assert_called_once_with("s3://bucket/slide.svs")
+
     @pytest.mark.parametrize("error", [BlocksizeMismatchError("wrong block size"), TiffFileError("bad cache")])
     def test_cache_read_error_is_repaired_and_retried(self, error):
         slides = object.__new__(main_module.SlideCache)
@@ -382,27 +400,10 @@ class TestTransientSourceFailures:
             result = main_module._run_slide_operation(
                 "s3://bucket/slide.svs",
                 lambda _: None,
-                source_fingerprint="a" * 64,
             )
 
         assert result == b"jpeg"
         direct.assert_called_once()
-
-    def test_fingerprint_is_passed_to_slide_cache_namespace(self):
-        slides = object.__new__(main_module.SlideCache)
-        with (
-            patch.object(main_module, "_slides", slides),
-            patch.object(main_module.SlideCache, "run", return_value=b"jpeg") as run,
-        ):
-            assert main_module._run_slide_operation(
-                "s3://bucket/slide.svs",
-                lambda _: None,
-                source_fingerprint="a" * 64,
-            ) == b"jpeg"
-
-        assert run.call_args.kwargs["cache_identity"] == main_module.source_cache_identity(
-            "s3://bucket/slide.svs", "a" * 64
-        )
 
 
 class TestThumbnailFetchRetry:
@@ -651,6 +652,12 @@ class TestSourceBinding:
             f"study-a\0{SLIDE_KEY}",
         ]
 
+    def test_rate_limit_scope_includes_the_resource_when_named(self):
+        claims = {"study_id": "study-a", "slide_key": SLIDE_KEY}
+        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0{SLIDE_KEY}"
+        claims["resource_id"] = "WSI_SAMPLE"
+        assert main_module._slide_rate_limit_scope(claims) == f"study-a\0WSI_SAMPLE\0{SLIDE_KEY}"
+
     @pytest.mark.asyncio
     async def test_metrics_bypasses_capability_guard(self):
         scope = {
@@ -694,8 +701,6 @@ class TestSourceBinding:
             ("tile", {"tile_source": "s3://slides/slide-a.svs?versionId=1"}),
             ("thumbnail", {"thumbnail_source": "s3://thumbs/../private/slide-a.jpg"}),
             ("tile", {"tile_source": "s3://user:pass@slides/slide-a.svs"}),
-            # Labelled MRN.
-            ("thumbnail", {"thumbnail_source": "s3://thumbs/MRN-12345678.jpg"}),
             # Unsupported schemes.
             ("tile", {"tile_source": "https://slides/slide-a.svs"}),
             ("tile", {"tile_source": "gs://slides/slide-a.svs"}),
@@ -743,7 +748,7 @@ class TestCapabilityRoutes:
 
         assert response.status_code == 200
         assert response.content == b"image"
-        assert cached.await_args.args[0] == main_module.source_cache_identity(expected)
+        assert cached.await_args.args[0] == main_module.source_digest(expected)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("path", ["/tiles/zxy/0/0/0", "/thumbnails"])
@@ -788,4 +793,4 @@ class TestCapabilityRoutes:
                 )
 
         assert response.status_code == 200
-        assert get_tile.await_args.args[0] == main_module.source_cache_identity(TILE_SOURCE)
+        assert get_tile.await_args.args[0] == main_module.source_digest(TILE_SOURCE)

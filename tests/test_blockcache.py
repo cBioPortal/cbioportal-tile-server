@@ -54,19 +54,6 @@ def test_slide_cache_directory_is_private_to_worker_and_block_size(tmp_path, mon
     assert second.name.startswith("b1048576-p202-")
 
 
-def test_source_fingerprint_uses_a_distinct_cache_namespace(tmp_path, monkeypatch):
-    monkeypatch.setattr(blockcache.settings, "blockcache_path", str(tmp_path))
-    monkeypatch.setattr(blockcache.settings, "blockcache_block_size", 1_048_576)
-    source = "s3://bucket/slide.svs"
-
-    first = blockcache.cache_directory_for_slide(source, "a" * 64)
-    second = blockcache.cache_directory_for_slide(source, "b" * 64)
-
-    assert first != second
-    assert first.parent == tmp_path
-    assert second.parent == tmp_path
-
-
 def test_purge_removes_one_cache_directory(tmp_path):
     manager = BlockCacheManager(str(tmp_path), max_bytes=8192, prune_interval_seconds=60)
     cache_dir = tmp_path / "slide-cache"
@@ -76,3 +63,16 @@ def test_purge_removes_one_cache_directory(tmp_path):
     assert manager.purge(cache_dir) is True
     assert not cache_dir.exists()
     assert manager.purge(cache_dir) is False
+
+
+def test_slide_cache_directory_changes_with_the_source_etag(tmp_path, monkeypatch):
+    monkeypatch.setattr(blockcache.settings, "blockcache_path", str(tmp_path))
+    source = "s3://bucket/slide.svs"
+
+    with patch.object(blockcache.os, "getpid", return_value=101):
+        old = blockcache.cache_directory_for_slide(source, '"old"')
+        new = blockcache.cache_directory_for_slide(source, '"new"')
+        legacy = blockcache.cache_directory_for_slide(source)
+
+    assert len({old, new, legacy}) == 3
+    assert old.parent == new.parent == tmp_path

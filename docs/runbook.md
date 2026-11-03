@@ -22,8 +22,8 @@ intrinsic tile metadata, and a `wsi_auth_version=4` token signed with
 real `image_id` and both source URLs encrypted by the data provider with
 AES-256-GCM under the raw 32-byte `WSI_SOURCE_SEAL_KEY` (AAD = `slide_key`).
 cBioPortal stores and forwards it verbatim and cannot decrypt it. The tile
-server opens it, applies `validate_artifact_uri` (scheme, approved prefix,
-extension, identifier checks), and reads only those URLs. v2 and v3 tokens are
+server opens it, applies `check_source_uri` (scheme, approved prefix,
+extension, no traversal), and reads only those URLs. v2 and v3 tokens are
 rejected. Contract: `wsi-serving-v6`
 (`../docs/wsi-deid-slide-key-contract.md`).
 
@@ -51,8 +51,7 @@ REDIS_URL=<password-protected Redis URL>
 ```
 
 The backend should use `wsi.access-token-ttl-seconds=300`. Do not set a tile
-server TTL lower than the backend TTL. `WSI_AUTH_REQUIRED` is retained as a
-legacy configuration key but authentication is mandatory for pixel routes.
+server TTL lower than the backend TTL. Authentication is mandatory for pixel routes.
 The URI prefix allowlists are a de-identification boundary; leave them empty
 only for an isolated non-publishing unit test.
 
@@ -105,10 +104,7 @@ becomes servable only after its thumbnail is published, the study files are
 exported, and cBioPortal core has imported them. See the README's
 "Offline preparation" section for the full contract.
 
-The frontend only requests `/thumbnails` and never uploads artifacts. The
-tile-server `app/thumbnail_worker.py` CLI can be used for development,
-rehearsal, or controlled remediation, but it writes only an object-store
-artifact. It must not be used as the production source of truth.
+The frontend only requests `/thumbnails` and never uploads artifacts.
 
 ## Response and cache policy
 

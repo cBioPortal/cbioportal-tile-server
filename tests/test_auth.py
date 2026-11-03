@@ -6,7 +6,6 @@ import time
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials
 
@@ -16,13 +15,11 @@ from app.auth import (
     validate_scoped_capability,
     decode_source_seal_key,
     decrypt_sealed_claims,
-    source_cache_identity,
-    source_digest,
     validate_wsi_auth_configuration,
     validate_wsi_token,
 )
 
-SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+SLIDE_KEY = "0123456789ab"
 TILE_SOURCE = "s3://slides/slide-a.svs"
 THUMBNAIL_SOURCE = "s3://thumbs/slide-a.jpg"
 SEAL_KEY = bytes(range(32))
@@ -30,7 +27,7 @@ SEAL_KEY_B64 = base64.b64encode(SEAL_KEY).decode()
 
 # Contract test vector (docs/wsi-deid-slide-key-contract.md, V6.1).
 VECTOR_SEAL_KEY_B64 = "8XaidWVtlFzV7hwyAwtTNjN13MNLqnenz5Sy7Y+cbAs="
-VECTOR_SLIDE_KEY = "0123456789abcdef0123456789abcdef"
+VECTOR_SLIDE_KEY = "0123456789ab"
 VECTOR_KEY_HEX = "f176a275656d945cd5ee1c32030b53363375dcc34baa77a7cf94b2ed8f9c6c0b"
 VECTOR_KEY = bytes.fromhex(VECTOR_KEY_HEX)
 VECTOR_PLAINTEXT = (
@@ -39,8 +36,8 @@ VECTOR_PLAINTEXT = (
 )
 VECTOR_ENC = (
     "AAECAwQFBgcICQoLNpOTYnY8HVb-KcPzu1F5HPykr7D0YY_UhVbbyjOFRlxC63fxCt09YO1aYC-phb85"
-    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRa"
-    "9qfr9t209wS7V-LhGl8i"
+    "wDhN5PPPpC0X46RSD0K0bRRgSptRb9wDiqMLtftFQ6VpBGfGILaddEV_s-Zsmpp28fG5Z3XTNWnyoBRT"
+    "AkaMITic3pNdzkC_lpw5"
 )
 
 
@@ -194,7 +191,8 @@ def test_contract_enc_vector_decrypts_to_exact_plaintext():
 @pytest.mark.parametrize(
     ("enc", "seal_key", "slide_key"),
     [
-        (VECTOR_ENC, VECTOR_KEY, "f" * 32),
+        (VECTOR_ENC, VECTOR_KEY, "f" * 12),
+        (VECTOR_ENC, VECTOR_KEY, "0123456789abcdef0123456789abcdef"),
         (VECTOR_ENC, VECTOR_KEY, VECTOR_SLIDE_KEY.upper()),
         # Sealed with another key, including the capability signing secret.
         (VECTOR_ENC, SEAL_KEY, VECTOR_SLIDE_KEY),
@@ -256,7 +254,8 @@ def test_token_must_not_expose_sealed_claims_in_plaintext(claim):
 
 
 @pytest.mark.parametrize(
-    "slide_key", [None, "", "0123456789ABCDEF0123456789ABCDEF", "0" * 31, "0" * 33, 12345]
+    "slide_key",
+    [None, "", "a key", "a/b", "../x", "a.b", "x" * 129, "k\0", 12345],
 )
 def test_malformed_slide_key_is_rejected(slide_key):
     secret = "s" * 32
@@ -266,28 +265,26 @@ def test_malformed_slide_key_is_rejected(slide_key):
         validate(make_token(secret, **claims), secret, "cbioportal-wsi")
 
 
-def test_source_cache_identity_changes_when_manifest_fingerprint_changes():
-    source = "s3://slides/slide-a.svs"
-    assert source_cache_identity(source) == source_digest(source)
-    assert source_cache_identity(source, "a" * 64) != source_cache_identity(source, "b" * 64)
-    assert source_cache_identity(source, "a" * 64) == source_cache_identity(source, "a" * 64)
-
-
-def test_source_fingerprint_is_optional():
+@pytest.mark.parametrize(
+    "slide_key",
+    ["0123456789ab", "0123456789AB", "cycif-roi_17", "k" * 128],
+)
+def test_any_well_formed_resource_key_is_accepted(slide_key):
+    # A capability may name any resource row's serving key; it is bound to the
+    # sealed source as its AAD.
     secret = "s" * 32
-    claims = validate(make_v4_token(secret), secret, "cbioportal-wsi")
-    assert "tile_source_fingerprint" not in claims
+    token = make_v4_token(secret, slide_key=slide_key, resource_id="ANY_RESOURCE")
+    assert validate(token, secret, "cbioportal-wsi")["slide_key"] == slide_key
 
 
-@pytest.mark.parametrize("claim", ["tile_source_fingerprint", "thumbnail_source_fingerprint"])
-def test_malformed_source_fingerprint_is_rejected(claim):
+@pytest.mark.parametrize(
+    "resource_id",
+    ["", "WSI-SAMPLE", "a\0b", "x" * 129, 12345, ["WSI_SAMPLE"]],
+)
+def test_malformed_resource_id_is_rejected(resource_id):
     secret = "s" * 32
-    with pytest.raises(InvalidWsiToken):
-        validate(
-            make_v4_token(secret, **{claim: "not-a-fingerprint"}),
-            secret,
-            "cbioportal-wsi",
-        )
+    with pytest.raises(InvalidWsiToken, match="invalid token resource"):
+        validate(make_v4_token(secret, resource_id=resource_id), secret, "cbioportal-wsi")
 
 
 @pytest.mark.parametrize(
@@ -426,6 +423,7 @@ def test_scoped_capability_rejects_invalid_claims(change):
     {"slide_key": SLIDE_KEY},
     {"enc": "x"},
     {"wsi_auth_version": 4},
+    {"resource_id": "wsi_slides"},
     {"image_id": "slide-a"},
     {"tile_source": TILE_SOURCE},
 ])
@@ -435,6 +433,20 @@ def test_scoped_capability_never_names_a_slide(change):
         validate_scoped_capability(
             make_token(secret, **scoped_claims(**change)), secret, "cbioportal-wsi", ANNOTATION_SCOPES
         )
+
+
+def test_scoped_capability_accepts_the_portal_agent_token():
+    # Shape issued by cBioPortal's /api/wsi/access-token?purpose=agent.
+    secret = "s" * 32
+    token = make_raw_token(
+        secret,
+        {"typ": "JWT", "alg": "HS256"},
+        scoped_claims(scope="agent:chat research:read annotations:read annotations:write"),
+    )
+    claims = validate_scoped_capability(
+        token, secret, "cbioportal-wsi", {"agent:chat", "research:read"}
+    )
+    assert claims["study_id"] == "study-a"
 
 
 def test_scoped_capability_rejects_wrong_signature():

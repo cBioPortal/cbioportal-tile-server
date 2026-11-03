@@ -1,18 +1,17 @@
 """
 Redis tile cache.
 
-Keys:  tile:{cache_identity}:{z}:{x}:{y}
+Keys:  tile:{source_digest}:{z}:{x}:{y}
 Value: raw JPEG bytes
 
 Tiles are immutable so tile TTL is configured separately. A thumbnail cache
-uses the key thumbnail:{cache_identity}:{width}:{height}. The identity is
-source-bound and may include the serving-manifest source fingerprint.
+uses the key thumbnail:{source_digest}:{width}:{height}, where source_digest is a
+digest of the source URI.
 
 Patient hierarchy and all clinical metadata are owned by the cBioPortal
 backend. This cache is limited to source-bound slide tiles and thumbnails.
 """
 
-import json
 import hashlib
 import logging
 import time
@@ -74,13 +73,6 @@ def _tile_key(slide_id: str, z: int, x: int, y: int) -> str:
 
 def _thumb_key(slide_id: str, width: int, height: int) -> str:
     return f"thumbnail:{slide_id}:{width}:{height}"
-
-def _meta_key(slide_id: str) -> str:
-    return f"meta:{slide_id}"
-
-
-def _thumbnail_status_key(slide_id: str, width: int, height: int) -> str:
-    return f"thumbnail-status:{slide_id}:{width}:{height}"
 
 
 def tile_cache_key(slide_id: str, z: int, x: int, y: int) -> str:
@@ -308,23 +300,6 @@ async def allow_cache_miss(subject: str, scope: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _from_json(raw: bytes | None) -> object | None:
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return None
-
-
-async def _redis_get_json(key: str) -> object | None:
-    return _from_json(await _redis_get(key))
-
-
-async def _redis_set_json(key: str, data: object, ttl: int = 0) -> None:
-    await _redis_set(key, json.dumps(data, default=str), ttl=ttl)
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -358,49 +333,3 @@ async def set_thumbnail(
         ttl=settings.thumbnail_cache_ttl if ttl is None else ttl,
     )
 
-
-async def get_thumbnail_status(slide_id: str, width: int, height: int) -> dict | None:
-    value = await _redis_get_json(_thumbnail_status_key(slide_id, width, height))
-    return value if isinstance(value, dict) else None
-
-
-async def set_thumbnail_status(
-    slide_id: str,
-    width: int,
-    height: int,
-    status: dict,
-    ttl: int | None = None,
-) -> None:
-    await _redis_set_json(
-        _thumbnail_status_key(slide_id, width, height),
-        status,
-        ttl=settings.thumbnail_cache_ttl if ttl is None else ttl,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Generic JSON cache (search results, etc.)
-# ---------------------------------------------------------------------------
-
-async def get_raw(key: str) -> object | None:
-    value = await _redis_get_json(key)
-    CACHE_REQUESTS.labels(kind="search", result="hit" if value is not None else "miss").inc()
-    return value
-
-
-async def set_raw(key: str, data: object, ttl: int = 300) -> None:
-    await _redis_set_json(key, data, ttl=ttl)
-
-
-# ---------------------------------------------------------------------------
-# Slide metadata cache
-# ---------------------------------------------------------------------------
-
-async def get_metadata(slide_id: str) -> dict | None:
-    value = await _redis_get_json(_meta_key(slide_id))
-    CACHE_REQUESTS.labels(kind="metadata", result="hit" if value is not None else "miss").inc()
-    return value
-
-
-async def set_metadata(slide_id: str, data: dict) -> None:
-    await _redis_set_json(_meta_key(slide_id), data, ttl=settings.metadata_cache_ttl)

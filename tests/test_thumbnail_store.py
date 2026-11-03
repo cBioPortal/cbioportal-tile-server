@@ -49,7 +49,6 @@ class TestThumbnailStore:
 
     def test_s3_read_falls_back_to_fsspec_after_direct_client_failure(self, monkeypatch):
         record = thumbnail_store.ThumbnailRecord(
-            image_id="2907269",
             uri="s3://bucket/2907269.jpg",
             width=128,
             height=88,
@@ -76,7 +75,6 @@ class TestThumbnailStore:
     def test_payload_passthrough_for_display_sized_variant(self):
         thumb_bytes = _jpeg_bytes((128, 79))
         record = thumbnail_store.ThumbnailRecord(
-            image_id="1492807",
             uri="s3://bucket/1492807.jpg",
             width=128,
             height=79,
@@ -89,35 +87,20 @@ class TestThumbnailStore:
         assert result == thumb_bytes
         assert status == {"status": "ok", "reason": "master"}
 
-    def test_returns_master_bytes_without_upscaling(self, tmp_path, monkeypatch):
+    def test_returns_master_bytes_without_upscaling(self):
         thumb_bytes = _jpeg_bytes((1024, 512))
-        thumb_path = tmp_path / "1492807.jpg"
-        thumb_path.write_bytes(thumb_bytes)
-        record = thumbnail_store.ThumbnailRecord(
-            image_id="1492807",
-            uri=str(thumb_path),
-            width=1024,
-            height=512,
-        )
-        monkeypatch.setattr(thumbnail_store.settings, "jpeg_quality", 85)
+        record = thumbnail_store.ThumbnailRecord(uri="s3://bucket/1492807.jpg", width=1024, height=512)
 
-        result, status = thumbnail_store.render_thumbnail_response(record, 2048, 2048)
+        result, status = thumbnail_store.render_thumbnail_payload(thumb_bytes, record, 2048, 2048)
 
         assert result == thumb_bytes
         assert status == {"status": "ok", "reason": "master"}
 
-    def test_downsizes_master_for_smaller_requests(self, tmp_path, monkeypatch):
-        thumb_path = tmp_path / "1492807.jpg"
-        thumb_path.write_bytes(_jpeg_bytes((1024, 512)))
-        record = thumbnail_store.ThumbnailRecord(
-            image_id="1492807",
-            uri=str(thumb_path),
-            width=1024,
-            height=512,
-        )
+    def test_downsizes_master_for_smaller_requests(self, monkeypatch):
+        record = thumbnail_store.ThumbnailRecord(uri="s3://bucket/1492807.jpg", width=1024, height=512)
         monkeypatch.setattr(thumbnail_store.settings, "jpeg_quality", 85)
 
-        result, status = thumbnail_store.render_thumbnail_response(record, 256, 256)
+        result, status = thumbnail_store.render_thumbnail_payload(_jpeg_bytes((1024, 512)), record, 256, 256)
 
         image = Image.open(BytesIO(result))
         assert image.size == (256, 128)
