@@ -20,7 +20,8 @@ def make_settings(**env):
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
                                    "CORS_", "CACHE_", "PATIENT_", "WSI_",
-                                   "IMAGE_", "SLIDE_S3_"))}
+                                   "IMAGE_", "SLIDE_S3_", "ANNOTATION_",
+                                   "KEYCLOAK_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         with patch("app.config._aws_profile", return_value=""):
@@ -143,6 +144,10 @@ class TestOtherSettings:
     def test_cache_miss_rate_limit_accepts_legacy_alias(self):
         s = make_settings(RATE_LIMIT_PER_MINUTE="7")
         assert s.cache_miss_rate_limit_per_minute == 7
+
+    def test_annotation_database_url_from_env(self):
+        s = make_settings(ANNOTATION_DATABASE_URL="postgresql://user:pass@host/db")
+        assert s.annotation_database_url == "postgresql://user:pass@host/db"
 
     def test_cors_origins_parsed(self):
         s = make_settings(CORS_ORIGINS="https://a.example.com,https://b.example.com")

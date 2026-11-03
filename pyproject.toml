@@ -37,6 +37,10 @@ dependencies = [
 
     # Observability (optional but useful)
     "prometheus-fastapi-instrumentator>=7.0.0",
+
+    # Annotation API storage
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
 ]
 
 [dependency-groups]
