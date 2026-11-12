@@ -41,7 +41,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.auth import InvalidWsiToken, decode_source_seal_key, decrypt_sealed_claims  # noqa: E402
+from app.auth import InvalidSealedSource, decode_source_seal_key, decrypt_sealed_claims  # noqa: E402
 from app.sealed_source import SLIDE_KEY_PATTERN  # noqa: E402
 
 MODEL_ID = "reef_v2_hoptimus1_keep"
@@ -124,7 +124,7 @@ def build_rows(
             continue
         try:
             claims = decrypt_sealed_claims(row.get("sealed_source"), seal_key, slide_key)
-        except InvalidWsiToken:
+        except InvalidSealedSource:
             counts["skipped_unsealable"] += 1
             continue
         image_id = image_id_from_source(claims["tile_source"])
@@ -204,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         seal_key = read_seal_key(args.seal_key_env_file)
-    except InvalidWsiToken:
+    except InvalidSealedSource:
         print("WSI_SOURCE_SEAL_KEY is missing or invalid", file=sys.stderr)
         return 2
     wds_image_ids = (

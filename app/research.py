@@ -24,14 +24,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .auth import scoped_user_dependency
+from .study_auth import study_scope_dependency
 from .config import settings
 from .query_planner import build_query_plan
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/research/v1", tags=["wsi-research"])
-_READ_USER = Depends(scoped_user_dependency({"research:read"}))
+_READ_USER = Depends(study_scope_dependency({"research:read"}))
 _manifest_lock = asyncio.Lock()
 _manifest_cache: tuple[str, float, dict[str, Any]] | None = None
 _rate_lock = asyncio.Lock()

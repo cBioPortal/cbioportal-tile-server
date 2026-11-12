@@ -24,7 +24,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from .auth import require_user
+from .study_auth import require_user
 from .sealed_source import SLIDE_KEY_PATTERN
 from .config import settings
 from .annotation_db import close_pool, connection, migrate, open_pool

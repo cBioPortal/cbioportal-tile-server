@@ -71,7 +71,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import annotations as annotation_store
-from .auth import scoped_user_dependency
+from .study_auth import study_scope_dependency
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
 from .sealed_source import SLIDE_KEY_PATTERN
@@ -86,10 +86,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
 _AGENT_READ_USER = Depends(
-    scoped_user_dependency({"agent:chat", "research:read", "annotations:read"})
+    study_scope_dependency({"agent:chat", "research:read", "annotations:read"})
 )
 _AGENT_READ_WRITE_USER = Depends(
-    scoped_user_dependency({"annotations:read", "annotations:write"})
+    study_scope_dependency({"annotations:read", "annotations:write"})
 )
 
 _db_path = ""
