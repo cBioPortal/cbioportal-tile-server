@@ -23,13 +23,15 @@ def test_tile_server_has_no_databricks_code():
     ):
         assert not (ROOT / "tools" / filename).exists()
     # The assistant may call a Databricks model-serving endpoint through the
-    # OpenAI client (app/agent.py, configured in app/config.py); no module may
-    # use a Databricks SDK, connector or REST job/SQL API.
+    # OpenAI client (app/agent.py, configured in app/config.py), and the
+    # annotation pool may fetch a Lakebase database credential from the
+    # workspace REST API (app/lakebase_credentials.py); no module may use a
+    # Databricks SDK, connector or REST job/SQL API.
     forbidden = re.compile(
         r"^\s*(?:from|import)\s+(?:databricks|pyspark|dbutils)\b|/api/2\.\d/(?:jobs|sql)",
         re.MULTILINE,
     )
-    provider_modules = {"agent.py", "config.py"}
+    provider_modules = {"agent.py", "config.py", "lakebase_credentials.py"}
     for path in (ROOT / "app").glob("*.py"):
         text = path.read_text(encoding="utf-8")
         assert not forbidden.search(text), path.name

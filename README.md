@@ -477,6 +477,11 @@ request's user; it calls no companion route over HTTP.
 | `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path |
 | `ANNOTATION_DB_POOL_MIN_SIZE` / `ANNOTATION_DB_POOL_MAX_SIZE` | `1` / `8` | Postgres pool size per worker |
 | `ANNOTATION_DB_COMMAND_TIMEOUT` | `30` | Postgres statement timeout, seconds |
+| `ANNOTATION_DB_MAX_INACTIVE_CONNECTION_LIFETIME` | `300` | Close a pooled Postgres connection idle this many seconds |
+| `ANNOTATION_DB_MAX_CONNECTION_AGE_SECONDS` | `1800` | Replace every pooled connection once the pool's connections are this old (`0` = never); keep it below the credential lifetime |
+| `ANNOTATION_DATABASE_PASSWORD_PROVIDER` | — | `databricks`: log in with a Lakebase database credential (an OAuth token, about 1 h) fetched for each new connection instead of the DSN's password |
+| `ANNOTATION_LAKEBASE_INSTANCE` | — | Lakebase database instance name(s), comma-separated, for that credential |
+| `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET` | — | Workspace and service principal that request the credential (OAuth machine-to-machine); `DATABRICKS_TOKEN` instead of the client pair is accepted |
 | `ANNOTATION_ALLOW_ANONYMOUS` | `false` | Development only: accept requests without `X-Auth-Request-User` |
 | `ANNOTATION_ANONYMOUS_USER` | `anonymous` | The user those requests act as |
 | `COMPANION_ALLOWED_ORIGINS` | — | Comma-separated origins, besides the request's own host, allowed to send unsafe requests |
@@ -508,6 +513,14 @@ request's user; it calls no companion route over HTTP.
 
 The companion needs none of the pixel settings (seal key, object storage,
 Redis).
+
+With the Lakebase provider, `ANNOTATION_DATABASE_URL` names the host,
+database and the service principal's Postgres role (its client ID) with no
+password, for example
+`postgresql://<client-id>@<instance-host>:5432/<database>?sslmode=require`.
+The credential is generated through the workspace REST API
+(`POST /api/2.0/database/credentials`) and cached until five minutes before it
+expires; neither it nor the client secret is logged.
 
 ### ingress-nginx
 
