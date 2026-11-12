@@ -488,7 +488,7 @@ request's user; it calls no companion route over HTTP.
 | `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
 | `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
 | `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
-| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant; every `/agent` route but `/agent/health` answers `404` while it is off |
 | `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
 | `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
 | `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
@@ -501,7 +501,7 @@ request's user; it calls no companion route over HTTP.
 | `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
 | `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
 | `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
-| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
+| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval; `/research/v1` routes but `/research/v1/health` answer `404` while it is off |
 | `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
 | `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
 | `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |

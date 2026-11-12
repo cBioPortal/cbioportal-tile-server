@@ -88,6 +88,15 @@ router = APIRouter(prefix="/agent", tags=["agent"])
 # The proxy-asserted user and study (app.request_identity).
 _USER = Depends(require_user)
 
+
+def _require_agent_enabled() -> None:
+    """404 for every assistant route but /health unless WSI_AGENT_ENABLED."""
+    if not settings.agent_enabled:
+        raise HTTPException(status_code=404, detail="WSI research assistant is disabled")
+
+
+_ENABLED = [Depends(_require_agent_enabled)]
+
 _db_path = ""
 _db_url = ""
 _rate_lock = asyncio.Lock()
@@ -2400,15 +2409,11 @@ async def agent_health() -> dict[str, Any]:
     }
 
 
-@router.post("/chat")
+@router.post("/chat", dependencies=_ENABLED)
 async def agent_chat(
     request: ChatRequest,
     user: dict[str, Any] = _USER,
 ) -> StreamingResponse:
-    if not settings.agent_enabled:
-        raise HTTPException(
-            status_code=404, detail="WSI research assistant is disabled"
-        )
     if not _provider_configured():
         raise HTTPException(
             status_code=503, detail="WSI research assistant is not configured"
@@ -2427,7 +2432,7 @@ async def agent_chat(
     )
 
 
-@router.get("/actions", response_model=list[AgentAction])
+@router.get("/actions", response_model=list[AgentAction], dependencies=_ENABLED)
 async def list_agent_actions(
     session_id: str = Query(..., min_length=1, max_length=128),
     user: dict[str, Any] = _USER,
@@ -2630,7 +2635,7 @@ async def _commit_annotations(
         await db.close()
 
 
-@router.post("/actions/{action_id}/apply", response_model=AgentAction)
+@router.post("/actions/{action_id}/apply", response_model=AgentAction, dependencies=_ENABLED)
 async def apply_agent_action(
     action_id: str,
     user: dict[str, Any] = _USER,
@@ -2647,6 +2652,7 @@ async def apply_agent_action(
 @router.post(
     "/actions/{action_id}/commit-annotations",
     response_model=AgentCommitResponse,
+    dependencies=_ENABLED,
 )
 async def commit_agent_annotations(
     action_id: str,
@@ -2660,7 +2666,7 @@ async def commit_agent_annotations(
     return await _commit_annotations(action_id, user["sub"], request)
 
 
-@router.post("/actions/{action_id}/reject", response_model=AgentAction)
+@router.post("/actions/{action_id}/reject", response_model=AgentAction, dependencies=_ENABLED)
 async def reject_agent_action(
     action_id: str,
     user: dict[str, Any] = _USER,
@@ -2668,7 +2674,7 @@ async def reject_agent_action(
     return await _transition_action(action_id, user, "pending", "rejected")
 
 
-@router.post("/actions/{action_id}/complete", response_model=AgentAction)
+@router.post("/actions/{action_id}/complete", response_model=AgentAction, dependencies=_ENABLED)
 async def complete_agent_action(
     action_id: str,
     outcome: ActionOutcome,
