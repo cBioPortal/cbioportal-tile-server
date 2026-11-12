@@ -93,7 +93,7 @@ class TestMaxZoom:
         }
         assert validate_tile_metadata(metadata) == (False, "missing_safe_min_level")
 
-    def test_schema_null_metadata_remains_legacy_compatible(self):
+    def test_schema_null_metadata_is_accepted(self):
         assert validate_tile_metadata(
             {
                 "dimensions": {"width": 256, "height": 256},

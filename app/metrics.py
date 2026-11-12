@@ -100,7 +100,7 @@ THUMBNAIL_FETCH_QUEUE_SECONDS = Histogram(
 )
 THUMBNAIL_RESIZE_SECONDS = Histogram(
     "tile_server_thumbnail_resize_seconds",
-    "Time spent resizing a fetched thumbnail.",
+    "Time spent fitting a fetched thumbnail to the requested size.",
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, float("inf")),
 )
 THUMBNAIL_FETCH_ERRORS = Counter(

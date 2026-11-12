@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Benchmark one authenticated WSI viewer session.
 
-The access JSON is the response from cBioPortal's slide access endpoint. It
-must contain ``accessToken`` and ``tileMetadata``; the tile source travels
-sealed inside the v4 token. The token is read only in memory and is never
-included in the benchmark output.
+The access JSON describes one slide's resource row: it must contain
+``studyId``, ``key``, ``enc`` (the row's sealed source) and ``tileMetadata``.
+Behind the ingress, set ``WSI_BENCH_COOKIE`` to the browser's session cookie
+(for example ``SESSION=...``) so the ingress authorizes the study. The sealed
+source and cookie are held only in memory and never included in the output.
 
 Example::
 
-    python bench/single_user_pan_bench.py \
+    WSI_BENCH_COOKIE='SESSION=...' python bench/single_user_pan_bench.py \
         --base-url https://beta.cbioportal.mskcc.org/wsi \
         --access-json /secure/path/access.json \
         --center-x 33864 --center-y 23365
@@ -21,6 +22,7 @@ import asyncio
 import importlib.util
 import json
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -54,15 +56,16 @@ def percentile(values: list[float], fraction: float) -> float | None:
     return ordered[index]
 
 
-def read_access(path: Path) -> tuple[str, dict[str, Any]]:
+def read_access(path: Path) -> tuple[dict[str, str], dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    token = payload.get("accessToken")
+    slide = {name: payload.get(name) for name in ("studyId", "key", "enc")}
     metadata = payload.get("tileMetadata")
-    if not isinstance(token, str) or not token:
-        raise ValueError("access JSON is missing accessToken")
+    for name, value in slide.items():
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"access JSON is missing {name}")
     if not isinstance(metadata, dict):
         raise ValueError("access JSON is missing tileMetadata")
-    return token, metadata
+    return slide, metadata
 
 
 def viewport_tiles(
@@ -143,6 +146,7 @@ async def run_phase(
     base_url: str,
     tiles: list[tuple[int, int, int]],
     concurrency: int,
+    slide: dict[str, str],
 ) -> dict[str, Any]:
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -151,7 +155,9 @@ async def run_phase(
         async with semaphore:
             started = time.perf_counter()
             try:
-                response = await client.get(f"{base_url}/tiles/zxy/{z}/{x}/{y}")
+                response = await client.get(
+                    f"{base_url}/tiles/zxy/{z}/{x}/{y}", params=slide
+                )
                 return {
                     "status": response.status_code,
                     "latency_ms": (time.perf_counter() - started) * 1000,
@@ -199,13 +205,13 @@ async def main() -> None:
         args.concurrency,
     ) < 1:
         raise SystemExit("viewport dimensions, tile counts, and concurrency must be positive")
-    token, metadata = read_access(args.access_json)
+    slide, metadata = read_access(args.access_json)
     fit_zoom, fit_tiles, maximum_tiles, pan_bands = build_workload(args, metadata)
     base_url = args.base_url.rstrip("/")
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Origin": "https://beta.cbioportal.mskcc.org",
-    }
+    headers = {"Origin": "https://beta.cbioportal.mskcc.org"}
+    cookie = os.environ.get("WSI_BENCH_COOKIE", "")
+    if cookie:
+        headers["Cookie"] = cookie
     print(
         json.dumps(
             {
@@ -230,13 +236,13 @@ async def main() -> None:
             max_keepalive_connections=args.concurrency,
         ),
     ) as client:
-        print(json.dumps({"phase": "cold_fit_view", **await run_phase(client, base_url, fit_tiles, args.concurrency)}))
-        print(json.dumps({"phase": "cold_max_zoom_viewport", **await run_phase(client, base_url, maximum_tiles, args.concurrency)}))
+        print(json.dumps({"phase": "cold_fit_view", **await run_phase(client, base_url, fit_tiles, args.concurrency, slide)}))
+        print(json.dumps({"phase": "cold_max_zoom_viewport", **await run_phase(client, base_url, maximum_tiles, args.concurrency, slide)}))
         for index, band in enumerate(pan_bands, start=1):
-            print(json.dumps({"phase": f"cold_pan_{index}", **await run_phase(client, base_url, band, args.concurrency)}))
+            print(json.dumps({"phase": f"cold_pan_{index}", **await run_phase(client, base_url, band, args.concurrency, slide)}))
             await asyncio.sleep(0.08)
         replay = maximum_tiles + [tile for band in pan_bands for tile in band]
-        print(json.dumps({"phase": "warm_replay", **await run_phase(client, base_url, replay, args.concurrency)}))
+        print(json.dumps({"phase": "warm_replay", **await run_phase(client, base_url, replay, args.concurrency, slide)}))
 
 
 if __name__ == "__main__":
