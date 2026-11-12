@@ -52,14 +52,14 @@ as a separate application from the same image (see
 3. The ingress authorizes each request before it reaches this service with an
    auth subrequest to cBioPortal's `GET /api/studies/{studyId}`, carrying the
    browser's session cookie. Only requests for a study the user may read are
-   forwarded; a `401` or `403` always comes from the ingress, never from this
-   service.
+   forwarded; a `401` or `403` on a pixel request always comes from the
+   ingress, never from this service.
 4. The service opens `enc` with `WSI_SOURCE_SEAL_KEY` (bound to `key`),
    checks the URLs against the artifact policy, and reads pixels from them in
    object storage.
 
 The tile server never resolves an image ID, queries cBioPortal metadata,
-loads portal data files, or authenticates users. Client-supplied source URLs
+loads portal data files, or authenticates pixel requests. Client-supplied source URLs
 (`?source=` or `X-WSI-Source`) are rejected.
 
 The service must be served same-origin with cBioPortal (for example under
@@ -370,13 +370,13 @@ and a short `proxy_cache_valid 200 30s;`, for the reason above.
 ## Companion service
 
 The same image also runs a second, separate application, `app.companion`,
-which serves slide annotations. The pixel application (`app.main`) serves
-none of its routes.
+which serves slide annotations, the research assistant and research
+retrieval. The pixel application (`app.main`) serves none of its routes.
 
 | Application | Command | Routes |
 |-------------|---------|--------|
 | Pixels | `gunicorn -c python:app.gunicorn_conf app.main:app` (the image's default `CMD`) | `/tiles`, `/thumbnails`, `/health`, `/ready`, `/metrics` |
-| Companion | `gunicorn -c python:app.gunicorn_conf app.companion:app` | `/annotations`, `/health`, `/ready` |
+| Companion | `gunicorn -c python:app.gunicorn_conf app.companion:app` | `/annotations`, `/agent`, `/research/v1`, `/health`, `/ready` |
 
 Both serve the same routes under `/wsi` as well. Run them as separate
 deployments: override the container command for the companion.
@@ -446,14 +446,26 @@ the custom header. Request bodies are capped at `COMPANION_MAX_BODY_BYTES`
 
 ### Companion routes
 
-Every route except `/health` and `/ready` takes `?studyId=<study>`.
+Every route except the health and readiness routes takes `?studyId=<study>`.
+The assistant stores proposals and writes annotations in-process with the
+request's user; it calls no companion route over HTTP.
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see |
 | POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
 | PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
+| POST | `/annotations/batch?studyId=` | Create a bounded group; every item's study must be `studyId` |
 | DELETE | `/annotations/{id}?studyId=` | Delete (creator only) |
+| GET | `/agent/health` | Assistant status (reads no identity) |
+| POST | `/agent/chat?studyId=` | Assistant turn as server-sent events; the body's `context.study_id` must be `studyId`. `WSI_AGENT_ENABLED` |
+| GET | `/agent/actions?studyId=&session_id=` | The user's proposals for the session in the study |
+| POST | `/agent/actions/{id}/{apply,reject,complete}?studyId=` | Decide a proposal; the proposal's study must be `studyId` |
+| POST | `/agent/actions/{id}/commit-annotations?studyId=` | Write a proposal's annotations as the user, in the same transaction that completes it |
+| GET | `/research/v1/health` | Research status (reads no identity) |
+| GET | `/research/v1/slides/{study}/{slide}/models?studyId=` | Models for a slide; `{study}` must be `studyId`. `WSI_RESEARCH_ENABLED` |
+| POST | `/research/v1/slides/{study}/{slide}/{region-search,similar-slides}?studyId=` | Retrieval; `{study}` must be `studyId` |
+| POST | `/research/v1/mcp?studyId=` | JSON-RPC tools for cBioAgent; `arguments.study_id` must be `studyId` |
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness: annotation storage reachable |
 
@@ -475,6 +487,29 @@ Every route except `/health` and `/ready` takes `?studyId=<study>`.
 | `COMPANION_ALLOWED_ORIGINS` | — | Comma-separated origins, besides the request's own host, allowed to send unsafe requests |
 | `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
 | `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
+| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant; every `/agent` route but `/agent/health` answers `404` while it is off |
+| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
+| `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
+| `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
+| `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
+| `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
+| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_MODEL` | `BEDROCK_AGENT_MODEL` | Assistant model for any provider: Bedrock model ID, OpenAI model, or Databricks serving endpoint name |
+| `DATABRICKS_HOST` | profile `host` | Workspace URL for `WSI_AGENT_PROVIDER=databricks`; the OpenAI Responses API is called at `<host>/serving-endpoints` |
+| `DATABRICKS_TOKEN` / `DATABRICKS_TOKEN_FILE` | profile `token` | Workspace token (or a file holding it) for the Databricks provider |
+| `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
+| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
+| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
+| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval; `/research/v1` routes but `/research/v1/health` answer `404` while it is off |
+| `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
+| `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
+| `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |
+| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal region retrieval worker URL (the QuiltNet worker is the `research` Compose profile) |
+| `WSI_RESEARCH_EMBEDDING_URLS` | — | Optional per-model worker URLs, `model=url,model=url`; other models use `WSI_RESEARCH_EMBEDDING_URL` |
+| `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
+| `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
+| `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
 
 The companion needs none of the pixel settings (seal key, object storage,
 Redis).
@@ -502,7 +537,11 @@ metadata:
     nginx.ingress.kubernetes.io/auth-method: GET
     nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Study"
     # No auth cache: a write or logout must take effect at once.
+    # The assistant's chat carries a viewport image of up to ~2.8 MB.
     nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    # Server-sent events from /agent/chat.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
     nginx.ingress.kubernetes.io/enable-access-log: "false"
 spec:
   ingressClassName: nginx
@@ -511,6 +550,16 @@ spec:
       http:
         paths:
           - path: /wsi/annotations
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          # When the assistant and research retrieval are enabled:
+          - path: /wsi/agent/chat
+            pathType: Exact
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          - path: /wsi/agent/actions
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          - path: /wsi/research/v1/slides/
             pathType: Prefix
             backend: {service: {name: wsi-companion, port: {number: 8080}}}
 ---
@@ -536,7 +585,7 @@ Keep `underscores_in_headers` off (the controller default), so
 ### Plain nginx
 
 ```nginx
-location ~ ^/wsi/annotations(/.*)?$ {
+location ~ ^/wsi/(annotations|agent|research)(/.*)?$ {
     if ($wsi_study = "!") {
         return 400;
     }
@@ -551,6 +600,9 @@ location ~ ^/wsi/annotations(/.*)?$ {
     proxy_set_header X-Auth-Request-Study $wsi_auth_study;
     proxy_set_header Cookie "";
     client_max_body_size 4m;
+    # Server-sent events from /agent/chat.
+    proxy_buffering off;
+    proxy_read_timeout 300s;
 }
 
 location = /_wsi_companion_access {
@@ -613,6 +665,32 @@ generate thumbnails or consult a manifest. Production deployments must run an
 offline thumbnail batch; the service never renders a thumbnail from the source
 image.
 
+These routes run in the companion service (see
+[Companion service](#companion-service)). When enabled, `/research/v1`
+exposes only study-scoped, bounded references to
+published model assets and candidate regions. `/research/v1/mcp` provides the
+same read-only region and similar-slide tools to cBioAgent. The assistant's
+annotation tools (on every provider) create pending proposals in the agent
+action store; the browser applies them through `/annotations/batch` only after
+user approval. Its `wsi_find_regions` tool searches the current slide with
+`WSI_RESEARCH_REGION_MODEL` and stores the ranked regions as a retrieval run;
+`wsi_propose_retrieval_annotations` turns chosen ranks of that run into one
+annotation-batch proposal.
+
+`reef_v2_hoptimus1_keep` scores stored REEF v2 H-optimus-1 tile features,
+mapped into KEEP text space, in a separate worker. Its manifest entries carry
+the slide's internal image ID, which the tile server sends only to that worker;
+API responses, assistant tool output and stored retrieval runs keep only the
+documented region fields. `tools/build_keep_manifest.py` builds such a
+manifest from the slide table's sealed sources and prints counts only.
+
+Semantic search is served by the optional `quiltnet-search` Compose service.
+Start it with `WSI_RESEARCH_EMBEDDING_URL=http://quiltnet-search:8080 docker
+compose --profile research up --build`; the companion service remains the
+study boundary and the worker receives only manifest artifact references and
+the interpreted query plan.
+
+
 Tile responses are `private, max-age=3600` and thumbnails
 `private, max-age=300`; both vary on `Cookie`, the credential the ingress
 authorizes on. Redis is an optimization only; a cache outage does not change
@@ -650,6 +728,20 @@ service, so it performs no study authorization; do not expose it. Its
 the identity headers a proxy would set; send them yourself to try it. Use the
 same `WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
 produced.
+
+The optional WSI research assistant is disabled by default. Enable it only in
+an environment with an approved secret manager or a read-only mounted key
+file, set `OPENAI_API_KEY_FILE` to the path visible inside the container, and
+set `WSI_AGENT_ENABLED=true` on the companion service. The browser holds no
+credential for it beyond the portal session; the OpenAI credential stays in
+the companion process. Assistant
+annotation and viewer changes are persisted as pending proposals and require
+explicit approval in the viewer before application.
+
+With `WSI_AGENT_PROVIDER=databricks` the assistant runs through the same
+Agents SDK path against a Databricks model-serving endpoint named by
+`WSI_AGENT_MODEL` (for example `databricks-gpt-5-6-terra`). The workspace
+token stays in the companion process and Agents SDK tracing is disabled.
 
 ## Local slide tests
 

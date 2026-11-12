@@ -1,4 +1,4 @@
-"""Companion service: the annotation API, separate from pixel serving.
+"""Companion service: annotations, the assistant and research retrieval.
 
 Run it from the same image as the tile server::
 
@@ -8,7 +8,10 @@ It trusts ``X-Auth-Request-User`` and ``X-Auth-Request-Study``
 (``app.request_identity``), so it must only be reachable through the
 authenticating reverse proxy: a pod-network Service admitted by a
 NetworkPolicy from the ingress controller alone, never ``hostNetwork``.
-The pixel app (``app.main``) serves none of these routes.
+The pixel app (``app.main``) serves none of these routes.  The assistant
+(``/agent``) and research retrieval (``/research/v1``) answer 404 unless
+``WSI_AGENT_ENABLED`` / ``WSI_RESEARCH_ENABLED`` are set; the assistant
+writes annotations in-process as the request's user.
 
 Every request may carry at most ``COMPANION_MAX_BODY_BYTES``.  Unsafe
 methods (POST, PUT, PATCH, DELETE) must send ``X-Requested-With:
@@ -28,7 +31,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import annotations
+from . import agent, annotations, research
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,8 @@ class CompanionGuard:
 async def lifespan(app: FastAPI):
     await annotations.init_db()
     logger.info("Annotation DB ready (%s)", annotations.storage_kind())
+    await agent.init_db()
+    logger.info("Agent proposal tables ready")
     try:
         yield
     finally:
@@ -148,12 +153,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="WSI companion service",
-    description="Slide annotations for cBioPortal, behind an authenticating proxy.",
+    description=(
+        "Slide annotations, the research assistant and research retrieval for"
+        " cBioPortal, behind an authenticating proxy."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CompanionGuard)
 app.include_router(annotations.router)
+app.include_router(agent.router)
+app.include_router(research.router)
 
 
 @app.get("/health")
@@ -168,6 +178,8 @@ async def ready():
         "service": "companion",
         "annotation_storage": annotations.storage_kind(),
         "anonymous_allowed": settings.annotation_allow_anonymous,
+        "agent_enabled": settings.agent_enabled,
+        "research_enabled": settings.research_enabled,
     }
     try:
         await annotations.ping()

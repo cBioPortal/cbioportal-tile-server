@@ -186,6 +186,103 @@ class Settings:
     companion_max_body_bytes: int = field(
         default_factory=lambda: _env_int("COMPANION_MAX_BODY_BYTES", 4 * 1024 * 1024)
     )
+    annotation_local_development: bool = field(
+        default_factory=lambda: _env_bool("ANNOTATION_LOCAL_DEVELOPMENT", False)
+    )
+    agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
+    agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
+    # WSI_AGENT_MODEL names the model for any provider (a Bedrock model ID,
+    # an OpenAI model, or a Databricks serving endpoint name);
+    # BEDROCK_AGENT_MODEL is read when it is unset.
+    agent_model: str = field(
+        default_factory=lambda: _env_str("WSI_AGENT_MODEL")
+        or _env_str("BEDROCK_AGENT_MODEL", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+    )
+    agent_region: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_REGION", "us-east-1"))
+    agent_profile: str = field(default_factory=lambda: _env_str("BEDROCK_AWS_PROFILE"))
+    agent_api_key_file: str = field(default_factory=lambda: _env_str("OPENAI_API_KEY_FILE"))
+    # WSI_AGENT_PROVIDER=databricks: the workspace serves the OpenAI
+    # Responses API at <host>/serving-endpoints. Host and token come from
+    # these variables, else from a profile of the Databricks CLI config file.
+    databricks_host: str = field(default_factory=lambda: _env_str("DATABRICKS_HOST"))
+    databricks_token: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_TOKEN"), repr=False
+    )
+    databricks_token_file: str = field(default_factory=lambda: _env_str("DATABRICKS_TOKEN_FILE"))
+    databricks_config_file: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_CONFIG_FILE", "~/.databrickscfg")
+    )
+    databricks_config_profile: str = field(
+        default_factory=lambda: _env_str("DATABRICKS_CONFIG_PROFILE", "DEFAULT")
+    )
+    research_enabled: bool = field(default_factory=lambda: _env_bool("WSI_RESEARCH_ENABLED", False))
+    research_manifest_uri: str = field(default_factory=lambda: _env_str("WSI_RESEARCH_MANIFEST_URI"))
+    research_rate_limit_per_minute: int = field(
+        default_factory=lambda: _env_int("WSI_RESEARCH_RATE_LIMIT_PER_MINUTE", 30)
+    )
+    # Region retrieval runs in a separate worker process because its models
+    # and feature tensors are much larger than the pixel-serving workers.
+    research_embedding_url: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URL")
+    )
+    # Optional per-model worker URLs, "model=url,model=url"; a model not
+    # listed here uses WSI_RESEARCH_EMBEDDING_URL.
+    research_embedding_urls: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_URLS")
+    )
+    # The tile-level model used for text-to-region search (the viewer's
+    # region-search default and the assistant's wsi_find_regions tool).
+    research_region_model: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_REGION_MODEL", "quiltnet_pmb")
+    )
+    research_embedding_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS", 60.0)
+    )
+    research_embedding_in_process: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_EMBEDDING_IN_PROCESS", False)
+    )
+    research_static_fallback: bool = field(
+        default_factory=lambda: _env_bool("WSI_RESEARCH_STATIC_FALLBACK", True)
+    )
+    research_embedding_cache_dir: str = field(
+        default_factory=lambda: _env_str("WSI_RESEARCH_EMBEDDING_CACHE_DIR", "/cache/research-embeddings")
+    )
+    research_embedding_cache_max_bytes: int = field(
+        default_factory=lambda: _env_int(
+            "WSI_RESEARCH_EMBEDDING_CACHE_MAX_BYTES", 20 * 1024**3
+        )
+    )
+    quiltnet_prompt_cache_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_PROMPT_CACHE_SIZE", 4096)
+    )
+    quiltnet_score_chunk_size: int = field(
+        default_factory=lambda: _env_int("QUILTNET_SCORE_CHUNK_SIZE", 65_536)
+    )
+    quiltnet_torch_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_THREADS", 2)
+    )
+    quiltnet_torch_interop_threads: int = field(
+        default_factory=lambda: _env_int("QUILTNET_TORCH_INTEROP_THREADS", 1)
+    )
+    quiltnet_max_concurrent_searches: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_CONCURRENT_SEARCHES", 1)
+    )
+    quiltnet_max_queue: int = field(
+        default_factory=lambda: _env_int("QUILTNET_MAX_QUEUE", 8)
+    )
+    quiltnet_queue_timeout_seconds: float = field(
+        default_factory=lambda: _env_float("QUILTNET_QUEUE_TIMEOUT_SECONDS", 30.0)
+    )
+    quiltnet_model_name: str = field(
+        default_factory=lambda: _env_str(
+            "QUILTNET_MODEL_NAME", "hf-hub:wisdomik/QuiltNet-B-16-PMB"
+        )
+    )
+    quiltnet_device: str = field(
+        default_factory=lambda: _env_str("QUILTNET_DEVICE", "auto")
+    )
+    agent_timeout_seconds: float = field(default_factory=lambda: _env_float("WSI_AGENT_TIMEOUT_SECONDS", 60.0))
+    agent_rate_limit_per_minute: int = field(default_factory=lambda: _env_int("WSI_AGENT_RATE_LIMIT_PER_MINUTE", 10))
 
     # CORS
     cors_origins: list[str] = field(
