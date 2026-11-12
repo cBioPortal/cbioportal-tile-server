@@ -35,8 +35,9 @@ def validate_tile_metadata(
 ) -> tuple[bool, str | None]:
     """Return whether metadata is usable by the tile server.
 
-    Schema-null records are retained for the migration window, but an
-    explicitly versioned record must satisfy the complete v2 contract.
+    Schema-null (unversioned) records are accepted with the common checks
+    unless ``allow_legacy`` is false; an explicitly versioned record must
+    satisfy the complete v2 contract.
     """
     if not isinstance(metadata, dict):
         return False, "metadata_not_object"

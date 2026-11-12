@@ -85,10 +85,6 @@ class TestOtherSettings:
         assert make_settings().thumbnail_prewarm_required is False
         assert make_settings(THUMBNAIL_PREWARM_REQUIRED="true").thumbnail_prewarm_required is True
 
-    def test_wsi_auth_max_ttl_reads_environment(self):
-        s = make_settings(WSI_AUTH_MAX_TTL="600")
-        assert s.wsi_auth_max_ttl == 600
-
     def test_release_identity_reads_environment(self):
         s = make_settings(
             WSI_RELEASE_ID="candidate-1",
@@ -140,7 +136,7 @@ class TestOtherSettings:
         )
         assert s.cache_miss_rate_limit_per_minute == 120
 
-    def test_cache_miss_rate_limit_accepts_legacy_alias(self):
+    def test_cache_miss_rate_limit_reads_rate_limit_per_minute_when_unset(self):
         s = make_settings(RATE_LIMIT_PER_MINUTE="7")
         assert s.cache_miss_rate_limit_per_minute == 7
 
