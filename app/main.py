@@ -70,12 +70,6 @@ from .metrics import (
     track_image_operation,
     track_thumbnail_fetch,
 )
-from .annotations import init_db as init_annotation_db
-from .annotations import close_db as close_annotation_db
-from .annotations import router as annotation_router
-from .agent import init_db as init_agent_db
-from .agent import router as agent_router
-from .research import router as research_router
 from .slide_store import UnsafeSourceUri, check_source_uri, is_source_changed_error
 from .slides import SlideCache
 from .thumbnail_store import (
@@ -367,10 +361,6 @@ async def lifespan(app: FastAPI):
         settings.max_open_slides,
         settings.aws_endpoint_url or "AWS default",
     )
-    await init_annotation_db()
-    logger.info("Annotation DB ready: %s", settings.annotation_db_path)
-    await init_agent_db()
-    logger.info("Agent audit DB ready: %s", settings.annotation_db_path)
     try:
         yield
     finally:
@@ -379,7 +369,6 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await blockcache_task
         _slides.close_all()
-        await close_annotation_db()
         await _in_thread(close_runtime_store)
         await tile_cache.close_cache()
 
@@ -402,7 +391,7 @@ async def wsi_namespace(request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET"],
     allow_headers=["*"],
     allow_private_network=True,
     expose_headers=["X-Thumbnail-Status", "X-Thumbnail-Reason", "Retry-After"],
@@ -414,9 +403,6 @@ app.add_middleware(
 TILE_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600", "Vary": "Cookie"}
 THUMB_CACHE_HEADERS = {"Cache-Control": "private, max-age=300", "Vary": "Cookie"}
 PHI_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
-app.include_router(annotation_router)
-app.include_router(agent_router)
-app.include_router(research_router)
 
 
 async def _in_thread(fn, *args):

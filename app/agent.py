@@ -71,7 +71,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import annotations as annotation_store
-from .study_auth import study_scope_dependency
+from .request_identity import require_same_study, require_user
 from .annotation_db import connection, migrate_agent, open_pool
 from .config import settings
 from .sealed_source import SLIDE_KEY_PATTERN
@@ -85,12 +85,8 @@ from .research import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-_AGENT_READ_USER = Depends(
-    study_scope_dependency({"agent:chat", "research:read", "annotations:read"})
-)
-_AGENT_READ_WRITE_USER = Depends(
-    study_scope_dependency({"annotations:read", "annotations:write"})
-)
+# The proxy-asserted user and study (app.request_identity).
+_USER = Depends(require_user)
 
 _db_path = ""
 _db_url = ""
@@ -2391,11 +2387,7 @@ async def _stream_agent(request: ChatRequest, user_sub: str):
 
 
 def _require_study(user: dict[str, Any], study_id: str) -> None:
-    if user.get("study_id") and user["study_id"] != study_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Token study scope does not match request",
-        )
+    require_same_study(user, study_id, "the assistant request's study")
 
 
 @router.get("/health")
@@ -2411,7 +2403,7 @@ async def agent_health() -> dict[str, Any]:
 @router.post("/chat")
 async def agent_chat(
     request: ChatRequest,
-    user: dict[str, Any] = _AGENT_READ_USER,
+    user: dict[str, Any] = _USER,
 ) -> StreamingResponse:
     if not settings.agent_enabled:
         raise HTTPException(
@@ -2438,11 +2430,9 @@ async def agent_chat(
 @router.get("/actions", response_model=list[AgentAction])
 async def list_agent_actions(
     session_id: str = Query(..., min_length=1, max_length=128),
-    study_id: str = Query(..., min_length=1, max_length=200),
-    user: dict[str, Any] = _AGENT_READ_USER,
+    user: dict[str, Any] = _USER,
 ) -> list[AgentAction]:
-    _require_study(user, study_id)
-    return await _list_actions(session_id, user["sub"], study_id)
+    return await _list_actions(session_id, user["sub"], user["study_id"])
 
 
 async def _transition_action(
@@ -2643,7 +2633,7 @@ async def _commit_annotations(
 @router.post("/actions/{action_id}/apply", response_model=AgentAction)
 async def apply_agent_action(
     action_id: str,
-    user: dict[str, Any] = _AGENT_READ_WRITE_USER,
+    user: dict[str, Any] = _USER,
 ) -> AgentAction:
     action = await _get_action(action_id, user["sub"])
     if action and action.action_type in {"create_annotation", "annotation_batch"}:
@@ -2661,7 +2651,7 @@ async def apply_agent_action(
 async def commit_agent_annotations(
     action_id: str,
     request: CommitAnnotationsRequest,
-    user: dict[str, Any] = _AGENT_READ_WRITE_USER,
+    user: dict[str, Any] = _USER,
 ) -> AgentCommitResponse:
     action = await _get_action(action_id, user["sub"])
     if not action:
@@ -2673,7 +2663,7 @@ async def commit_agent_annotations(
 @router.post("/actions/{action_id}/reject", response_model=AgentAction)
 async def reject_agent_action(
     action_id: str,
-    user: dict[str, Any] = _AGENT_READ_USER,
+    user: dict[str, Any] = _USER,
 ) -> AgentAction:
     return await _transition_action(action_id, user, "pending", "rejected")
 
@@ -2682,7 +2672,7 @@ async def reject_agent_action(
 async def complete_agent_action(
     action_id: str,
     outcome: ActionOutcome,
-    user: dict[str, Any] = _AGENT_READ_WRITE_USER,
+    user: dict[str, Any] = _USER,
 ) -> AgentAction:
     return await _transition_action(
         action_id,

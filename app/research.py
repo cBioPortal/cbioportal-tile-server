@@ -24,14 +24,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .study_auth import study_scope_dependency
+from .request_identity import require_same_study, require_user
 from .config import settings
 from .query_planner import build_query_plan
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/research/v1", tags=["wsi-research"])
-_READ_USER = Depends(study_scope_dependency({"research:read"}))
+# The proxy-asserted user and study (app.request_identity).
+_READ_USER = Depends(require_user)
 _manifest_lock = asyncio.Lock()
 _manifest_cache: tuple[str, float, dict[str, Any]] | None = None
 _rate_lock = asyncio.Lock()
@@ -223,8 +224,7 @@ async def _check_rate_limit(user: dict[str, Any]) -> None:
 
 
 def _require_study(user: dict[str, Any], study_id: str) -> None:
-    if user.get("study_id") and user["study_id"] != study_id:
-        raise HTTPException(status_code=403, detail="Token study scope does not match request")
+    require_same_study(user, study_id, "the research request's study")
 
 
 def _region_search_text(region: dict[str, Any]) -> str:

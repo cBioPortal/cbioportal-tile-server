@@ -84,7 +84,9 @@ def main(argv: list[str] | None = None) -> None:
         "ANNOTATION_DB_PATH=/data/annotations.db",
         "# Optional: point annotations at Lakebase/Postgres instead of local SQLite.",
         "# ANNOTATION_DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>?sslmode=require",
-        "ANNOTATION_AUTH_ENABLED=true",
+        "# The companion service trusts X-Auth-Request-User/-Study from the proxy;",
+        "# set true only on a development stack whose proxy forwards no user.",
+        "ANNOTATION_ALLOW_ANONYMOUS=false",
     ]
     output = args.output.expanduser().resolve()
     _write_secure(output, "\n".join(lines) + "\n")

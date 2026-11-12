@@ -24,7 +24,7 @@ def user(
     subject: str,
     *,
     groups: list[str] | None = None,
-    study_id: str | None = "study-1",
+    study_id: str = "study-1",
 ) -> dict:
     return {
         "sub": subject,
@@ -75,7 +75,7 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
     assert created.created_at
     assert created.updated_at
 
-    listed = await annotations.list_annotations(SLIDE_KEY, "study-1", owner)
+    listed = await annotations.list_annotations(SLIDE_KEY, owner)
     assert [item.id for item in listed] == [created.id]
 
     updated = await annotations.update_annotation(
@@ -93,7 +93,7 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
     assert updated.updated_at
 
     await annotations.delete_annotation(created.id, owner)
-    assert await annotations.list_annotations(SLIDE_KEY, "study-1", owner) == []
+    assert await annotations.list_annotations(SLIDE_KEY, owner) == []
 
 
 @pytest.mark.asyncio
@@ -133,17 +133,15 @@ async def test_annotation_visibility_honors_creator_groups_and_public_rows():
     )
     public = await annotations.create_annotation(annotation_input(visible_to=[]), owner)
 
-    outsider_rows = await annotations.list_annotations(
-        SLIDE_KEY, "study-1", user("outsider")
-    )
+    outsider_rows = await annotations.list_annotations(SLIDE_KEY, user("outsider"))
     assert [item.id for item in outsider_rows] == [public.id]
 
     group_rows = await annotations.list_annotations(
-        SLIDE_KEY, "study-1", user("reviewer", groups=["pathology"])
+        SLIDE_KEY, user("reviewer", groups=["pathology"])
     )
     assert {item.id for item in group_rows} == {group.id, public.id}
 
-    owner_rows = await annotations.list_annotations(SLIDE_KEY, "study-1", owner)
+    owner_rows = await annotations.list_annotations(SLIDE_KEY, owner)
     assert {item.id for item in owner_rows} == {private.id, group.id, public.id}
 
 
@@ -158,11 +156,15 @@ async def test_annotation_writes_require_creator_and_matching_study_scope():
         )
     assert wrong_study_create.value.status_code == 403
 
-    with pytest.raises(HTTPException) as wrong_study_list:
-        await annotations.list_annotations(
-            SLIDE_KEY, "study-1", user("owner", study_id="study-2")
+    with pytest.raises(HTTPException) as wrong_study_update:
+        await annotations.update_annotation(
+            created.id, AnnotationUpdate(version=1), user("owner", study_id="study-2")
         )
-    assert wrong_study_list.value.status_code == 403
+    assert wrong_study_update.value.status_code == 403
+
+    with pytest.raises(HTTPException) as wrong_study_delete:
+        await annotations.delete_annotation(created.id, user("owner", study_id="study-2"))
+    assert wrong_study_delete.value.status_code == 403
 
     with pytest.raises(HTTPException) as non_creator_update:
         await annotations.update_annotation(
@@ -184,9 +186,7 @@ async def test_local_development_subject_can_manage_legacy_annotations(monkeypat
 
     await annotations.delete_annotation(created.id, user("local-development"))
 
-    assert await annotations.list_annotations(
-        SLIDE_KEY, "study-1", user("local-development")
-    ) == []
+    assert await annotations.list_annotations(SLIDE_KEY, user("local-development")) == []
 
 
 @pytest.mark.asyncio
@@ -230,7 +230,7 @@ def test_annotations_accept_only_opaque_slide_keys(slide_id):
     app.include_router(annotations.router)
     app.dependency_overrides[annotations.require_user] = lambda: user("owner")
     response = TestClient(app).get(
-        "/annotations", params={"slide_id": slide_id, "study_id": "study-1"}
+        "/annotations", params={"slide_id": slide_id, "studyId": "study-1"}
     )
     assert response.status_code == 422
 

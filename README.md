@@ -8,10 +8,12 @@ cBioPortal frontend.
 At MSK, cBioPortal uses this service to show H&E and IHC whole-slide images
 alongside the patients and samples they were taken from.
 
-The service only handles pixels. It does not know about patients, samples,
-studies, slide hierarchy, or image IDs; cBioPortal owns that metadata, and
-the ingress in front of this service authorizes every request against
-cBioPortal (see [Request flow](#request-flow)).
+The pixel service only handles pixels. It does not know about patients,
+samples, studies, slide hierarchy, or image IDs; cBioPortal owns that
+metadata, and the ingress in front of this service authorizes every request
+against cBioPortal (see [Request flow](#request-flow)). Slide annotations run
+as a separate application from the same image (see
+[Companion service](#companion-service)).
 
 ## What it serves
 
@@ -365,6 +367,244 @@ This example caches nothing. To cache, add `proxy_cache` to the auth
 location with `proxy_cache_key "$cookie_SESSION$http_authorization$wsi_study";`
 and a short `proxy_cache_valid 200 30s;`, for the reason above.
 
+## Companion service
+
+The same image also runs a second, separate application, `app.companion`,
+which serves slide annotations, the research assistant and research
+retrieval. The pixel application (`app.main`) serves none of its routes.
+
+| Application | Command | Routes |
+|-------------|---------|--------|
+| Pixels | `gunicorn -c python:app.gunicorn_conf app.main:app` (the image's default `CMD`) | `/tiles`, `/thumbnails`, `/health`, `/ready`, `/metrics` |
+| Companion | `gunicorn -c python:app.gunicorn_conf app.companion:app` | `/annotations`, `/agent`, `/research/v1`, `/health`, `/ready` |
+
+Both serve the same routes under `/wsi` as well. Run them as separate
+deployments: override the container command for the companion.
+
+### Identity from the proxy
+
+The companion does not authenticate anyone itself. It trusts two request
+headers that an authenticating reverse proxy sets:
+
+1. For every companion request, the proxy makes an auth subrequest to the
+   portal's `GET /api/studies/{studyId}/access`, carrying the browser's
+   `Cookie` (and `Authorization`, if sent). `{studyId}` comes from the
+   request's `studyId` query parameter. The portal answers:
+   - `204` with `X-Auth-Request-User` (the signed-in user; absent when the
+     portal runs without login) and `X-Auth-Request-Study`;
+   - `401` when not signed in;
+   - `403` when the user may not read the study, or the study is unknown.
+2. On `2xx`, the proxy copies `X-Auth-Request-User` and
+   `X-Auth-Request-Study` from the auth response onto the forwarded request,
+   **replacing any copy the client sent**. With ingress-nginx
+   `auth-response-headers` and nginx `auth_request_set` + `proxy_set_header`,
+   a header the portal did not return is sent empty, which drops the
+   client's copy too.
+
+The companion then requires, on every route:
+
+- `X-Auth-Request-Study` present and well formed, else `401`;
+- `studyId` in the query string exactly once (names matched
+  case-insensitively, as nginx does) and equal to `X-Auth-Request-Study`,
+  else `403`;
+- any study the request body names, and the stored row's study for an update
+  or delete, equal to `X-Auth-Request-Study`, else `403`;
+- `X-Auth-Request-User` present, else `401`. Only when
+  `ANNOTATION_ALLOW_ANONYMOUS=true` (development stacks whose portal has no
+  login) does a request without it act as `ANNOTATION_ANONYMOUS_USER`.
+
+An annotation's `created_by` is `X-Auth-Request-User`, and only that user may
+update or delete it.
+
+**Trusted-proxy requirement.** Anyone who can reach the companion without
+going through that proxy can claim any user. Deploy it:
+
+- on the pod network, never `hostNetwork`;
+- behind a Service that a NetworkPolicy opens to the ingress controller's
+  namespace only (no other namespaces, no node ports);
+- with no Ingress rule that reaches it without the auth subrequest. Probe
+  routes (`/health`, `/ready`) read no identity and may be routed without
+  auth.
+
+A client that holds another credential the portal accepts in the auth
+subrequest (HTTP basic, a data-access token) can use the companion as that
+user; that is the portal's own authorization.
+
+### Browser request rules
+
+The portal's session cookie authorizes companion requests, so unsafe methods
+(`POST`, `PUT`, `PATCH`, `DELETE`) must also:
+
+- send `X-Requested-With: XMLHttpRequest`, else `403`;
+- send `Content-Type: application/json` when there is a body, else `415`;
+- send no `Origin`, or one that is the request's own host or is listed in
+  `COMPANION_ALLOWED_ORIGINS`, else `403`.
+
+The companion sends no CORS headers, so a page on another site cannot send
+the custom header. Request bodies are capped at `COMPANION_MAX_BODY_BYTES`
+(`413` above it), and every response is `Cache-Control: private, no-store`.
+
+### Companion routes
+
+Every route except the health and readiness routes takes `?studyId=<study>`.
+The assistant stores proposals and writes annotations in-process with the
+request's user; it calls no companion route over HTTP.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see |
+| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
+| PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
+| POST | `/annotations/batch?studyId=` | Create a bounded group; every item's study must be `studyId` |
+| DELETE | `/annotations/{id}?studyId=` | Delete (creator only) |
+| GET | `/agent/health` | Assistant status (reads no identity) |
+| POST | `/agent/chat?studyId=` | Assistant turn as server-sent events; the body's `context.study_id` must be `studyId`. `WSI_AGENT_ENABLED` |
+| GET | `/agent/actions?studyId=&session_id=` | The user's proposals for the session in the study |
+| POST | `/agent/actions/{id}/{apply,reject,complete}?studyId=` | Decide a proposal; the proposal's study must be `studyId` |
+| POST | `/agent/actions/{id}/commit-annotations?studyId=` | Write a proposal's annotations as the user, in the same transaction that completes it |
+| GET | `/research/v1/health` | Research status (reads no identity) |
+| GET | `/research/v1/slides/{study}/{slide}/models?studyId=` | Models for a slide; `{study}` must be `studyId`. `WSI_RESEARCH_ENABLED` |
+| POST | `/research/v1/slides/{study}/{slide}/{region-search,similar-slides}?studyId=` | Retrieval; `{study}` must be `studyId` |
+| POST | `/research/v1/mcp?studyId=` | JSON-RPC tools for cBioAgent; `arguments.study_id` must be `studyId` |
+| GET | `/health` | Liveness |
+| GET | `/ready` | Readiness: annotation storage reachable |
+
+### Companion configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ANNOTATION_DATABASE_URL` | — | Postgres/Lakebase DSN; SQLite at `ANNOTATION_DB_PATH` when unset |
+| `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path |
+| `ANNOTATION_DB_POOL_MIN_SIZE` / `ANNOTATION_DB_POOL_MAX_SIZE` | `1` / `8` | Postgres pool size per worker |
+| `ANNOTATION_DB_COMMAND_TIMEOUT` | `30` | Postgres statement timeout, seconds |
+| `ANNOTATION_ALLOW_ANONYMOUS` | `false` | Development only: accept requests without `X-Auth-Request-User` |
+| `ANNOTATION_ANONYMOUS_USER` | `anonymous` | The user those requests act as |
+| `COMPANION_ALLOWED_ORIGINS` | — | Comma-separated origins, besides the request's own host, allowed to send unsafe requests |
+| `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
+| `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
+| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
+| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
+| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
+| `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
+| `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
+| `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
+| `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
+| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
+| `WSI_AGENT_MODEL` | `BEDROCK_AGENT_MODEL` | Assistant model for any provider: Bedrock model ID, OpenAI model, or Databricks serving endpoint name |
+| `DATABRICKS_HOST` | profile `host` | Workspace URL for `WSI_AGENT_PROVIDER=databricks`; the OpenAI Responses API is called at `<host>/serving-endpoints` |
+| `DATABRICKS_TOKEN` / `DATABRICKS_TOKEN_FILE` | profile `token` | Workspace token (or a file holding it) for the Databricks provider |
+| `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
+| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
+| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
+| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
+| `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
+| `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
+| `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |
+| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal region retrieval worker URL (the QuiltNet worker is the `research` Compose profile) |
+| `WSI_RESEARCH_EMBEDDING_URLS` | — | Optional per-model worker URLs, `model=url,model=url`; other models use `WSI_RESEARCH_EMBEDDING_URL` |
+| `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
+| `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
+| `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
+
+The companion needs none of the pixel settings (seal key, object storage,
+Redis).
+
+### ingress-nginx
+
+The `$wsi_study` map from [Ingress](#ingress) matches `studyId` on any path,
+so the companion Ingress uses it unchanged:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: wsi-companion
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "http://cbioportal.<namespace>.svc.cluster.local:8080/api/studies/$wsi_study/access"
+    nginx.ingress.kubernetes.io/auth-method: GET
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User,X-Auth-Request-Study"
+    # No auth cache: a write or logout must take effect at once.
+    # The assistant's chat carries a viewport image of up to ~2.8 MB.
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    # Server-sent events from /agent/chat.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: cbioportal.example.org
+      http:
+        paths:
+          - path: /wsi/annotations
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          # When the assistant and research retrieval are enabled:
+          - path: /wsi/agent/chat
+            pathType: Exact
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          - path: /wsi/agent/actions
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          - path: /wsi/research/v1/slides/
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wsi-companion
+spec:
+  podSelector:
+    matchLabels: {app: wsi-companion}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+      ports:
+        - port: 8080
+```
+
+Keep `underscores_in_headers` off (the controller default), so
+`X_Auth_Request_User` cannot stand in for the real header.
+
+### Plain nginx
+
+```nginx
+location ~ ^/wsi/(annotations|agent|research)(/.*)?$ {
+    if ($wsi_study = "!") {
+        return 400;
+    }
+    auth_request /_wsi_companion_access;
+    auth_request_set $wsi_auth_user  $upstream_http_x_auth_request_user;
+    auth_request_set $wsi_auth_study $upstream_http_x_auth_request_study;
+    proxy_pass http://companion:8080;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    # Always set both, so a client's copy never passes through.
+    proxy_set_header X-Auth-Request-User  $wsi_auth_user;
+    proxy_set_header X-Auth-Request-Study $wsi_auth_study;
+    proxy_set_header Cookie "";
+    client_max_body_size 4m;
+    # Server-sent events from /agent/chat.
+    proxy_buffering off;
+    proxy_read_timeout 300s;
+}
+
+location = /_wsi_companion_access {
+    internal;
+    proxy_pass http://portal/api/studies/$wsi_study/access;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header Cookie $http_cookie;
+    proxy_set_header Host $http_host;
+}
+```
+
+A location that sets any `proxy_set_header` inherits none from the server
+block, so each companion location sets both identity headers itself.
+
 ## Runtime configuration
 
 The service needs only pixel storage, the source seal key, and an optional
@@ -402,35 +642,6 @@ Redis cache:
 | `GUNICORN_TIMEOUT` | `180` | Worker request timeout for long cold-slide reads |
 | `BLOCKCACHE_PATH` | — | Optional local range-read cache, namespaced by each source's ETag so a slide rewritten in place never reuses old blocks |
 | `CORS_ORIGINS` | internal cBioPortal origins | Origins allowed uncredentialed cross-origin reads; pixel requests are same-origin, so this is not an access path |
-| `ANNOTATION_DATABASE_URL` | — | Optional Postgres/Lakebase DSN for annotation storage |
-| `ANNOTATION_DB_PATH` | `/data/annotations.db` | SQLite path used when `ANNOTATION_DATABASE_URL` is unset |
-| `ANNOTATION_AUTH_ENABLED` | `true` | Require cBioPortal-issued study tokens on `/annotations`, `/agent` and `/research`; `false` is a dev-only open mode |
-| `WSI_AUTH_SECRET` | — | HS256 secret cBioPortal signs study tokens with (at least 32 bytes). Used only by `/annotations`, `/agent` and `/research`; without it those routes return `503`. Tiles and thumbnails never read it |
-| `WSI_AUTH_PREVIOUS_SECRET` | — | Previous study-token secret, accepted during rotation |
-| `WSI_AUTH_AUDIENCE` | `cbioportal-wsi` | Required `aud` of study tokens |
-| `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Dev-only compatibility for legacy seeded rows under the synthetic local-development subject |
-| `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant |
-| `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
-| `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
-| `BEDROCK_AWS_REGION` | `us-east-1` | Bedrock runtime region |
-| `BEDROCK_AWS_PROFILE` | — | Explicit AWS profile used for Bedrock credentials |
-| `BEDROCK_AWS_ENDPOINT_URL` | Regional Bedrock endpoint | Optional Bedrock runtime endpoint override |
-| `OPENAI_API_KEY_FILE` | — | Secret-mounted file containing the server-side OpenAI key |
-| `WSI_AGENT_MODEL` | `BEDROCK_AGENT_MODEL` | Assistant model for any provider: Bedrock model ID, OpenAI model, or Databricks serving endpoint name |
-| `DATABRICKS_HOST` | profile `host` | Workspace URL for `WSI_AGENT_PROVIDER=databricks`; the OpenAI Responses API is called at `<host>/serving-endpoints` |
-| `DATABRICKS_TOKEN` / `DATABRICKS_TOKEN_FILE` | profile `token` | Workspace token (or a file holding it) for the Databricks provider |
-| `DATABRICKS_CONFIG_FILE` / `DATABRICKS_CONFIG_PROFILE` | `~/.databrickscfg` / `DEFAULT` | Databricks CLI profile used when host or token is unset |
-| `WSI_AGENT_TIMEOUT_SECONDS` | `60` | Maximum model request duration |
-| `WSI_AGENT_RATE_LIMIT_PER_MINUTE` | `10` | Per-user assistant request limit |
-| `WSI_RESEARCH_ENABLED` | `false` | Enable manifest-backed research retrieval |
-| `WSI_RESEARCH_MANIFEST_URI` | — | Local or S3 URI for the published study-qualified research manifest |
-| `WSI_RESEARCH_RATE_LIMIT_PER_MINUTE` | `30` | Per-user region/similar-slide retrieval limit |
-| `WSI_RESEARCH_REGION_MODEL` | `quiltnet_pmb` | Tile-level model for text-to-region search (`quiltnet_pmb` or `reef_v2_hoptimus1_keep`) |
-| `WSI_RESEARCH_EMBEDDING_URL` | — | Internal region retrieval worker URL (the QuiltNet worker is the `research` Compose profile) |
-| `WSI_RESEARCH_EMBEDDING_URLS` | — | Optional per-model worker URLs, `model=url,model=url`; other models use `WSI_RESEARCH_EMBEDDING_URL` |
-| `WSI_RESEARCH_EMBEDDING_TIMEOUT_SECONDS` | `60` | Timeout for semantic retrieval worker calls, including cold model/artifact load |
-| `WSI_RESEARCH_STATIC_FALLBACK` | `true` | Return labeled fallback regions when semantic retrieval is unavailable |
-| `QUILTNET_MODEL_NAME` | `hf-hub:wisdomik/QuiltNet-B-16-PMB` | QuiltNet text encoder used by the retrieval worker |
 
 Thumbnail artifacts are generated offline (see
 [Offline preparation](#offline-preparation)); their dimensions, content
@@ -441,7 +652,9 @@ generate thumbnails or consult a manifest. Production deployments must run an
 offline thumbnail batch; the service never renders a thumbnail from the source
 image.
 
-When enabled, `/research/v1` exposes only study-scoped, bounded references to
+These routes run in the companion service (see
+[Companion service](#companion-service)). When enabled, `/research/v1`
+exposes only study-scoped, bounded references to
 published model assets and candidate regions. `/research/v1/mcp` provides the
 same read-only region and similar-slide tools to cBioAgent. The assistant's
 annotation tools (on every provider) create pending proposals in the agent
@@ -460,16 +673,10 @@ manifest from the slide table's sealed sources and prints counts only.
 
 Semantic search is served by the optional `quiltnet-search` Compose service.
 Start it with `WSI_RESEARCH_EMBEDDING_URL=http://quiltnet-search:8080 docker
-compose --profile research up --build`; the tile server remains the
-study-token boundary and the worker receives only manifest artifact
-references and the interpreted query plan.
+compose --profile research up --build`; the companion service remains the
+study boundary and the worker receives only manifest artifact references and
+the interpreted query plan.
 
-
-Annotation, assistant and research routes require a study-scoped bearer
-token signed by cBioPortal with `WSI_AUTH_SECRET` (HS256, `aud` =
-`WSI_AUTH_AUDIENCE`, at most 300 s). A missing or invalid token returns `401`,
-a valid token without the route's scopes `403`, and an unset secret `503`.
-These tokens are study capabilities only: tiles and thumbnails ignore them.
 
 Tile responses are `private, max-age=3600` and thumbnails
 `private, max-age=300`; both vary on `Cookie`, the credential the ingress
@@ -503,22 +710,25 @@ docker compose up --build
 ```
 
 The compose file is a local rehearsal with no ingress in front of the
-service, so it performs no study authorization; do not expose it. Use the
+service, so it performs no study authorization; do not expose it. Its
+`companion` service listens on `127.0.0.1:${COMPANION_PORT:-8081}` and expects
+the identity headers a proxy would set; send them yourself to try it. Use the
 same `WSI_SOURCE_SEAL_KEY` here and wherever the study's sealed sources were
 produced.
 
 The optional WSI research assistant is disabled by default. Enable it only in
 an environment with an approved secret manager or a read-only mounted key
 file, set `OPENAI_API_KEY_FILE` to the path visible inside the container, and
-set `WSI_AGENT_ENABLED=true`. The browser receives only the short-lived WSI
-capability; the OpenAI credential stays in the tile-server process. Assistant
+set `WSI_AGENT_ENABLED=true` on the companion service. The browser holds no
+credential for it beyond the portal session; the OpenAI credential stays in
+the companion process. Assistant
 annotation and viewer changes are persisted as pending proposals and require
 explicit approval in the viewer before application.
 
 With `WSI_AGENT_PROVIDER=databricks` the assistant runs through the same
 Agents SDK path against a Databricks model-serving endpoint named by
 `WSI_AGENT_MODEL` (for example `databricks-gpt-5-6-terra`). The workspace
-token stays in the tile-server process and Agents SDK tracing is disabled.
+token stays in the companion process and Agents SDK tracing is disabled.
 
 ## Local slide tests
 
