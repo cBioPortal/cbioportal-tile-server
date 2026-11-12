@@ -20,7 +20,7 @@ def make_settings(**env):
                                    "JPEG_", "MAX_", "N_WORKERS", "BLOCKCACHE",
                                    "THUMBNAIL_", "METADATA_", "PATH_",
                                    "CORS_", "CACHE_", "PATIENT_", "WSI_",
-                                   "IMAGE_", "SLIDE_S3_", "ANNOTATION_",
+                                   "IMAGE_", "SLIDE_S3_", "ANNOTATION_", "COMPANION_",
                                    "KEYCLOAK_"))}
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):

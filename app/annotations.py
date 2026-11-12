@@ -1,14 +1,16 @@
 """
 Annotation CRUD with pluggable SQLite or Postgres storage.
 
-Routes:
-  GET    /annotations             list annotations for a slide/study
+Routes (each with ``?studyId=<study>``):
+  GET    /annotations?slide_id=   list a slide's annotations in the study
   POST   /annotations             create a new annotation
   PUT    /annotations/{id}        update (optimistic concurrency via version)
   DELETE /annotations/{id}        delete (creator only)
 
-Auth: all routes require a short-lived, study-scoped capability issued by
-cBioPortal via ``require_user()``.
+Auth: ``require_user()`` takes the user and study the authenticating proxy
+asserted (``app.request_identity``).  The body's study, and the stored
+row's study for an update or delete, must be that study; ``created_by`` is
+the proxy's user.  These routes are served by ``app.companion`` only.
 
 ``slide_id`` carries the opaque slide key, never a pathology image ID; any
 other value is rejected so image IDs cannot reach annotation storage.
@@ -23,7 +25,7 @@ import aiosqlite
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
-from .study_auth import require_user
+from .request_identity import require_same_study, require_user
 from .sealed_source import SLIDE_KEY_PATTERN
 from .config import settings
 from .annotation_db import close_pool, connection, migrate, open_pool
@@ -44,6 +46,21 @@ def _settings_db_url() -> str:
 
 def _storage_kind() -> str:
     return "postgres" if (_db_url or _settings_db_url()) else "sqlite"
+
+
+def storage_kind() -> str:
+    """``postgres`` or ``sqlite``: where annotations are stored."""
+    return _storage_kind()
+
+
+async def ping() -> None:
+    """Run a trivial query against annotation storage; raises if unreachable."""
+    if _storage_kind() == "postgres":
+        async with connection(_get_db_url()) as conn:
+            await conn.fetchval("SELECT 1")
+    else:
+        async with aiosqlite.connect(_get_db_path()) as db:
+            await db.execute("SELECT 1 FROM annotations LIMIT 1")
 
 
 def _get_db_path() -> str:
@@ -389,13 +406,9 @@ async def _delete_postgres(annotation_id: str) -> None:
 @router.get("", response_model=list[AnnotationOut])
 async def list_annotations(
     slide_id: str = Query(..., pattern=SLIDE_KEY_REGEX, description="Opaque slide key"),
-    study_id: str = Query(..., description="cBioPortal study ID"),
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:
-    if user.get("study_id") and user["study_id"] != study_id:
-        raise HTTPException(
-            status_code=403, detail="Token study scope does not match request"
-        )
+    study_id: str = user["study_id"]
     user_sub: str = user["sub"]
     user_groups: set[str] = set(user["groups"])
     if _storage_kind() == "postgres":
@@ -410,10 +423,7 @@ async def create_annotation(
     data: AnnotationIn,
     user: dict = Depends(require_user),
 ) -> AnnotationOut:
-    if user.get("study_id") and user["study_id"] != data.study_id:
-        raise HTTPException(
-            status_code=403, detail="Token study scope does not match request"
-        )
+    require_same_study(user, data.study_id, "the annotation's study")
     if _storage_kind() == "postgres":
         row = await _create_postgres(data, user["sub"])
     else:
@@ -434,10 +444,7 @@ async def update_annotation(
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    if user.get("study_id") and user["study_id"] != existing["study_id"]:
-        raise HTTPException(
-            status_code=403, detail="Token study scope does not match annotation"
-        )
+    require_same_study(user, existing["study_id"], "the annotation's study")
     if existing["created_by"] != user["sub"]:
         raise HTTPException(
             status_code=403, detail="Only the creator may update this annotation"
@@ -513,10 +520,7 @@ async def delete_annotation(
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    if user.get("study_id") and user["study_id"] != existing["study_id"]:
-        raise HTTPException(
-            status_code=403, detail="Token study scope does not match annotation"
-        )
+    require_same_study(user, existing["study_id"], "the annotation's study")
     if existing["created_by"] != user["sub"]:
         raise HTTPException(
             status_code=403, detail="Only the creator may delete this annotation"

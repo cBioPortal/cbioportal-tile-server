@@ -168,18 +168,23 @@ class Settings:
 
     annotation_database_url: str = field(default_factory=lambda: _env_str("ANNOTATION_DATABASE_URL"))
     annotation_db_path: str = field(default_factory=lambda: _env_str("ANNOTATION_DB_PATH", "/data/annotations.db"))
-    annotation_auth_enabled: bool = field(default_factory=lambda: _env_bool("ANNOTATION_AUTH_ENABLED", True))
-    # Study tokens for /annotations (app.study_auth): the HS256 secret
-    # cBioPortal signs them with (at least 32 bytes), an optional previous
-    # secret accepted during rotation, and their audience.
-    wsi_auth_secret: str = field(
-        default_factory=lambda: _env_str("WSI_AUTH_SECRET"), repr=False
+    # Companion service (app.companion). The authenticating proxy sends
+    # X-Auth-Request-User; without it a request is refused unless anonymous
+    # use is allowed (development only), when it acts as this user.
+    annotation_allow_anonymous: bool = field(
+        default_factory=lambda: _env_bool("ANNOTATION_ALLOW_ANONYMOUS", False)
     )
-    wsi_auth_previous_secret: str = field(
-        default_factory=lambda: _env_str("WSI_AUTH_PREVIOUS_SECRET"), repr=False
+    annotation_anonymous_user: str = field(
+        default_factory=lambda: _env_str("ANNOTATION_ANONYMOUS_USER", "anonymous")
     )
-    wsi_auth_audience: str = field(
-        default_factory=lambda: _env_str("WSI_AUTH_AUDIENCE", "cbioportal-wsi")
+    # Origins (scheme://host[:port]) besides the request's own host that may
+    # send unsafe requests to the companion service.
+    companion_allowed_origins: list[str] = field(
+        default_factory=lambda: _env_csv("COMPANION_ALLOWED_ORIGINS", "")
+    )
+    # Largest request body the companion service accepts.
+    companion_max_body_bytes: int = field(
+        default_factory=lambda: _env_int("COMPANION_MAX_BODY_BYTES", 4 * 1024 * 1024)
     )
 
     # CORS

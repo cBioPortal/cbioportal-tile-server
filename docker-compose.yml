@@ -51,11 +51,6 @@ services:
       # ── CORS — add the viewer origin so the browser can reach tile APIs ───
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:3000,https://cbioportal.mskcc.org,https://triage.cbioportal.mskcc.org}
 
-      # ── Annotation API ────────────────────────────────────────────────────
-      ANNOTATION_DATABASE_URL: ${ANNOTATION_DATABASE_URL:-}
-      ANNOTATION_DB_PATH: /data/annotations.db
-      ANNOTATION_AUTH_ENABLED: ${ANNOTATION_AUTH_ENABLED:-true}
-
       # ── Capacity (tune to host RAM; each open SVS ≈ 50–200 MB) ───────────
       MAX_OPEN_SLIDES: ${MAX_OPEN_SLIDES:-1}
       N_WORKERS: ${N_WORKERS:-2}
@@ -71,7 +66,6 @@ services:
       PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-/cache/prometheus}
     volumes:
       - slide_blocks:/cache/slide-blocks
-      - annotation_data:/data
       - ./tests/testdata:/app/testdata:ro
     depends_on:
       redis:
@@ -81,6 +75,32 @@ services:
       resources:
         limits:
           memory: ${APP_MEMORY_LIMIT:-4g}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Annotation API (app.companion), from the same image. It trusts the
+  # X-Auth-Request-User / X-Auth-Request-Study headers an authenticating
+  # proxy sets, so it is published on loopback only; put the proxy described
+  # in the README in front of it.
+  companion:
+    build: .
+    command: ["gunicorn", "-c", "python:app.gunicorn_conf", "app.companion:app"]
+    ports:
+      - "127.0.0.1:${COMPANION_PORT:-8081}:8080"
+    environment:
+      ANNOTATION_DATABASE_URL: ${ANNOTATION_DATABASE_URL:-}
+      ANNOTATION_DB_PATH: /data/annotations.db
+      ANNOTATION_ALLOW_ANONYMOUS: ${ANNOTATION_ALLOW_ANONYMOUS:-false}
+      COMPANION_ALLOWED_ORIGINS: ${COMPANION_ALLOWED_ORIGINS:-}
+      # One worker creates the SQLite schema safely on first start.
+      N_WORKERS: ${COMPANION_WORKERS:-1}
+    volumes:
+      - annotation_data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/ready"]
       interval: 30s
