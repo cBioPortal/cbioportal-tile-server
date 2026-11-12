@@ -81,6 +81,12 @@ def main(argv: list[str] | None = None) -> None:
         "",
         "# ── Isolated S3 thumbnail namespace for development ────────────────",
         "THUMBNAIL_MANIFEST_URI=s3://mskmind-bkt/wsi-thumbnails-dev/manifest.json",
+        "ANNOTATION_DB_PATH=/data/annotations.db",
+        "# Optional: point annotations at Lakebase/Postgres instead of local SQLite.",
+        "# ANNOTATION_DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>?sslmode=require",
+        "# The companion service trusts X-Auth-Request-User/-Study from the proxy;",
+        "# set true only on a development stack whose proxy forwards no user.",
+        "ANNOTATION_ALLOW_ANONYMOUS=false",
     ]
     output = args.output.expanduser().resolve()
     _write_secure(output, "\n".join(lines) + "\n")
