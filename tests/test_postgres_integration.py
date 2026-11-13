@@ -94,3 +94,72 @@ async def test_postgres_round_trip_uses_real_timestamp_columns():
 
     await annotation_store._delete_postgres(annotation["id"])
     assert await annotation_store._get_existing_postgres(annotation["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_migrations_on_empty_schema_all_succeed():
+    """Workers starting together against an empty database all migrate cleanly."""
+    import asyncio
+
+    import asyncpg
+
+    from app.annotation_db import migrate, migrate_agent
+
+    dsn = os.environ.get("POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.fail("POSTGRES_TEST_DSN is required for the PostgreSQL integration suite")
+
+    schema = f"migrate_race_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(dsn)
+    await admin.execute(f'CREATE SCHEMA "{schema}"')
+    workers = 8
+    try:
+        connections = await asyncio.gather(
+            *(
+                asyncpg.connect(dsn, server_settings={"search_path": schema})
+                for _ in range(workers)
+            )
+        )
+        try:
+            start = asyncio.Event()
+
+            async def start_worker(conn: asyncpg.Connection) -> None:
+                await start.wait()
+                await migrate(conn)
+                await migrate_agent(conn)
+
+            tasks = [asyncio.create_task(start_worker(conn)) for conn in connections]
+            await asyncio.sleep(0)
+            start.set()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await asyncio.gather(*(conn.close() for conn in connections))
+
+        assert [r for r in results if isinstance(r, BaseException)] == []
+        tables = {
+            row["table_name"]
+            for row in await admin.fetch(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = $1",
+                schema,
+            )
+        }
+        assert {
+            "annotation_schema_migrations",
+            "annotations",
+            "agent_actions",
+            "agent_retrieval_candidates",
+            "agent_retrieval_runs",
+        } <= tables
+        versions = await admin.fetch(
+            f'SELECT component, version FROM "{schema}".annotation_schema_migrations'
+        )
+        assert {row["component"]: row["version"] for row in versions} == {
+            "annotations": 1,
+            "agent_actions": 1,
+            "agent_retrieval_candidates": 1,
+            "agent_retrieval_runs": 1,
+        }
+    finally:
+        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.close()

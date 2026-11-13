@@ -7,6 +7,11 @@ Lakebase credential fetched for each new connection
 ``ANNOTATION_DB_MAX_INACTIVE_CONNECTION_LIFETIME`` seconds and every
 connection is replaced once it is ``ANNOTATION_DB_MAX_CONNECTION_AGE_SECONDS``
 old, so none outlives the credential it logged in with by much.
+
+Schema setup runs inside one transaction that first takes a
+transaction-scoped Postgres advisory lock (``SCHEMA_LOCK_KEY``), so several
+workers or replicas starting against the same empty database apply the
+migrations one at a time.
 """
 
 from __future__ import annotations
@@ -19,6 +24,9 @@ from typing import AsyncIterator
 import asyncpg
 
 from . import lakebase_credentials
+
+# Fixed advisory-lock key shared by every process that migrates this schema.
+SCHEMA_LOCK_KEY = 0x6362_7769_6D69_6772  # b"cbwimigr"
 
 _pool: asyncpg.Pool | None = None
 _pool_dsn = ""
@@ -93,6 +101,19 @@ async def connection(dsn: str) -> AsyncIterator[asyncpg.Connection]:
         yield conn
 
 
+@asynccontextmanager
+async def _schema_lock(conn: asyncpg.Connection) -> AsyncIterator[None]:
+    """Run schema setup in one transaction holding the schema advisory lock.
+
+    ``pg_advisory_xact_lock`` blocks until no other session holds the key and
+    releases it at commit or rollback, so concurrent ``CREATE ... IF NOT
+    EXISTS`` statements from other workers never race on the catalog.
+    """
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", SCHEMA_LOCK_KEY)
+        yield
+
+
 async def _ensure_migration_table(conn: asyncpg.Connection) -> None:
     await conn.execute(
         """
@@ -129,6 +150,11 @@ async def _mark_migration(conn: asyncpg.Connection, component: str) -> None:
 
 async def migrate(conn: asyncpg.Connection) -> None:
     """Apply the annotation schema without destructive table rewrites."""
+    async with _schema_lock(conn):
+        await _migrate_annotations(conn)
+
+
+async def _migrate_annotations(conn: asyncpg.Connection) -> None:
     await _ensure_migration_table(conn)
     if await _migration_complete(conn, "annotations"):
         return
@@ -160,6 +186,11 @@ async def migrate(conn: asyncpg.Connection) -> None:
 
 async def migrate_agent(conn: asyncpg.Connection) -> None:
     """Create the durable proposal audit table in the same database."""
+    async with _schema_lock(conn):
+        await _migrate_agent(conn)
+
+
+async def _migrate_agent(conn: asyncpg.Connection) -> None:
     await _ensure_migration_table(conn)
     if not await _migration_complete(conn, "agent_actions"):
         await conn.execute(
