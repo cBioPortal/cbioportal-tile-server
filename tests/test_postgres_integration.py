@@ -181,6 +181,7 @@ async def test_postgres_batch_is_atomic_and_review_bumps_the_version(monkeypatch
     slide_id = suffix[:12]
     loader = {"sub": f"loader-{suffix}", "groups": [], "study_id": "integration-study"}
     reviewer = {"sub": f"reviewer-{suffix}", "groups": [], "study_id": "integration-study"}
+    monkeypatch.setattr(annotation_store.settings, "annotation_trusted_writers", [loader["sub"]])
 
     def item(label: str) -> annotation_store.AnnotationIn:
         return annotation_store.AnnotationIn(

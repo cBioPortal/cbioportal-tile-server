@@ -189,6 +189,13 @@ class Settings:
     annotation_local_development: bool = field(
         default_factory=lambda: _env_bool("ANNOTATION_LOCAL_DEVELOPMENT", False)
     )
+    # Users (X-Auth-Request-User values) that may create annotations whose
+    # provenance names a machine source, or that carry review fields, over
+    # HTTP: a bulk loader's service identity.  The assistant writes in-process
+    # and needs no entry.
+    annotation_trusted_writers: list[str] = field(
+        default_factory=lambda: _env_csv("ANNOTATION_TRUSTED_WRITERS", "")
+    )
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
     agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
     # WSI_AGENT_MODEL names the model for any provider (a Bedrock model ID,

@@ -453,7 +453,7 @@ request's user; it calls no companion route over HTTP.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see; rejected machine-made ones only with `include_rejected=true` |
-| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
+| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId`; machine provenance only from a trusted writer |
 | PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
 | POST | `/annotations/batch?studyId=` | Create 1–100 annotations in one transaction (all or none), returned in request order; every item's study must be `studyId` |
 | POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject", "version"}` on a machine-made annotation, by any user who can see it (see below) |
@@ -488,6 +488,33 @@ can see it in its study may review it, not only its creator:
 A human-made annotation answers `403`; one the user cannot see answers
 `404`. Updating and deleting stay creator-only.
 
+#### Who may write machine provenance
+
+`provenance.source` decides who may review an annotation, so a browser may
+not set it to a machine source:
+
+- `POST /annotations` and `POST /annotations/batch` answer `422` when an
+  item's `provenance.source` is a machine source, or its provenance carries
+  `review_status`, `reviewed_by` or `reviewed_at`, unless the user is listed
+  in `ANNOTATION_TRUSTED_WRITERS`. A batch with one such item saves none.
+- `PUT /annotations/{id}` answers `422` when the new body names a machine
+  source the stored row does not have (making a human annotation
+  machine-made, or changing one machine source to another). The creator may
+  still edit a machine-made annotation that keeps its source. The review
+  fields always keep their stored values; only the review route sets them.
+- The assistant writes its annotations in-process when a proposal is
+  committed (`/agent/actions/{id}/commit-annotations`), not through these
+  routes, so it needs no entry and stores `source: "agent"` as the
+  committing user.
+- A bulk loader of model output either writes to storage directly or calls
+  these routes as a service identity listed in `ANNOTATION_TRUSTED_WRITERS`
+  (an `X-Auth-Request-User` the portal asserts for it).
+- Stored rows are never re-checked: existing machine-made rows stay
+  listable, reviewable and editable by their creator.
+
+Do not list `ANNOTATION_ANONYMOUS_USER` in `ANNOTATION_TRUSTED_WRITERS`:
+with anonymous use on, every request without a user would be trusted.
+
 ### Companion configuration
 
 | Variable | Default | Purpose |
@@ -507,6 +534,7 @@ A human-made annotation answers `403`; one the user cannot see answers
 | `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
 | `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
 | `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
+| `ANNOTATION_TRUSTED_WRITERS` | — | Comma-separated users (`X-Auth-Request-User`) that may create machine-made annotations and set review fields over HTTP (see [Who may write machine provenance](#who-may-write-machine-provenance)) |
 | `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant; every `/agent` route but `/agent/health` answers `404` while it is off |
 | `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
 | `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |

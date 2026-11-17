@@ -49,6 +49,7 @@ def settings_env(monkeypatch, tmp_path):
     monkeypatch.setattr(companion.settings, "annotation_anonymous_user", "anonymous")
     monkeypatch.setattr(companion.settings, "companion_allowed_origins", [])
     monkeypatch.setattr(companion.settings, "companion_max_body_bytes", 4 * 1024 * 1024)
+    monkeypatch.setattr(companion.settings, "annotation_trusted_writers", ["loader@example.org"])
     yield companion.settings
     annotations._db_path = ""
     annotations._db_url = ""
@@ -243,7 +244,44 @@ class TestAnnotationRoutes:
     def _machine_row(self, client, source: str = "precomputed") -> dict:
         body = annotation_body()
         body["body"]["provenance"] = {"source": source}
-        return client.post("/annotations?studyId=study-a", json=body, headers=headers()).json()
+        response = client.post(
+            "/annotations?studyId=study-a", json=body, headers=headers(user="loader@example.org")
+        )
+        assert response.status_code == 201
+        return response.json()
+
+    def test_only_a_trusted_writer_may_create_machine_rows_over_http(self, client):
+        body = annotation_body()
+        body["body"]["provenance"] = {"source": "agent"}
+        assert client.post("/annotations?studyId=study-a", json=body, headers=headers()).status_code == 422
+        batch = {"annotations": [annotation_body(), body]}
+        assert (
+            client.post("/annotations/batch?studyId=study-a", json=batch, headers=headers()).status_code
+            == 422
+        )
+        listed = client.get(
+            "/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
+        )
+        assert listed.json() == []
+        assert (
+            client.post(
+                "/annotations?studyId=study-a", json=body, headers=headers(user="loader@example.org")
+            ).status_code
+            == 201
+        )
+
+    def test_put_by_the_creator_cannot_flip_source_to_machine(self, client):
+        row = client.post("/annotations?studyId=study-a", json=annotation_body(), headers=headers()).json()
+        update = {
+            "version": 1,
+            "body": {"label": "Tumor", "provenance": {"source": "precomputed"}},
+        }
+        response = client.put(f"/annotations/{row['id']}?studyId=study-a", json=update, headers=headers())
+        assert response.status_code == 422
+        update["body"]["provenance"] = {"source": "import"}
+        response = client.put(f"/annotations/{row['id']}?studyId=study-a", json=update, headers=headers())
+        assert response.status_code == 200
+        assert response.json()["body"]["provenance"] == {"source": "import"}
 
     def test_any_user_of_the_study_may_review_a_machine_annotation(self, client):
         row = self._machine_row(client)
@@ -255,7 +293,7 @@ class TestAnnotationRoutes:
         )
         assert accepted.status_code == 200
         assert accepted.json()["version"] == 2
-        assert accepted.json()["created_by"] == "alice@example.org"
+        assert accepted.json()["created_by"] == "loader@example.org"
         assert accepted.json()["body"]["provenance"]["reviewed_by"] == "bob@example.org"
 
         rejected = client.post(

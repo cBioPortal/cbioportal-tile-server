@@ -22,6 +22,17 @@ the provenance and bumps the version.  A rejected annotation is kept, for
 the audit trail, and left out of the list unless ``include_rejected=true``.
 Its creator may still delete it.
 
+Provenance trust: over HTTP, only a trusted writer (a user listed in
+``ANNOTATION_TRUSTED_WRITERS``, such as a bulk loader's service identity)
+may create an annotation whose ``provenance.source`` is a machine source,
+or one that carries review fields; anyone else gets 422.  An update may not
+turn an annotation machine-made or change its machine source (422), and the
+review fields always keep their stored values: only the review route sets
+them.  The assistant writes its annotations in-process
+(``app.agent._commit_annotations``), not through these routes, so it needs
+no entry.  Stored rows are never re-checked, so existing machine-made rows
+stay readable, reviewable and editable by their creator.
+
 ``slide_id`` carries the opaque slide key, never a pathology image ID; any
 other value is rejected so image IDs cannot reach annotation storage.
 """
@@ -127,6 +138,7 @@ def _can_modify(row: dict, user: dict) -> bool:
 MACHINE_SOURCES = frozenset({"agent", "assistant", "ai", "model", "precomputed"})
 REVIEW_ACCEPTED = "accepted"
 REVIEW_REJECTED = "rejected"
+REVIEW_FIELDS = ("review_status", "reviewed_by", "reviewed_at")
 
 
 def _provenance(body: Any) -> dict[str, Any]:
@@ -143,6 +155,60 @@ def is_machine_made(body: Any) -> bool:
     """Whether a body's provenance names a machine source (``MACHINE_SOURCES``)."""
     source = _provenance(body).get("source")
     return isinstance(source, str) and source.strip().lower() in MACHINE_SOURCES
+
+
+def _machine_source(provenance: dict[str, Any]) -> str | None:
+    source = provenance.get("source")
+    if isinstance(source, str) and source.strip().lower() in MACHINE_SOURCES:
+        return source.strip().lower()
+    return None
+
+
+def is_trusted_writer(user: dict) -> bool:
+    """Whether ``user`` may write machine provenance over HTTP."""
+    return user.get("sub") in set(getattr(settings, "annotation_trusted_writers", []) or [])
+
+
+def _require_untrusted_provenance_allowed(body: "AnnotationBody", user: dict) -> None:
+    """422 unless ``user`` may create an annotation with this provenance."""
+    if is_trusted_writer(user):
+        return
+    provenance = body.provenance or {}
+    if _machine_source(provenance) is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Only a trusted writer may create a machine-made annotation",
+        )
+    if any(name in provenance for name in REVIEW_FIELDS):
+        raise HTTPException(
+            status_code=422,
+            detail="Review fields are set only by the review route",
+        )
+
+
+def _guard_updated_provenance(
+    existing_body: Any, body: "AnnotationBody", user: dict
+) -> "AnnotationBody":
+    """The body to store for an update by ``user``.
+
+    An untrusted caller may not make an annotation machine-made or change
+    its machine source (422); the review fields keep their stored values.
+    """
+    if is_trusted_writer(user) or body.provenance is None:
+        return body
+    stored = _provenance(existing_body)
+    provenance = dict(body.provenance)
+    new_source = _machine_source(provenance)
+    if new_source is not None and new_source != _machine_source(stored):
+        raise HTTPException(
+            status_code=422,
+            detail="Only a trusted writer may mark an annotation machine-made",
+        )
+    for name in REVIEW_FIELDS:
+        provenance.pop(name, None)
+        if name in stored:
+            provenance[name] = stored[name]
+    return body.model_copy(update={"provenance": provenance})
 
 
 def is_rejected(body: Any) -> bool:
@@ -530,6 +596,7 @@ async def create_annotation(
     user: dict = Depends(require_user),
 ) -> AnnotationOut:
     require_same_study(user, data.study_id, "the annotation's study")
+    _require_untrusted_provenance_allowed(data.body, user)
     if _storage_kind() == "postgres":
         row = await _create_postgres(data, user["sub"])
     else:
@@ -571,6 +638,8 @@ async def create_annotation_batch(
         raise HTTPException(status_code=422, detail="A batch must contain one study")
     study_id = next(iter(study_ids))
     require_same_study(user, study_id, "the batch's study")
+    for annotation in normalized:
+        _require_untrusted_provenance_allowed(annotation.body, user)
     if _storage_kind() == "postgres":
         rows = await _create_batch_postgres(normalized, user["sub"])
     else:
@@ -624,7 +693,9 @@ async def update_annotation(
         )
 
     new_body = (
-        data.body.model_dump_json() if data.body is not None else existing["body"]
+        _guard_updated_provenance(existing["body"], data.body, user).model_dump_json()
+        if data.body is not None
+        else existing["body"]
     )
     new_target = (
         _sqlite_target_json(data.target.selector)

@@ -47,6 +47,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(companion.settings, "companion_max_body_bytes", 4 * 1024 * 1024)
     monkeypatch.setattr(companion.settings, "agent_enabled", False)
     monkeypatch.setattr(companion.settings, "research_enabled", False)
+    monkeypatch.setattr(companion.settings, "annotation_trusted_writers", [])
     agent._rate_windows.clear()
     yield companion.settings, db_path
     annotations._db_path = ""
@@ -190,6 +191,10 @@ class TestEnabledAssistant:
             "/annotations", params={"studyId": "study-a", "slide_id": SLIDE_A}, headers=headers()
         )
         assert [row["created_by"] for row in rows.json()] == ["alice@example.org"]
+        # The assistant writes in-process, so an untrusted user's commit still
+        # stores the machine source the review route relies on.
+        assert annotations.settings.annotation_trusted_writers == []
+        assert [row["body"]["provenance"]["source"] for row in rows.json()] == ["agent"]
 
     @pytest.mark.asyncio
     async def test_a_proposal_is_bound_to_its_user_and_study(self, client, env):
