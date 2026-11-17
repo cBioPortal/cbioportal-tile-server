@@ -234,3 +234,148 @@ def test_annotations_accept_only_opaque_slide_keys(slide_id):
     )
     assert response.status_code == 422
 
+
+
+def machine_input(source: str = "precomputed", visible_to: list[str] | None = None) -> AnnotationIn:
+    data = annotation_input(visible_to=[] if visible_to is None else visible_to)
+    data.body = AnnotationBody(
+        label="Tumor",
+        type="Polygon",
+        layer_name="Model",
+        provenance={"source": source, "model": "luad-patterns"},
+    )
+    return data
+
+
+@pytest.mark.parametrize("source", ["agent", "assistant", "AI", "model", "precomputed"])
+def test_machine_sources_are_reviewable(source):
+    assert annotations.is_machine_made({"provenance": {"source": source}})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"provenance": None}, {"provenance": {"source": "import"}}, {"provenance": {"source": 1}}, "not json"],
+)
+def test_other_annotations_are_not_machine_made(body):
+    assert not annotations.is_machine_made(body)
+
+
+@pytest.mark.asyncio
+async def test_any_user_in_the_study_may_accept_a_machine_annotation():
+    created = await annotations.create_annotation(machine_input(), user("loader"))
+
+    accepted = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+    )
+
+    assert accepted.version == 2
+    assert accepted.created_by == "loader"
+    assert accepted.body.label == "Tumor"
+    assert accepted.target == created.target
+    assert accepted.visible_to == []
+    provenance = accepted.body.provenance
+    assert provenance["source"] == "precomputed"
+    assert provenance["model"] == "luad-patterns"
+    assert provenance["review_status"] == "accepted"
+    assert provenance["reviewed_by"] == "reviewer"
+    assert provenance["reviewed_at"].endswith("Z")
+    listed = await annotations.list_annotations(SLIDE_KEY, user("other"))
+    assert [item.body.provenance["review_status"] for item in listed] == ["accepted"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_annotation_is_kept_but_not_listed():
+    created = await annotations.create_annotation(machine_input("agent"), user("loader"))
+
+    rejected = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="reject", version=1), user("reviewer")
+    )
+
+    assert rejected.body.provenance["review_status"] == "rejected"
+    assert await annotations.list_annotations(SLIDE_KEY, user("loader")) == []
+    audit = await annotations.list_annotations(SLIDE_KEY, user("loader"), include_rejected=True)
+    assert [item.id for item in audit] == [created.id]
+
+    # A later review may restore it, and its creator may still delete it.
+    restored = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="accept", version=2), user("second")
+    )
+    assert restored.version == 3
+    assert [item.id for item in await annotations.list_annotations(SLIDE_KEY, user("x"))] == [created.id]
+    await annotations.delete_annotation(created.id, user("loader"))
+
+
+@pytest.mark.asyncio
+async def test_review_refuses_human_annotations_other_studies_and_stale_versions():
+    human = await annotations.create_annotation(annotation_input(visible_to=[]), user("owner"))
+    with pytest.raises(HTTPException) as not_machine:
+        await annotations.review_annotation(
+            human.id, annotations.AnnotationReview(decision="accept", version=1), user("owner")
+        )
+    assert not_machine.value.status_code == 403
+
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    with pytest.raises(HTTPException) as wrong_study:
+        await annotations.review_annotation(
+            machine.id,
+            annotations.AnnotationReview(decision="accept", version=1),
+            user("reviewer", study_id="study-2"),
+        )
+    assert wrong_study.value.status_code == 403
+
+    with pytest.raises(HTTPException) as stale:
+        await annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="reject", version=5), user("reviewer")
+        )
+    assert stale.value.status_code == 409
+
+    with pytest.raises(HTTPException) as missing:
+        await annotations.review_annotation(
+            "missing", annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+        )
+    assert missing.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_review_needs_the_annotation_to_be_visible_to_the_reviewer():
+    private = await annotations.create_annotation(
+        machine_input(visible_to=None).model_copy(update={"visible_to": None}), user("loader")
+    )
+    with pytest.raises(HTTPException) as hidden:
+        await annotations.review_annotation(
+            private.id, annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+        )
+    assert hidden.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_open_edit_or_delete_to_other_users():
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    with pytest.raises(HTTPException) as update:
+        await annotations.update_annotation(machine.id, AnnotationUpdate(version=1), user("reviewer"))
+    assert update.value.status_code == 403
+    with pytest.raises(HTTPException) as delete:
+        await annotations.delete_annotation(machine.id, user("reviewer"))
+    assert delete.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reviews_take_one_version():
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    results = await asyncio.gather(
+        annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="accept", version=1), user("a")
+        ),
+        annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="reject", version=1), user("b")
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, AnnotationOut) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, HTTPException)]
+    assert [conflict.status_code for conflict in conflicts] == [409]
+
+
+def test_a_review_decision_must_be_accept_or_reject():
+    with pytest.raises(ValidationError):
+        annotations.AnnotationReview(decision="delete", version=1)

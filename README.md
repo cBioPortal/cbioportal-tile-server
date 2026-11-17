@@ -452,10 +452,11 @@ request's user; it calls no companion route over HTTP.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see |
+| GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see; rejected machine-made ones only with `include_rejected=true` |
 | POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
 | PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
 | POST | `/annotations/batch?studyId=` | Create a bounded group; every item's study must be `studyId` |
+| POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject", "version"}` on a machine-made annotation, by any user who can see it (see below) |
 | DELETE | `/annotations/{id}?studyId=` | Delete (creator only) |
 | GET | `/agent/health` | Assistant status (reads no identity) |
 | POST | `/agent/chat?studyId=` | Assistant turn as server-sent events; the body's `context.study_id` must be `studyId`. `WSI_AGENT_ENABLED` |
@@ -468,6 +469,24 @@ request's user; it calls no companion route over HTTP.
 | POST | `/research/v1/mcp?studyId=` | JSON-RPC tools for cBioAgent; `arguments.study_id` must be `studyId` |
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness: annotation storage reachable |
+
+#### Reviewing machine-made annotations
+
+An annotation is machine-made when its `body.provenance.source` is `agent`,
+`assistant`, `ai`, `model` or `precomputed` (any letter case). Any user who
+can see it in its study may review it, not only its creator:
+
+- `accept` sets `provenance.review_status: "accepted"`;
+- `reject` sets `provenance.review_status: "rejected"`. The row is kept as
+  an audit record of the model's output and the reviewer's decision; the
+  list leaves it out unless `include_rejected=true`, and a later review can
+  accept it again;
+- both record `reviewed_by` (the proxy's user) and `reviewed_at` (UTC), keep
+  every other field, and bump `version`. `version` must match the stored
+  one (`409` otherwise).
+
+A human-made annotation answers `403`; one the user cannot see answers
+`404`. Updating and deleting stay creator-only.
 
 ### Companion configuration
 

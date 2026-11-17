@@ -5,13 +5,22 @@ Routes (each with ``?studyId=<study>``):
   GET    /annotations?slide_id=   list a slide's annotations in the study
   POST   /annotations             create a new annotation
   POST   /annotations/batch       create a bounded group in one study
-  PUT    /annotations/{id}        update (optimistic concurrency via version)
+  PUT    /annotations/{id}        update (creator only; optimistic concurrency via version)
+  POST   /annotations/{id}/review accept or reject a machine-made annotation
   DELETE /annotations/{id}        delete (creator only)
 
 Auth: ``require_user()`` takes the user and study the authenticating proxy
 asserted (``app.request_identity``).  The body's study, and the stored
 row's study for an update or delete, must be that study; ``created_by`` is
 the proxy's user.  These routes are served by ``app.companion`` only.
+
+Review: an annotation whose ``body.provenance.source`` names a machine
+source (``MACHINE_SOURCES``: the assistant or a model) may be accepted or
+rejected by any user who can see it in its study, not only its creator.
+A review records ``review_status``, ``reviewed_by`` and ``reviewed_at`` in
+the provenance and bumps the version.  A rejected annotation is kept, for
+the audit trail, and left out of the list unless ``include_rejected=true``.
+Its creator may still delete it.
 
 ``slide_id`` carries the opaque slide key, never a pathology image ID; any
 other value is rejected so image IDs cannot reach annotation storage.
@@ -20,7 +29,8 @@ other value is rejected so image IDs cannot reach annotation storage.
 import json
 import logging
 import uuid
-from typing import Any
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal
 
 import aiosqlite
 import asyncpg
@@ -111,6 +121,35 @@ def _can_modify(row: dict, user: dict) -> bool:
     )
 
 
+# ``provenance.source`` values of annotations a machine made: the research
+# assistant ("agent"/"assistant") or a model ("model", "ai", and
+# "precomputed" for model output loaded in bulk).
+MACHINE_SOURCES = frozenset({"agent", "assistant", "ai", "model", "precomputed"})
+REVIEW_ACCEPTED = "accepted"
+REVIEW_REJECTED = "rejected"
+
+
+def _provenance(body: Any) -> dict[str, Any]:
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return {}
+    provenance = body.get("provenance") if isinstance(body, dict) else None
+    return provenance if isinstance(provenance, dict) else {}
+
+
+def is_machine_made(body: Any) -> bool:
+    """Whether a body's provenance names a machine source (``MACHINE_SOURCES``)."""
+    source = _provenance(body).get("source")
+    return isinstance(source, str) and source.strip().lower() in MACHINE_SOURCES
+
+
+def is_rejected(body: Any) -> bool:
+    """Whether a machine-made annotation was rejected in review."""
+    return is_machine_made(body) and _provenance(body).get("review_status") == REVIEW_REJECTED
+
+
 class AnnotationBody(BaseModel):
     label: str = ""
     comment: str = ""
@@ -152,6 +191,13 @@ class AnnotationUpdate(BaseModel):
     body: AnnotationBody | None = None
     target: AnnotationTarget | None = None
     visible_to: list[str] | None = None
+    version: int = Field(
+        ..., description="Must match current version (optimistic lock)"
+    )
+
+
+class AnnotationReview(BaseModel):
+    decision: Literal["accept", "reject"]
     version: int = Field(
         ..., description="Must match current version (optimistic lock)"
     )
@@ -458,6 +504,10 @@ async def _delete_postgres(annotation_id: str) -> None:
 async def list_annotations(
     slide_id: str = Query(..., pattern=SLIDE_KEY_REGEX, description="Opaque slide key"),
     user: dict = Depends(require_user),
+    include_rejected: Annotated[
+        bool,
+        Query(description="Also list machine-made annotations rejected in review"),
+    ] = False,
 ) -> list[AnnotationOut]:
     study_id: str = user["study_id"]
     user_sub: str = user["sub"]
@@ -466,7 +516,12 @@ async def list_annotations(
         rows = await _list_postgres(slide_id, study_id, user_sub)
     else:
         rows = await _list_sqlite(slide_id, study_id, user_sub)
-    return [_row_to_out(row) for row in rows if _is_visible(row, user_sub, user_groups)]
+    return [
+        _row_to_out(row)
+        for row in rows
+        if _is_visible(row, user_sub, user_groups)
+        and (include_rejected or not is_rejected(row["body"]))
+    ]
 
 
 @router.post("", response_model=AnnotationOut, status_code=status.HTTP_201_CREATED)
@@ -559,25 +614,23 @@ async def update_annotation(
         )
     else:
         new_visible = existing["visible_to"]
+    return await _write_version(existing, new_body, new_target, new_visible)
+
+
+async def _write_version(
+    existing: dict, new_body: str, new_target: str, new_visible: str | None
+) -> AnnotationOut:
+    """Store the next version of ``existing``; 409 if it changed meanwhile."""
     new_version = existing["version"] + 1
-    if _storage_kind() == "postgres":
-        updated_at = await _update_postgres(
-            annotation_id,
-            new_body,
-            new_target,
-            new_visible,
-            existing["version"],
-            new_version,
-        )
-    else:
-        updated_at = await _update_sqlite(
-            annotation_id,
-            new_body,
-            new_target,
-            new_visible,
-            existing["version"],
-            new_version,
-        )
+    write = _update_postgres if _storage_kind() == "postgres" else _update_sqlite
+    updated_at = await write(
+        existing["id"],
+        new_body,
+        new_target,
+        new_visible,
+        existing["version"],
+        new_version,
+    )
     if updated_at is None:
         raise HTTPException(
             status_code=409,
@@ -595,6 +648,52 @@ async def update_annotation(
         version=new_version,
         created_at=existing["created_at"],
         updated_at=updated_at,
+    )
+
+
+@router.post("/{annotation_id}/review", response_model=AnnotationOut)
+async def review_annotation(
+    annotation_id: str,
+    data: AnnotationReview,
+    user: dict = Depends(require_user),
+) -> AnnotationOut:
+    """Accept or reject a machine-made annotation.
+
+    Any user who can see the annotation in the authorized study may review
+    it; the creator-only rule still applies to PUT and DELETE.  Only the
+    provenance's review fields change.  A rejected annotation is kept and
+    left out of the list (see ``list_annotations``).
+    """
+    existing = (
+        await _get_existing_postgres(annotation_id)
+        if _storage_kind() == "postgres"
+        else await _get_existing_sqlite(annotation_id)
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    require_same_study(user, existing["study_id"], "the annotation's study")
+    if not _is_visible(existing, user["sub"], set(user["groups"])):
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    body = json.loads(existing["body"])
+    if not is_machine_made(body):
+        raise HTTPException(
+            status_code=403,
+            detail="Only machine-made annotations can be reviewed",
+        )
+    if existing["version"] != data.version:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Version conflict: expected {existing['version']}, got {data.version}",
+        )
+    body["provenance"] = {
+        **_provenance(body),
+        "review_status": REVIEW_ACCEPTED if data.decision == "accept" else REVIEW_REJECTED,
+        "reviewed_by": user["sub"],
+        "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    new_body = AnnotationBody(**body).model_dump_json()
+    return await _write_version(
+        existing, new_body, existing["target"], existing["visible_to"]
     )
 
 

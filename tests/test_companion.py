@@ -240,6 +240,109 @@ class TestAnnotationRoutes:
         assert client.delete(f"/annotations/{row['id']}?studyId=study-a", headers=other).status_code == 403
 
 
+    def _machine_row(self, client, source: str = "precomputed") -> dict:
+        body = annotation_body()
+        body["body"]["provenance"] = {"source": source}
+        return client.post("/annotations?studyId=study-a", json=body, headers=headers()).json()
+
+    def test_any_user_of_the_study_may_review_a_machine_annotation(self, client):
+        row = self._machine_row(client)
+        bob = headers(user="bob@example.org")
+        accepted = client.post(
+            f"/wsi/annotations/{row['id']}/review?studyId=study-a",
+            json={"decision": "accept", "version": 1},
+            headers=bob,
+        )
+        assert accepted.status_code == 200
+        assert accepted.json()["version"] == 2
+        assert accepted.json()["created_by"] == "alice@example.org"
+        assert accepted.json()["body"]["provenance"]["reviewed_by"] == "bob@example.org"
+
+        rejected = client.post(
+            f"/annotations/{row['id']}/review?studyId=study-a",
+            json={"decision": "reject", "version": 2},
+            headers=bob,
+        )
+        assert rejected.status_code == 200
+        listed = client.get(
+            "/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=bob
+        )
+        assert listed.json() == []
+        audit = client.get(
+            "/annotations",
+            params={"studyId": "study-a", "slide_id": SLIDE_KEY, "include_rejected": "true"},
+            headers=bob,
+        )
+        assert [item["id"] for item in audit.json()] == [row["id"]]
+        # Review does not let bob edit or delete it.
+        assert (
+            client.put(f"/annotations/{row['id']}?studyId=study-a", json={"version": 3}, headers=bob).status_code
+            == 403
+        )
+        assert client.delete(f"/annotations/{row['id']}?studyId=study-a", headers=bob).status_code == 403
+
+    def test_review_is_refused_for_human_rows_other_studies_and_stale_versions(self, client):
+        human = client.post("/annotations?studyId=study-a", json=annotation_body(), headers=headers()).json()
+        bob = headers(user="bob@example.org")
+        review = {"decision": "accept", "version": 1}
+        assert (
+            client.post(f"/annotations/{human['id']}/review?studyId=study-a", json=review, headers=bob).status_code
+            == 403
+        )
+        row = self._machine_row(client, "agent")
+        other_study = headers(user="bob@example.org", study="study-b")
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/review?studyId=study-b", json=review, headers=other_study
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/review?studyId=study-a",
+                json={"decision": "accept", "version": 9},
+                headers=bob,
+            ).status_code
+            == 409
+        )
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/review?studyId=study-a",
+                json={"decision": "delete", "version": 1},
+                headers=bob,
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(f"/annotations/{row['id']}/review?studyId=study-a", json=review, headers=headers(user=None))
+        ).status_code == 401
+
+    def test_review_is_a_write_under_the_csrf_rules(self, client):
+        row = self._machine_row(client)
+        no_xhr = {k: v for k, v in headers().items() if k != "X-Requested-With"}
+        review = {"decision": "accept", "version": 1}
+        assert (
+            client.post(f"/annotations/{row['id']}/review?studyId=study-a", json=review, headers=no_xhr).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/review?studyId=study-a",
+                json=review,
+                headers=headers(Origin="https://evil.example"),
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/review?studyId=study-a",
+                content='{"decision": "accept", "version": 1}',
+                headers=headers(**{"Content-Type": "text/plain"}),
+            ).status_code
+            == 415
+        )
+
+
 # --- CSRF guard ---------------------------------------------------------------
 
 
