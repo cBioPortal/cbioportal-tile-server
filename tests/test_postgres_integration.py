@@ -163,3 +163,72 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
     finally:
         await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
         await admin.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_batch_is_atomic_and_review_bumps_the_version(monkeypatch):
+    dsn = os.environ.get("POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.fail("POSTGRES_TEST_DSN is required for the PostgreSQL integration suite")
+
+    from app import annotation_db
+
+    # The pool belongs to the event loop that opened it; this test has its own.
+    monkeypatch.setattr(annotation_db, "_pool", None)
+    monkeypatch.setattr(annotation_db, "_pool_dsn", "")
+    await annotation_store.init_db(db_url=dsn)
+    suffix = uuid.uuid4().hex
+    slide_id = suffix[:12]
+    loader = {"sub": f"loader-{suffix}", "groups": [], "study_id": "integration-study"}
+    reviewer = {"sub": f"reviewer-{suffix}", "groups": [], "study_id": "integration-study"}
+
+    def item(label: str) -> annotation_store.AnnotationIn:
+        return annotation_store.AnnotationIn(
+            slide_id=slide_id,
+            study_id="integration-study",
+            body=annotation_store.AnnotationBody(
+                label=label, provenance={"source": "precomputed"}
+            ),
+            target=annotation_store.AnnotationTarget(
+                selector={"type": "SvgSelector", "value": "<svg />"}
+            ),
+            visible_to=[],
+        )
+
+    real_insert = annotation_store._insert_postgres_connection
+    calls = 0
+
+    async def failing_second_insert(conn, data, user_sub, annotation_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("storage failed")
+        return await real_insert(conn, data, user_sub, annotation_id)
+
+    monkeypatch.setattr(annotation_store, "_insert_postgres_connection", failing_second_insert)
+    with pytest.raises(RuntimeError):
+        await annotation_store.create_annotation_batch(
+            annotation_store.AnnotationBatchIn(annotations=[item("a"), item("b")]), loader
+        )
+    monkeypatch.setattr(annotation_store, "_insert_postgres_connection", real_insert)
+    assert await annotation_store.list_annotations(slide_id, loader) == []
+
+    created = await annotation_store.create_annotation_batch(
+        annotation_store.AnnotationBatchIn(annotations=[item("a"), item("b")]), loader
+    )
+    assert [row.body.label for row in created] == ["a", "b"]
+
+    rejected = await annotation_store.review_annotation(
+        created[0].id,
+        annotation_store.AnnotationReview(decision="reject", version=1),
+        reviewer,
+    )
+    assert rejected.version == 2
+    assert rejected.updated_at.endswith("Z")
+    assert rejected.body.provenance["reviewed_by"] == reviewer["sub"]
+    listed = await annotation_store.list_annotations(slide_id, reviewer)
+    assert [row.id for row in listed] == [created[1].id]
+
+    for row in created:
+        await annotation_store._delete_postgres(row.id)
+    await annotation_store.close_db()

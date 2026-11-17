@@ -455,7 +455,7 @@ request's user; it calls no companion route over HTTP.
 | GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see; rejected machine-made ones only with `include_rejected=true` |
 | POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
 | PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
-| POST | `/annotations/batch?studyId=` | Create a bounded group; every item's study must be `studyId` |
+| POST | `/annotations/batch?studyId=` | Create 1–100 annotations in one transaction (all or none), returned in request order; every item's study must be `studyId` |
 | POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject", "version"}` on a machine-made annotation, by any user who can see it (see below) |
 | DELETE | `/annotations/{id}?studyId=` | Delete (creator only) |
 | GET | `/agent/health` | Assistant status (reads no identity) |

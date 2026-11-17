@@ -379,3 +379,32 @@ async def test_concurrent_reviews_take_one_version():
 def test_a_review_decision_must_be_accept_or_reject():
     with pytest.raises(ValidationError):
         annotations.AnnotationReview(decision="delete", version=1)
+
+
+@pytest.mark.asyncio
+async def test_annotation_batch_saves_all_or_none(monkeypatch):
+    owner = user("owner")
+    real_insert = annotations._insert_sqlite_connection
+    calls = 0
+
+    async def failing_second_insert(db, data, user_sub, annotation_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("storage failed")
+        return await real_insert(db, data, user_sub, annotation_id)
+
+    monkeypatch.setattr(annotations, "_insert_sqlite_connection", failing_second_insert)
+    with pytest.raises(RuntimeError):
+        await annotations.create_annotation_batch(
+            AnnotationBatchIn(annotations=[annotation_input(visible_to=[]) for _ in range(3)]), owner
+        )
+    monkeypatch.setattr(annotations, "_insert_sqlite_connection", real_insert)
+
+    assert await annotations.list_annotations(SLIDE_KEY, owner) == []
+
+    created = await annotations.create_annotation_batch(
+        AnnotationBatchIn(annotations=[annotation_input(visible_to=[]) for _ in range(3)]), owner
+    )
+    listed = await annotations.list_annotations(SLIDE_KEY, owner)
+    assert {item.id for item in listed} == {item.id for item in created}

@@ -4,7 +4,7 @@ Annotation CRUD with pluggable SQLite or Postgres storage.
 Routes (each with ``?studyId=<study>``):
   GET    /annotations?slide_id=   list a slide's annotations in the study
   POST   /annotations             create a new annotation
-  POST   /annotations/batch       create a bounded group in one study
+  POST   /annotations/batch       create up to 100 in one study, all or none
   PUT    /annotations/{id}        update (creator only; optimistic concurrency via version)
   POST   /annotations/{id}/review accept or reject a machine-made annotation
   DELETE /annotations/{id}        delete (creator only)
@@ -542,7 +542,11 @@ async def create_annotation_batch(
     data: AnnotationBatchIn,
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:
-    """Create a bounded group of annotations in the authorized study."""
+    """Create a bounded group of annotations in the authorized study.
+
+    The items are inserted in one transaction, so a failure saves none of
+    them, and the response lists the saved annotations in request order.
+    """
     normalized: list[AnnotationIn] = []
     for annotation in data.annotations:
         if isinstance(annotation, AnnotationIn):
@@ -567,13 +571,32 @@ async def create_annotation_batch(
         raise HTTPException(status_code=422, detail="A batch must contain one study")
     study_id = next(iter(study_ids))
     require_same_study(user, study_id, "the batch's study")
-    rows: list[dict] = []
-    for annotation in normalized:
-        if _storage_kind() == "postgres":
-            rows.append(await _create_postgres(annotation, user["sub"]))
-        else:
-            rows.append(await _create_sqlite(annotation, user["sub"]))
+    if _storage_kind() == "postgres":
+        rows = await _create_batch_postgres(normalized, user["sub"])
+    else:
+        rows = await _create_batch_sqlite(normalized, user["sub"])
     return [_row_to_out(row) for row in rows]
+
+
+async def _create_batch_sqlite(items: list[AnnotationIn], user_sub: str) -> list[dict]:
+    """Insert every item in one transaction: all are saved, or none."""
+    async with aiosqlite.connect(_get_db_path()) as db:
+        await _apply_sqlite_pragmas(db)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = [await _insert_sqlite_connection(db, item, user_sub) for item in items]
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+    return rows
+
+
+async def _create_batch_postgres(items: list[AnnotationIn], user_sub: str) -> list[dict]:
+    """Insert every item in one transaction: all are saved, or none."""
+    async with connection(_get_db_url()) as conn:
+        async with conn.transaction():
+            return [await _insert_postgres_connection(conn, item, user_sub) for item in items]
 
 
 @router.put("/{annotation_id}", response_model=AnnotationOut)
