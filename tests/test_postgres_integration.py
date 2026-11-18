@@ -147,6 +147,8 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
         assert {
             "annotation_schema_migrations",
             "annotations",
+            "annotation_comments",
+            "slide_notes",
             "agent_actions",
             "agent_retrieval_candidates",
             "agent_retrieval_runs",
@@ -155,7 +157,7 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
             f'SELECT component, version FROM "{schema}".annotation_schema_migrations'
         )
         assert {row["component"]: row["version"] for row in versions} == {
-            "annotations": 1,
+            "annotations": 2,
             "agent_actions": 1,
             "agent_retrieval_candidates": 1,
             "agent_retrieval_runs": 1,

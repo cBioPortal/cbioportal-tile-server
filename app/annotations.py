@@ -7,7 +7,20 @@ Routes (each with ``?studyId=<study>``):
   POST   /annotations/batch       create up to 100 in one study, all or none
   PUT    /annotations/{id}        update (creator only; optimistic concurrency via version)
   POST   /annotations/{id}/review accept or reject a machine-made annotation
-  DELETE /annotations/{id}        delete (creator only)
+  DELETE /annotations/{id}        delete (creator only) with its comment thread
+  POST   /annotations/batch-update  update up to 100 under the PUT rules, all or none
+  POST   /annotations/batch-delete  delete up to 100 (creator only), all or none
+  POST   /annotations/batch-review  review up to 100 under the review rules, all or none
+
+Comment threads (``app.annotation_comments``) live under
+``/annotations/{id}/comments``; the list reports each row's ``comment_count``.
+
+Batches: every item names an ``id`` and its ``version``; an id may appear
+once.  The rows are read and locked, every item is checked under the
+single-item rules, and only then is anything written, all in one
+transaction.  The first missing, forbidden or invalid item fails the batch
+(404/403/422 naming the item's index); stale versions are reported
+together (409).  A 2xx answers the rows in request order.
 
 Auth: ``require_user()`` takes the user and study the authenticating proxy
 asserted (``app.request_identity``).  The body's study, and the stored
@@ -48,6 +61,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
+from . import annotation_sql
 from .request_identity import require_same_study, require_user
 from .sealed_source import SLIDE_KEY_PATTERN
 from .config import settings
@@ -58,6 +72,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/annotations", tags=["annotations"])
 
 SLIDE_KEY_REGEX = SLIDE_KEY_PATTERN.pattern
+
+# The live comments in annotation ``a``'s thread.
+COMMENT_COUNT_SQL = (
+    "(SELECT COUNT(*) FROM annotation_comments c"
+    " WHERE c.annotation_id = a.id AND c.deleted = FALSE)"
+)
 
 _db_path: str = ""
 _db_url: str = ""
@@ -251,6 +271,9 @@ class AnnotationOut(BaseModel):
     version: int
     created_at: str
     updated_at: str
+    comment_count: int = Field(
+        default=0, description="Comments in the annotation's thread (not deleted)"
+    )
 
 
 class AnnotationUpdate(BaseModel):
@@ -295,6 +318,7 @@ def _row_to_out(row: dict) -> AnnotationOut:
         version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        comment_count=int(row.get("comment_count") or 0),
     )
 
 
@@ -323,6 +347,46 @@ async def _init_sqlite(path: str) -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
+        )
+        # Schema version 2 (see app.annotation_db): comment threads and
+        # slide-level notes.  Timestamps are UTC ISO-8601 text.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS annotation_comments (
+                id            TEXT PRIMARY KEY,
+                annotation_id TEXT NOT NULL,
+                study_id      TEXT NOT NULL,
+                author        TEXT NOT NULL,
+                body          TEXT NOT NULL,
+                created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                deleted       INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ann_comments_annotation "
+            "ON annotation_comments(annotation_id, created_at)"
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS slide_notes (
+                id          TEXT PRIMARY KEY,
+                slide_id    TEXT NOT NULL,
+                study_id    TEXT NOT NULL,
+                text        TEXT NOT NULL DEFAULT '',
+                tags        TEXT NOT NULL DEFAULT '[]',
+                created_by  TEXT NOT NULL,
+                visible_to  TEXT,
+                version     INTEGER NOT NULL DEFAULT 1,
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_slide_notes_slide_study "
+            "ON slide_notes(slide_id, study_id)"
         )
         await db.commit()
 
@@ -355,10 +419,11 @@ async def _list_sqlite(slide_id: str, study_id: str, user_sub: str) -> list[dict
         await _apply_sqlite_pragmas(db)
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            """
-            SELECT * FROM annotations
-            WHERE slide_id = ? AND study_id = ?
-              AND (created_by = ? OR visible_to IS NOT NULL)
+            f"""
+            SELECT a.*, {COMMENT_COUNT_SQL} AS comment_count
+            FROM annotations a
+            WHERE a.slide_id = ? AND a.study_id = ?
+              AND (a.created_by = ? OR a.visible_to IS NOT NULL)
             """,
             (slide_id, study_id, user_sub),
         )
@@ -369,15 +434,16 @@ async def _list_sqlite(slide_id: str, study_id: str, user_sub: str) -> list[dict
 async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[dict]:
     async with connection(_get_db_url()) as conn:
         rows = await conn.fetch(
-            """
+            f"""
             SELECT
-                id, slide_id, study_id, body, target, created_by, visible_to,
-                version,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
-                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
-            FROM annotations
-            WHERE slide_id = $1 AND study_id = $2
-              AND (created_by = $3 OR visible_to IS NOT NULL)
+                a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by, a.visible_to,
+                a.version,
+                to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at,
+                {COMMENT_COUNT_SQL} AS comment_count
+            FROM annotations a
+            WHERE a.slide_id = $1 AND a.study_id = $2
+              AND (a.created_by = $3 OR a.visible_to IS NOT NULL)
             """,
             slide_id,
             study_id,
@@ -469,8 +535,9 @@ async def _get_existing_sqlite(annotation_id: str) -> dict | None:
         await _apply_sqlite_pragmas(db)
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, slide_id, study_id, body, target, created_by, visible_to, version, created_at"
-            " FROM annotations WHERE id = ?",
+            "SELECT a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by,"
+            f" a.visible_to, a.version, a.created_at, {COMMENT_COUNT_SQL} AS comment_count"
+            " FROM annotations a WHERE a.id = ?",
             (annotation_id,),
         )
         row = await cursor.fetchone()
@@ -480,11 +547,12 @@ async def _get_existing_sqlite(annotation_id: str) -> dict | None:
 async def _get_existing_postgres(annotation_id: str) -> dict | None:
     async with connection(_get_db_url()) as conn:
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT
-                id, slide_id, study_id, body, target, created_by, visible_to, version,
-                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
-            FROM annotations WHERE id = $1
+                a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by, a.visible_to, a.version,
+                to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                {COMMENT_COUNT_SQL} AS comment_count
+            FROM annotations a WHERE a.id = $1
             """,
             annotation_id,
         )
@@ -557,13 +625,25 @@ async def _update_postgres(
 async def _delete_sqlite(annotation_id: str) -> None:
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
-        await db.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            await db.execute(
+                "DELETE FROM annotation_comments WHERE annotation_id = ?", (annotation_id,)
+            )
+        except BaseException:
+            await db.rollback()
+            raise
         await db.commit()
 
 
 async def _delete_postgres(annotation_id: str) -> None:
     async with connection(_get_db_url()) as conn:
-        await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
+        async with conn.transaction():
+            await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
+            await conn.execute(
+                "DELETE FROM annotation_comments WHERE annotation_id = $1", annotation_id
+            )
 
 
 @router.get("", response_model=list[AnnotationOut])
@@ -668,30 +748,44 @@ async def _create_batch_postgres(items: list[AnnotationIn], user_sub: str) -> li
             return [await _insert_postgres_connection(conn, item, user_sub) for item in items]
 
 
-@router.put("/{annotation_id}", response_model=AnnotationOut)
-async def update_annotation(
-    annotation_id: str,
-    data: AnnotationUpdate,
-    user: dict = Depends(require_user),
-) -> AnnotationOut:
-    existing = (
-        await _get_existing_postgres(annotation_id)
-        if _storage_kind() == "postgres"
-        else await _get_existing_sqlite(annotation_id)
-    )
-    if not existing:
-        raise HTTPException(status_code=404, detail="Annotation not found")
+
+
+# --- per-annotation rules, shared by the single and batch routes ------------
+
+
+def _authorize_change(existing: dict, user: dict, verb: str) -> None:
+    """403 unless ``user`` may update or delete ``existing`` (creator only)."""
     require_same_study(user, existing["study_id"], "the annotation's study")
     if not _can_modify(existing, user):
         raise HTTPException(
-            status_code=403, detail="Only the creator may update this annotation"
-        )
-    if existing["version"] != data.version:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Version conflict: expected {existing['version']}, got {data.version}",
+            status_code=403, detail=f"Only the creator may {verb} this annotation"
         )
 
+
+def _authorize_review(existing: dict, user: dict) -> None:
+    """403/404 unless ``user`` may review ``existing``."""
+    require_same_study(user, existing["study_id"], "the annotation's study")
+    if not _is_visible(existing, user["sub"], set(user["groups"])):
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    if not is_machine_made(existing["body"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Only machine-made annotations can be reviewed",
+        )
+
+
+def _check_version(existing: dict, version: int) -> None:
+    if existing["version"] != version:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Version conflict: expected {existing['version']}, got {version}",
+        )
+
+
+def _updated_fields(
+    existing: dict, data: "AnnotationUpdate", user: dict
+) -> tuple[str, str, str | None]:
+    """The body, target and visible_to an update stores (422 on bad provenance)."""
     new_body = (
         _guard_updated_provenance(existing["body"], data.body, user).model_dump_json()
         if data.body is not None
@@ -708,6 +802,39 @@ async def update_annotation(
         )
     else:
         new_visible = existing["visible_to"]
+    return new_body, new_target, new_visible
+
+
+def _reviewed_body(existing: dict, decision: str, user: dict) -> str:
+    """The stored body with the review fields of ``decision`` by ``user``."""
+    body = json.loads(existing["body"])
+    body["provenance"] = {
+        **_provenance(body),
+        "review_status": REVIEW_ACCEPTED if decision == "accept" else REVIEW_REJECTED,
+        "reviewed_by": user["sub"],
+        "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    return AnnotationBody(**body).model_dump_json()
+
+
+async def _get_existing(annotation_id: str) -> dict | None:
+    if _storage_kind() == "postgres":
+        return await _get_existing_postgres(annotation_id)
+    return await _get_existing_sqlite(annotation_id)
+
+
+@router.put("/{annotation_id}", response_model=AnnotationOut)
+async def update_annotation(
+    annotation_id: str,
+    data: AnnotationUpdate,
+    user: dict = Depends(require_user),
+) -> AnnotationOut:
+    existing = await _get_existing(annotation_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    _authorize_change(existing, user, "update")
+    _check_version(existing, data.version)
+    new_body, new_target, new_visible = _updated_fields(existing, data, user)
     return await _write_version(existing, new_body, new_target, new_visible)
 
 
@@ -742,6 +869,7 @@ async def _write_version(
         version=new_version,
         created_at=existing["created_at"],
         updated_at=updated_at,
+        comment_count=int(existing.get("comment_count") or 0),
     )
 
 
@@ -758,34 +886,12 @@ async def review_annotation(
     provenance's review fields change.  A rejected annotation is kept and
     left out of the list (see ``list_annotations``).
     """
-    existing = (
-        await _get_existing_postgres(annotation_id)
-        if _storage_kind() == "postgres"
-        else await _get_existing_sqlite(annotation_id)
-    )
+    existing = await _get_existing(annotation_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    require_same_study(user, existing["study_id"], "the annotation's study")
-    if not _is_visible(existing, user["sub"], set(user["groups"])):
-        raise HTTPException(status_code=404, detail="Annotation not found")
-    body = json.loads(existing["body"])
-    if not is_machine_made(body):
-        raise HTTPException(
-            status_code=403,
-            detail="Only machine-made annotations can be reviewed",
-        )
-    if existing["version"] != data.version:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Version conflict: expected {existing['version']}, got {data.version}",
-        )
-    body["provenance"] = {
-        **_provenance(body),
-        "review_status": REVIEW_ACCEPTED if data.decision == "accept" else REVIEW_REJECTED,
-        "reviewed_by": user["sub"],
-        "reviewed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    new_body = AnnotationBody(**body).model_dump_json()
+    _authorize_review(existing, user)
+    _check_version(existing, data.version)
+    new_body = _reviewed_body(existing, data.decision, user)
     return await _write_version(
         existing, new_body, existing["target"], existing["visible_to"]
     )
@@ -796,20 +902,263 @@ async def delete_annotation(
     annotation_id: str,
     user: dict = Depends(require_user),
 ) -> None:
-    existing = (
-        await _get_existing_postgres(annotation_id)
-        if _storage_kind() == "postgres"
-        else await _get_existing_sqlite(annotation_id)
-    )
+    """Delete an annotation and its comment thread (creator only)."""
+    existing = await _get_existing(annotation_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
-    require_same_study(user, existing["study_id"], "the annotation's study")
-    if not _can_modify(existing, user):
-        raise HTTPException(
-            status_code=403, detail="Only the creator may delete this annotation"
-        )
+    _authorize_change(existing, user, "delete")
 
     if _storage_kind() == "postgres":
         await _delete_postgres(annotation_id)
     else:
         await _delete_sqlite(annotation_id)
+
+
+# --- batch update, delete and review ----------------------------------------
+
+BATCH_MAX_ITEMS = 100
+
+AnnotationId = Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class AnnotationBatchUpdateItem(AnnotationUpdate):
+    id: AnnotationId
+
+
+class AnnotationBatchVersionItem(BaseModel):
+    id: AnnotationId
+    version: int = Field(..., description="Must match current version (optimistic lock)")
+
+
+class AnnotationBatchReviewItem(AnnotationReview):
+    id: AnnotationId
+
+
+class AnnotationBatchUpdate(BaseModel):
+    items: list[AnnotationBatchUpdateItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
+
+
+class AnnotationBatchDelete(BaseModel):
+    items: list[AnnotationBatchVersionItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
+
+
+class AnnotationBatchReview(BaseModel):
+    items: list[AnnotationBatchReviewItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
+
+
+def _item_loc(index: int) -> list[Any]:
+    return ["body", "items", index]
+
+
+def _item_error(exc: HTTPException, index: int, annotation_id: str) -> HTTPException:
+    """``exc`` from the single-item rules, naming the batch item it is about.
+
+    A 422 keeps FastAPI's validation shape (a list of ``{loc, msg, type}``);
+    403 and 404 answer ``{msg, index, id, loc}``.
+    """
+    if exc.status_code == 422:
+        return HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": _item_loc(index),
+                    "msg": str(exc.detail),
+                    "type": "value_error",
+                    "id": annotation_id,
+                }
+            ],
+        )
+    return HTTPException(
+        status_code=exc.status_code,
+        detail={
+            "msg": str(exc.detail),
+            "index": index,
+            "id": annotation_id,
+            "loc": _item_loc(index),
+        },
+    )
+
+
+def _require_unique_ids(items: list[Any]) -> None:
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        if item.id in seen:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": [*_item_loc(index), "id"],
+                        "msg": "An annotation may appear once in a batch",
+                        "type": "value_error",
+                        "id": item.id,
+                    }
+                ],
+            )
+        seen.add(item.id)
+
+
+def storage_transaction(write: bool = False):
+    """One transaction on annotation storage (``app.annotation_sql``)."""
+    return annotation_sql.transaction(
+        _storage_kind(),
+        db_path=_get_db_path,
+        db_url=_get_db_url,
+        pragmas=_apply_sqlite_pragmas,
+        write=write,
+    )
+
+
+def _annotation_columns(tx: annotation_sql.Transaction) -> str:
+    return (
+        "a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by, a.visible_to,"
+        f" a.version, {tx.ts('a.created_at')}, {tx.ts('a.updated_at')},"
+        f" {COMMENT_COUNT_SQL} AS comment_count"
+    )
+
+
+def _annotation_now(tx: annotation_sql.Transaction) -> str:
+    """``updated_at`` for an annotation write, as the single-item routes set it."""
+    return "timezone('utc', now())" if tx.kind == "postgres" else "datetime('now')"
+
+
+async def _locked_rows(tx: annotation_sql.Transaction, ids: list[str]) -> dict[str, dict]:
+    """The stored rows for ``ids``, locked for this transaction.
+
+    Rows are locked in id order, so two batches touching the same rows
+    cannot deadlock.
+    """
+    rows: dict[str, dict] = {}
+    for annotation_id in sorted(set(ids)):
+        row = await tx.fetchrow(
+            f"SELECT {_annotation_columns(tx)} FROM annotations a WHERE a.id = $1"
+            f"{tx.for_update}",
+            annotation_id,
+        )
+        if row is not None:
+            rows[annotation_id] = row
+    return rows
+
+
+async def _apply_batch(
+    kind: Literal["update", "delete", "review"],
+    items: list[Any],
+    user: dict,
+) -> list[AnnotationOut]:
+    """Check every item, then write them all in one transaction.
+
+    The first item that is missing, forbidden or invalid fails the batch
+    (404/403/422 naming it); stale versions are collected and answered
+    together (409).  Nothing is written unless every item passes.
+    """
+    _require_unique_ids(items)
+    async with storage_transaction(write=True) as tx:
+        rows = await _locked_rows(tx, [item.id for item in items])
+        conflicts: list[dict[str, Any]] = []
+        writes: list[tuple[int, Any, dict, tuple[str, str, str | None] | None]] = []
+        for index, item in enumerate(items):
+            existing = rows.get(item.id)
+            try:
+                if existing is None:
+                    raise HTTPException(status_code=404, detail="Annotation not found")
+                if kind == "review":
+                    _authorize_review(existing, user)
+                else:
+                    _authorize_change(existing, user, kind)
+                if existing["version"] != item.version:
+                    conflicts.append(
+                        {
+                            "index": index,
+                            "id": item.id,
+                            "loc": [*_item_loc(index), "version"],
+                            "version": item.version,
+                            "current_version": existing["version"],
+                        }
+                    )
+                    continue
+                if kind == "update":
+                    fields = _updated_fields(existing, item, user)
+                elif kind == "review":
+                    fields = (
+                        _reviewed_body(existing, item.decision, user),
+                        existing["target"],
+                        existing["visible_to"],
+                    )
+                else:
+                    fields = None
+            except HTTPException as exc:
+                raise _item_error(exc, index, item.id) from None
+            writes.append((index, item, existing, fields))
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "msg": "Version conflict: "
+                    + ", ".join(
+                        f"item {c['index']} ({c['id']}) is at version"
+                        f" {c['current_version']}, not {c['version']}"
+                        for c in conflicts
+                    ),
+                    "conflicts": conflicts,
+                },
+            )
+
+        for index, item, existing, fields in writes:
+            if fields is None:
+                changed = await tx.execute(
+                    "DELETE FROM annotations WHERE id = $1 AND version = $2",
+                    item.id,
+                    existing["version"],
+                )
+                await tx.execute(
+                    "DELETE FROM annotation_comments WHERE annotation_id = $1", item.id
+                )
+            else:
+                changed = await tx.execute(
+                    "UPDATE annotations SET body = $1, target = $2, visible_to = $3,"
+                    f" version = version + 1, updated_at = {_annotation_now(tx)}"
+                    " WHERE id = $4 AND version = $5",
+                    *fields,
+                    item.id,
+                    existing["version"],
+                )
+            if changed != 1:
+                raise _item_error(
+                    HTTPException(status_code=409, detail="Annotation was modified concurrently"),
+                    index,
+                    item.id,
+                )
+
+        if kind == "delete":
+            return [_row_to_out(existing) for _, _, existing, _ in writes]
+        updated = await _locked_rows(tx, [item.id for item in items])
+    return [_row_to_out(updated[item.id]) for item in items]
+
+
+@router.post("/batch-update", response_model=list[AnnotationOut])
+async def update_annotation_batch(
+    data: AnnotationBatchUpdate,
+    user: dict = Depends(require_user),
+) -> list[AnnotationOut]:
+    """Update 1–100 annotations under the PUT rules, all or none."""
+    return await _apply_batch("update", data.items, user)
+
+
+@router.post("/batch-delete", response_model=list[AnnotationOut])
+async def delete_annotation_batch(
+    data: AnnotationBatchDelete,
+    user: dict = Depends(require_user),
+) -> list[AnnotationOut]:
+    """Delete 1–100 annotations (creator only), all or none.
+
+    Answers the deleted annotations as they were stored.
+    """
+    return await _apply_batch("delete", data.items, user)
+
+
+@router.post("/batch-review", response_model=list[AnnotationOut])
+async def review_annotation_batch(
+    data: AnnotationBatchReview,
+    user: dict = Depends(require_user),
+) -> list[AnnotationOut]:
+    """Review 1–100 machine-made annotations under the review rules, all or none."""
+    return await _apply_batch("review", data.items, user)

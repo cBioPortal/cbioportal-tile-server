@@ -11,7 +11,9 @@ old, so none outlives the credential it logged in with by much.
 Schema setup runs inside one transaction that first takes a
 transaction-scoped Postgres advisory lock (``SCHEMA_LOCK_KEY``), so several
 workers or replicas starting against the same empty database apply the
-migrations one at a time.
+migrations one at a time.  ``annotation_schema_migrations`` records each
+component's version; a start applies only the steps above it, and every
+step only adds tables and indexes.
 """
 
 from __future__ import annotations
@@ -27,6 +29,10 @@ from . import lakebase_credentials
 
 # Fixed advisory-lock key shared by every process that migrates this schema.
 SCHEMA_LOCK_KEY = 0x6362_7769_6D69_6772  # b"cbwimigr"
+
+# Version of the ``annotations`` component: 1 = annotations;
+# 2 = annotation_comments and slide_notes.
+ANNOTATIONS_SCHEMA_VERSION = 2
 
 _pool: asyncpg.Pool | None = None
 _pool_dsn = ""
@@ -126,25 +132,33 @@ async def _ensure_migration_table(conn: asyncpg.Connection) -> None:
     )
 
 
-async def _migration_complete(
-    conn: asyncpg.Connection, component: str
-) -> bool:
+async def _component_version(conn: asyncpg.Connection, component: str) -> int:
+    """The schema version recorded for ``component`` (0 when none)."""
     current = await conn.fetchval(
         "SELECT version FROM annotation_schema_migrations WHERE component = $1",
         component,
     )
-    return current is not None and int(current) >= 1
+    return int(current) if current is not None else 0
 
 
-async def _mark_migration(conn: asyncpg.Connection, component: str) -> None:
+async def _migration_complete(
+    conn: asyncpg.Connection, component: str
+) -> bool:
+    return await _component_version(conn, component) >= 1
+
+
+async def _mark_migration(
+    conn: asyncpg.Connection, component: str, version: int = 1
+) -> None:
     await conn.execute(
         """
         INSERT INTO annotation_schema_migrations(component, version)
-        VALUES ($1, 1)
+        VALUES ($1, $2)
         ON CONFLICT (component) DO UPDATE SET version = EXCLUDED.version,
                                                applied_at = timezone('utc', now())
         """,
         component,
+        version,
     )
 
 
@@ -155,10 +169,23 @@ async def migrate(conn: asyncpg.Connection) -> None:
 
 
 async def _migrate_annotations(conn: asyncpg.Connection) -> None:
-    await _ensure_migration_table(conn)
-    if await _migration_complete(conn, "annotations"):
-        return
+    """Bring the ``annotations`` component up to ``ANNOTATIONS_SCHEMA_VERSION``.
 
+    Each step only adds tables and indexes, so rows written by an older
+    version are kept as they are.
+    """
+    await _ensure_migration_table(conn)
+    current = await _component_version(conn, "annotations")
+    if current < 1:
+        await _annotations_v1(conn)
+        await _mark_migration(conn, "annotations", 1)
+    if current < 2:
+        await _annotations_v2(conn)
+        await _mark_migration(conn, "annotations", 2)
+
+
+async def _annotations_v1(conn: asyncpg.Connection) -> None:
+    """The annotations table."""
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS annotations (
@@ -181,7 +208,48 @@ async def _migrate_annotations(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
     )
-    await _mark_migration(conn, "annotations")
+
+
+async def _annotations_v2(conn: asyncpg.Connection) -> None:
+    """Comment threads on annotations and slide-level notes."""
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS annotation_comments (
+            id            TEXT PRIMARY KEY,
+            annotation_id TEXT NOT NULL,
+            study_id      TEXT NOT NULL,
+            author        TEXT NOT NULL,
+            body          TEXT NOT NULL,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            deleted       BOOLEAN NOT NULL DEFAULT FALSE
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ann_comments_annotation "
+        "ON annotation_comments(annotation_id, created_at)"
+    )
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS slide_notes (
+            id          TEXT PRIMARY KEY,
+            slide_id    TEXT NOT NULL,
+            study_id    TEXT NOT NULL,
+            text        TEXT NOT NULL DEFAULT '',
+            tags        TEXT NOT NULL DEFAULT '[]',
+            created_by  TEXT NOT NULL,
+            visible_to  TEXT,
+            version     INTEGER NOT NULL DEFAULT 1,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_slide_notes_slide_study "
+        "ON slide_notes(slide_id, study_id)"
+    )
 
 
 async def migrate_agent(conn: asyncpg.Connection) -> None:
