@@ -453,20 +453,20 @@ request's user; it calls no companion route over HTTP.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see, each with its `comment_count`; rejected machine-made ones only with `include_rejected=true` |
-| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId`; machine provenance only from a trusted writer |
-| PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
+| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId`; machine provenance only from a trusted writer; `target.selector` must pass the [selector rules](#selector-rules) (`422`) |
+| PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock; `409` when the row changed since it was read, `404` when it was deleted); a sent `target` must pass the [selector rules](#selector-rules) |
 | POST | `/annotations/batch?studyId=` | Create 1–100 annotations in one transaction (all or none), returned in request order; every item's study must be `studyId` |
 | POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject", "version"}` on a machine-made annotation, by any user who can see it (see below) |
-| DELETE | `/annotations/{id}?studyId=` | Delete (creator only), with its comment thread |
+| DELETE | `/annotations/{id}?studyId=` | Delete (creator only), with its comment thread; `404` when it is already gone |
 | POST | `/annotations/batch-update?studyId=` | `{"items": [{"id", "version", "body"?, "target"?, "visible_to"?}]}`: 1–100 updates under the PUT rules, all or none (see [Batches](#batch-update-delete-and-review)) |
 | POST | `/annotations/batch-delete?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 deletes (creator only), all or none |
 | POST | `/annotations/batch-review?studyId=` | `{"items": [{"id", "version", "decision"}]}`: 1–100 reviews under the review rules, all or none |
-| GET | `/annotations/{id}/comments?studyId=` | The annotation's comment thread, oldest first, for anyone who can see the annotation (see [Comment threads](#comment-threads)) |
-| POST | `/annotations/{id}/comments?studyId=` | Add `{"body"}` to the thread |
+| GET | `/annotations/{id}/comments?studyId=[&offset=0][&limit=100]` | A page of the annotation's comment thread, oldest first, for anyone who can see the annotation: `{"annotation_id", "comments", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Comment threads](#comment-threads)) |
+| POST | `/annotations/{id}/comments?studyId=` | Add `{"body"}` to the thread; `422` once the annotation holds 1000 comments (deleted ones included) |
 | PUT | `/annotations/{id}/comments/{cid}?studyId=` | Edit `{"body"}` (author only) |
 | DELETE | `/annotations/{id}/comments/{cid}?studyId=` | Delete (author only; kept, flagged deleted) |
-| GET | `/slide-notes?studyId=&slide_id=` | The slide's notes the user may see, with a tag summary (see [Slide notes and tags](#slide-notes-and-tags)) |
-| POST | `/slide-notes?studyId=` | Create `{"slide_id", "study_id", "text"?, "tags"?, "visible_to"?}`; the body's `study_id` must be `studyId` |
+| GET | `/slide-notes?studyId=&slide_id=[&offset=0][&limit=100]` | A page of the slide's notes the user may see, with a tag summary over all of them: `{"slide_id", "notes", "tags", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Slide notes and tags](#slide-notes-and-tags)) |
+| POST | `/slide-notes?studyId=` | Create `{"slide_id", "study_id", "text"?, "tags"?, "visible_to"?}`; the body's `study_id` must be `studyId`; `422` once the slide holds 1000 notes in the study (from all users) |
 | PUT | `/slide-notes/{id}?studyId=` | Update `{"version", "text"?, "tags"?, "visible_to"?}` (creator only; `version` is an optimistic lock) |
 | DELETE | `/slide-notes/{id}?studyId=[&version=]` | Delete (creator only; `409` when a given `version` is stale) |
 | GET | `/agent/health` | Assistant status (reads no identity) |
@@ -537,7 +537,7 @@ written, all in one transaction: either every item is saved or none is.
 | Status | When | Body |
 |--------|------|------|
 | `200` | Every item saved | The rows in request order: updated or reviewed (`version` bumped), or, for `batch-delete`, as they were before deletion |
-| `422` | Fewer than 1 or more than 100 items, a repeated `id`, a malformed item, or an item the provenance rules refuse | FastAPI's `detail` list; each `loc` is `["body", "items", <index>, ...]` |
+| `422` | Fewer than 1 or more than 100 items, a repeated `id`, a malformed item (including a `target` the [selector rules](#selector-rules) refuse), or an item the provenance rules refuse | FastAPI's `detail` list; each `loc` is `["body", "items", <index>, ...]` |
 | `404` | An item's annotation does not exist (or, for a review, is not visible to the user) | `{"msg", "index", "id", "loc"}` for the first such item |
 | `403` | An item's annotation is in another study, not the user's (update, delete), or not machine-made (review) | `{"msg", "index", "id", "loc"}` for the first such item |
 | `409` | Any item's `version` is stale | `{"msg", "conflicts": [{"index", "id", "loc", "version", "current_version"}]}` listing every stale item |
@@ -545,6 +545,45 @@ written, all in one transaction: either every item is saved or none is.
 Checks run in request order: the first missing, forbidden or invalid item
 fails the batch at once, while stale versions are collected and answered
 together, so a client can refetch exactly those rows.
+
+#### Selector rules
+
+The viewer hands `target.selector.value` to Annotorious, which renders an
+`SvgSelector` as SVG markup, so every create and update (single, `batch`
+and `batch-update`) checks the selector it is sent and answers `422`
+(FastAPI's `detail` list, `loc` ending in `target`) unless it is one of the
+shapes the viewer writes. Stored rows are never re-checked: an existing
+annotation stays readable, and a `PUT` or batch item that leaves `target`
+out keeps it.
+
+- The selector object holds `type`, `value` and, optionally, `conformsTo`
+  (an `http(s)` URL), nothing else; `value` is at most 1,000,000
+  characters.
+- `FragmentSelector`: `xywh=x,y,w,h` or `xywh=pixel:x,y,w,h`, four numbers.
+- `SvgSelector`: one `<svg>` element (no attribute but the SVG `xmlns`)
+  holding at least one shape, directly or inside one level of `<g>`
+  (no attribute but `fill-rule`). The shapes and their only attributes:
+
+  | Element | Attributes |
+  |---------|------------|
+  | `<polygon>`, `<polyline>` | `points`: numbers separated by commas or whitespace |
+  | `<path>` | `d`: path commands `M L H V C S Q T A Z` (either case) and numbers |
+  | `<circle>` | `cx`, `cy`, `r` (a point is `r="0"`) |
+  | `<ellipse>` | `cx`, `cy`, `rx`, `ry` |
+  | `<line>` | `x1`, `y1`, `x2`, `y2` |
+  | `<rect>` | `x`, `y`, `width`, `height`, `rx`, `ry` |
+
+  Any shape (and `<g>`) may also carry `fill-rule` (`nonzero` or
+  `evenodd`), as a region with holes does:
+  `<svg><g><path fill-rule="evenodd" d="M … Z M … Z" /></g></svg>`. A
+  number is a decimal with an optional sign and exponent (`NaN`,
+  `Infinity` and units are refused). Shapes may be self-closing or have an
+  empty closing tag.
+- Refused: any other element (`script`, `foreignObject`, `image`, `use`,
+  `a`, `style`, nested `<g>`, ...), any other attribute (`on*`, `style`,
+  `class`, `href`, `xlink:href`, `transform`, ...), text, entities and
+  character references, comments, CDATA, processing instructions and
+  DOCTYPEs.
 
 #### Comment threads
 
@@ -564,6 +603,36 @@ note (`body.comment`, which only its creator edits):
 A comment is `{"id", "annotation_id", "study_id", "author", "body",
 "created_at", "updated_at"}`; `author` is `X-Auth-Request-User`.
 
+An annotation holds at most 1000 comments, deleted ones included (so
+deleting and reposting cannot grow a thread without bound); the next `POST`
+answers `422`. The list is paged: `offset` (default `0`, at most
+`1000000`) and `limit` (default `100`, `1`–`500`; `422` outside those)
+pick a slice of the live comments, oldest first:
+
+```json
+{
+  "annotation_id": "5d0c…",
+  "comments": [
+    {"id": "…", "annotation_id": "5d0c…", "study_id": "luad_mskcc", "author": "alice",
+     "body": "Agree", "created_at": "2026-11-18T14:02:11Z", "updated_at": "2026-11-18T14:02:11Z"}
+  ],
+  "total": 1,
+  "offset": 0,
+  "limit": 100,
+  "has_more": false,
+  "next_offset": null
+}
+```
+
+`total` counts the thread's live comments (as `comment_count` does);
+`next_offset` is the `offset` of the next page, `null` on the last
+(`has_more` is then `false`). Comments that are deleted between page
+requests shift later pages back by one.
+
+At every start the companion also deletes comments whose annotation no
+longer exists (left by anything that removed annotations outside these
+routes, which delete a thread with its annotation).
+
 #### Slide notes and tags
 
 A slide note belongs to a slide (`slide_id`, the opaque 12-hex slide key)
@@ -581,8 +650,12 @@ to 20 `tags`, or both, never neither (`422`).
 - **Writes**: only the creator may update or delete a note. `PUT` needs
   the current `version` and bumps it; `DELETE` checks `version` when it is
   given. Fields left out of a `PUT` keep their stored values.
+- **Cap**: a slide holds at most 1000 notes in a study, from all users;
+  the next `POST` answers `422`.
 
-`GET /slide-notes` answers:
+`GET /slide-notes` takes `offset` (default `0`, at most `1000000`) and
+`limit` (default `100`, `1`–`500`; `422` outside those) over the notes the
+user may see, oldest first, and answers:
 
 ```json
 {
@@ -592,12 +665,19 @@ to 20 `tags`, or both, never neither (`422`).
      "tags": ["QC", "LUAD"], "created_by": "alice", "visible_to": [], "version": 1,
      "created_at": "2026-11-18T14:02:11Z", "updated_at": "2026-11-18T14:02:11Z"}
   ],
-  "tags": [{"tag": "QC", "count": 1}, {"tag": "LUAD", "count": 1}]
+  "tags": [{"tag": "QC", "count": 1}, {"tag": "LUAD", "count": 1}],
+  "total": 1,
+  "offset": 0,
+  "limit": 100,
+  "has_more": false,
+  "next_offset": null
 }
 ```
 
-`notes` are oldest first; `tags` counts, for each tag, the listed notes
-that carry it, most used first.
+`notes` is the page, oldest first; `total` counts every note the user may
+see, and `tags` counts, for each tag, all those notes that carry it (not
+only the page's), most used first. `next_offset` is the `offset` of the
+next page, `null` on the last.
 
 ### Annotation storage schema
 
