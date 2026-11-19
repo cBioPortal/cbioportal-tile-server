@@ -12,7 +12,10 @@ and visible to the user (``visible_to``; 404 otherwise, as for a missing
 annotation).  Editing and deleting a comment stay with its author, who must
 still be able to see the annotation.  A deleted comment is kept, flagged
 ``deleted``, and left out of the thread and of the annotation's
-``comment_count``.  Deleting the annotation deletes its thread.
+``comment_count``.  Deleting the annotation (a soft delete) keeps its
+thread: every route here answers 404 for the deleted annotation, as for a
+missing one, until its creator restores it.  The retention purge removes
+the thread with the annotation.
 
 The thread is separate from the annotation's own note (``body.comment``),
 which only the annotation's creator edits.
@@ -95,10 +98,10 @@ def _columns(tx: Transaction) -> str:
 async def _visible_annotation(
     tx: Transaction, annotation_id: str, user: dict, lock: bool = False
 ) -> dict:
-    """The annotation, if ``user`` may see it in the authorized study."""
+    """The live annotation, if ``user`` may see it in the authorized study."""
     row = await tx.fetchrow(
         "SELECT a.id, a.study_id, a.created_by, a.visible_to FROM annotations a"
-        f" WHERE a.id = $1{tx.for_update if lock else ''}",
+        f" WHERE a.id = $1 AND {annotation_store.LIVE_SQL}{tx.for_update if lock else ''}",
         annotation_id,
     )
     if row is None:

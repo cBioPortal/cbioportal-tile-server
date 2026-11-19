@@ -13,7 +13,7 @@ transaction-scoped Postgres advisory lock (``SCHEMA_LOCK_KEY``), so several
 workers or replicas starting against the same empty database apply the
 migrations one at a time.  ``annotation_schema_migrations`` records each
 component's version; a start applies only the steps above it, and every
-step only adds tables and indexes.
+step only adds tables, nullable columns and indexes.
 """
 
 from __future__ import annotations
@@ -31,8 +31,9 @@ from . import lakebase_credentials
 SCHEMA_LOCK_KEY = 0x6362_7769_6D69_6772  # b"cbwimigr"
 
 # Version of the ``annotations`` component: 1 = annotations;
-# 2 = annotation_comments and slide_notes.
-ANNOTATIONS_SCHEMA_VERSION = 2
+# 2 = annotation_comments and slide_notes; 3 = annotations.deleted_at
+# (soft delete).
+ANNOTATIONS_SCHEMA_VERSION = 3
 
 _pool: asyncpg.Pool | None = None
 _pool_dsn = ""
@@ -171,8 +172,8 @@ async def migrate(conn: asyncpg.Connection) -> None:
 async def _migrate_annotations(conn: asyncpg.Connection) -> None:
     """Bring the ``annotations`` component up to ``ANNOTATIONS_SCHEMA_VERSION``.
 
-    Each step only adds tables and indexes, so rows written by an older
-    version are kept as they are.
+    Each step only adds tables, nullable columns and indexes, so rows
+    written by an older version are kept as they are.
     """
     await _ensure_migration_table(conn)
     current = await _component_version(conn, "annotations")
@@ -182,6 +183,9 @@ async def _migrate_annotations(conn: asyncpg.Connection) -> None:
     if current < 2:
         await _annotations_v2(conn)
         await _mark_migration(conn, "annotations", 2)
+    if current < 3:
+        await _annotations_v3(conn)
+        await _mark_migration(conn, "annotations", 3)
 
 
 async def _annotations_v1(conn: asyncpg.Connection) -> None:
@@ -249,6 +253,22 @@ async def _annotations_v2(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_slide_notes_slide_study "
         "ON slide_notes(slide_id, study_id)"
+    )
+
+
+async def _annotations_v3(conn: asyncpg.Connection) -> None:
+    """Soft delete: ``annotations.deleted_at`` (null while the row is live).
+
+    A nullable column without a default is a catalog-only change, so no
+    stored row is rewritten; every existing row stays live.  The partial
+    index covers only deleted rows, for the retention purge.
+    """
+    await conn.execute(
+        "ALTER TABLE annotations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ann_deleted_at ON annotations(deleted_at)"
+        " WHERE deleted_at IS NOT NULL"
     )
 
 

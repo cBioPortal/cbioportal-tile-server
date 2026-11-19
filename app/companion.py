@@ -22,6 +22,8 @@ no ``Origin`` or one that is the request's own host or listed in
 cross-site page cannot send the custom header.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -146,9 +148,14 @@ async def lifespan(app: FastAPI):
     logger.info("Annotation DB ready (%s)", annotations.storage_kind())
     await agent.init_db()
     logger.info("Agent proposal tables ready")
+    # init_db purged once; repeat daily while the service is up.
+    purge = asyncio.create_task(annotations.purge_deleted_annotations_forever())
     try:
         yield
     finally:
+        purge.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await purge
         await annotations.close_db()
 
 

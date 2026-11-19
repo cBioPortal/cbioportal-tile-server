@@ -6,11 +6,13 @@ Routes (each with ``?studyId=<study>``):
   POST   /annotations             create a new annotation
   POST   /annotations/batch       create up to 100 in one study, all or none
   PUT    /annotations/{id}        update (creator only; optimistic concurrency via version)
-  POST   /annotations/{id}/review accept or reject a machine-made annotation
-  DELETE /annotations/{id}        delete (creator only) with its comment thread
+  POST   /annotations/{id}/review accept, reject or reset a machine-made annotation's review
+  DELETE /annotations/{id}        soft-delete (creator only); the comment thread is kept
+  POST   /annotations/{id}/restore  bring a deleted annotation back (creator only)
   POST   /annotations/batch-update  update up to 100 under the PUT rules, all or none
   POST   /annotations/batch-delete  delete up to 100 (creator only), all or none
   POST   /annotations/batch-review  review up to 100 under the review rules, all or none
+  POST   /annotations/batch-restore restore up to 100 (creator only), all or none
 
 Comment threads (``app.annotation_comments``) live under
 ``/annotations/{id}/comments``; the list reports each row's ``comment_count``.
@@ -33,7 +35,18 @@ rejected by any user who can see it in its study, not only its creator.
 A review records ``review_status``, ``reviewed_by`` and ``reviewed_at`` in
 the provenance and bumps the version.  A rejected annotation is kept, for
 the audit trail, and left out of the list unless ``include_rejected=true``.
-Its creator may still delete it.
+Its creator may still delete it.  ``reset`` undoes a review: only the
+reviewer (``reviewed_by``) may reset it, which removes the three fields
+(the annotation is unreviewed, and listed again if it was rejected) and
+bumps the version.
+
+Soft delete: DELETE (single or batch) sets ``deleted_at`` and keeps the row,
+its version and its comment thread.  A deleted annotation is absent from
+every read and write path (list, PUT, review, batch, comments: 404) until
+its creator restores it under the same id, which bumps the version.
+``purge_deleted_annotations`` removes rows deleted more than
+``ANNOTATION_DELETED_RETENTION_DAYS`` ago, with their threads, at every
+start and once a day.
 
 Provenance trust: over HTTP, only a trusted writer (a user listed in
 ``ANNOTATION_TRUSTED_WRITERS``, such as a bulk loader's service identity)
@@ -55,9 +68,11 @@ otherwise); stored rows are read as they are.
 
 A single-item PUT, review or DELETE whose row was deleted after it was read
 answers 404; one whose row changed answers 409.  At every start,
-``sweep_orphan_comments`` deletes comments whose annotation is gone.
+``sweep_orphan_comments`` deletes comments whose annotation row is gone (a
+soft-deleted annotation's row is still there, so its thread is kept).
 """
 
+import asyncio
 import json
 import logging
 import uuid
@@ -81,6 +96,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/annotations", tags=["annotations"])
 
 SLIDE_KEY_REGEX = SLIDE_KEY_PATTERN.pattern
+
+# Annotation ``a`` is live (not soft-deleted).
+LIVE_SQL = "a.deleted_at IS NULL"
 
 # The live comments in annotation ``a``'s thread.
 COMMENT_COUNT_SQL = (
@@ -167,6 +185,8 @@ def _can_modify(row: dict, user: dict) -> bool:
 MACHINE_SOURCES = frozenset({"agent", "assistant", "ai", "model", "precomputed"})
 REVIEW_ACCEPTED = "accepted"
 REVIEW_REJECTED = "rejected"
+# A review decision that undoes the current review.
+REVIEW_RESET = "reset"
 REVIEW_FIELDS = ("review_status", "reviewed_by", "reviewed_at")
 
 
@@ -306,9 +326,17 @@ class AnnotationUpdate(BaseModel):
 
 
 class AnnotationReview(BaseModel):
-    decision: Literal["accept", "reject"]
+    decision: Literal["accept", "reject", "reset"] = Field(
+        ..., description="``reset`` clears the review (reviewer only)"
+    )
     version: int = Field(
         ..., description="Must match current version (optimistic lock)"
+    )
+
+
+class AnnotationRestore(BaseModel):
+    version: int = Field(
+        ..., description="The deleted annotation's version (optimistic lock)"
     )
 
 
@@ -358,7 +386,8 @@ async def _init_sqlite(path: str) -> None:
                 visible_to  TEXT,
                 version     INTEGER DEFAULT 1,
                 created_at  TEXT DEFAULT (datetime('now')),
-                updated_at  TEXT DEFAULT (datetime('now'))
+                updated_at  TEXT DEFAULT (datetime('now')),
+                deleted_at  TEXT
             )
             """
         )
@@ -367,6 +396,20 @@ async def _init_sqlite(path: str) -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_ann_slide ON annotations(slide_id)"
+        )
+        # Schema version 3 (see app.annotation_db): soft delete.  A table
+        # created before it gains the nullable column; its rows stay live.
+        cursor = await db.execute("PRAGMA table_info(annotations)")
+        if "deleted_at" not in {row[1] for row in await cursor.fetchall()}:
+            try:
+                await db.execute("ALTER TABLE annotations ADD COLUMN deleted_at TEXT")
+            except aiosqlite.OperationalError as exc:
+                # Another worker added it first.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ann_deleted_at ON annotations(deleted_at)"
+            " WHERE deleted_at IS NOT NULL"
         )
         # Schema version 2 (see app.annotation_db): comment threads and
         # slide-level notes.  Timestamps are UTC ISO-8601 text.
@@ -429,14 +472,16 @@ async def init_db(db_path: str | None = None, db_url: str | None = None) -> None
         await _init_sqlite(_get_db_path())
         logger.info("Annotation DB ready (sqlite): %s", _get_db_path())
     await sweep_orphan_comments()
+    await purge_deleted_annotations()
 
 
 async def sweep_orphan_comments() -> int:
     """Delete comments whose annotation no longer exists; returns how many.
 
-    The delete routes remove a thread with its annotation in one
-    transaction; this catches rows left by anything that deleted
-    annotations another way.  It runs at every start and is idempotent.
+    A soft-deleted annotation keeps its row, so its thread is not an
+    orphan; the retention purge removes a thread with its annotation in one
+    transaction.  This catches rows left by anything that removed
+    annotation rows another way.  It runs at every start and is idempotent.
     """
     try:
         async with storage_transaction(write=True) as tx:
@@ -452,6 +497,58 @@ async def sweep_orphan_comments() -> int:
     return swept
 
 
+# How often the companion runs the retention purge while it is up.
+PURGE_INTERVAL_SECONDS = 24 * 60 * 60
+
+
+def deleted_retention_days() -> int:
+    """Days a deleted annotation is kept (``0``: forever)."""
+    return max(0, int(getattr(settings, "annotation_deleted_retention_days", 30) or 0))
+
+
+async def purge_deleted_annotations(retention_days: int | None = None) -> int:
+    """Remove annotations deleted more than ``retention_days`` ago, with their
+    comment threads; returns how many annotations were removed.
+
+    ``retention_days`` defaults to ``ANNOTATION_DELETED_RETENTION_DAYS``;
+    ``0`` purges nothing.  Live annotations are never touched.  Idempotent,
+    so every worker may run it.
+    """
+    days = deleted_retention_days() if retention_days is None else max(0, retention_days)
+    if days == 0:
+        return 0
+    try:
+        async with storage_transaction(write=True) as tx:
+            if tx.kind == "postgres":
+                cutoff = "timezone('utc', now()) - make_interval(days => $1)"
+            else:
+                cutoff = "datetime('now', '-' || $1 || ' days')"
+            expired = f"SELECT a.id FROM annotations a WHERE a.deleted_at IS NOT NULL AND a.deleted_at < {cutoff}"
+            await tx.execute(
+                f"DELETE FROM annotation_comments WHERE annotation_id IN ({expired})", days
+            )
+            purged = await tx.execute(
+                f"DELETE FROM annotations WHERE id IN ({expired})", days
+            )
+    except Exception:
+        logger.exception("Deleted annotation purge failed")
+        return 0
+    if purged:
+        logger.info(
+            "Purged %d annotations deleted more than %d days ago", purged, days
+        )
+    return purged
+
+
+async def purge_deleted_annotations_forever(
+    interval_seconds: float = PURGE_INTERVAL_SECONDS,
+) -> None:
+    """Run the retention purge every ``interval_seconds`` until cancelled."""
+    while True:
+        await asyncio.sleep(interval_seconds)
+        await purge_deleted_annotations()
+
+
 async def close_db() -> None:
     await close_pool()
 
@@ -464,7 +561,7 @@ async def _list_sqlite(slide_id: str, study_id: str, user_sub: str) -> list[dict
             f"""
             SELECT a.*, {COMMENT_COUNT_SQL} AS comment_count
             FROM annotations a
-            WHERE a.slide_id = ? AND a.study_id = ?
+            WHERE a.slide_id = ? AND a.study_id = ? AND {LIVE_SQL}
               AND (a.created_by = ? OR a.visible_to IS NOT NULL)
             """,
             (slide_id, study_id, user_sub),
@@ -484,7 +581,7 @@ async def _list_postgres(slide_id: str, study_id: str, user_sub: str) -> list[di
                 to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at,
                 {COMMENT_COUNT_SQL} AS comment_count
             FROM annotations a
-            WHERE a.slide_id = $1 AND a.study_id = $2
+            WHERE a.slide_id = $1 AND a.study_id = $2 AND {LIVE_SQL}
               AND (a.created_by = $3 OR a.visible_to IS NOT NULL)
             """,
             slide_id,
@@ -579,7 +676,7 @@ async def _get_existing_sqlite(annotation_id: str) -> dict | None:
         cursor = await db.execute(
             "SELECT a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by,"
             f" a.visible_to, a.version, a.created_at, {COMMENT_COUNT_SQL} AS comment_count"
-            " FROM annotations a WHERE a.id = ?",
+            f" FROM annotations a WHERE a.id = ? AND {LIVE_SQL}",
             (annotation_id,),
         )
         row = await cursor.fetchone()
@@ -594,7 +691,7 @@ async def _get_existing_postgres(annotation_id: str) -> dict | None:
                 a.id, a.slide_id, a.study_id, a.body, a.target, a.created_by, a.visible_to, a.version,
                 to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                 {COMMENT_COUNT_SQL} AS comment_count
-            FROM annotations a WHERE a.id = $1
+            FROM annotations a WHERE a.id = $1 AND {LIVE_SQL}
             """,
             annotation_id,
         )
@@ -616,7 +713,7 @@ async def _update_sqlite(
             UPDATE annotations
             SET body = ?, target = ?, visible_to = ?, version = ?,
                 updated_at = datetime('now')
-            WHERE id = ? AND version = ?
+            WHERE id = ? AND version = ? AND deleted_at IS NULL
             """,
             (
                 new_body,
@@ -651,7 +748,7 @@ async def _update_postgres(
             UPDATE annotations
             SET body = $1, target = $2, visible_to = $3, version = $4,
                 updated_at = timezone('utc', now())
-            WHERE id = $5 AND version = $6
+            WHERE id = $5 AND version = $6 AND deleted_at IS NULL
             RETURNING to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
             """,
             new_body,
@@ -665,31 +762,30 @@ async def _update_postgres(
 
 
 async def _delete_sqlite(annotation_id: str) -> int:
-    """Delete the annotation and its thread; returns the annotations deleted."""
+    """Soft-delete the live annotation; returns the annotations deleted.
+
+    The row keeps its version and its comment thread (see the module notes).
+    """
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
-        await db.execute("BEGIN IMMEDIATE")
-        try:
-            cursor = await db.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
-            deleted = cursor.rowcount
-            await db.execute(
-                "DELETE FROM annotation_comments WHERE annotation_id = ?", (annotation_id,)
-            )
-        except BaseException:
-            await db.rollback()
-            raise
+        cursor = await db.execute(
+            "UPDATE annotations SET deleted_at = datetime('now')"
+            " WHERE id = ? AND deleted_at IS NULL",
+            (annotation_id,),
+        )
+        deleted = cursor.rowcount
         await db.commit()
     return deleted
 
 
 async def _delete_postgres(annotation_id: str) -> int:
-    """Delete the annotation and its thread; returns the annotations deleted."""
+    """Soft-delete the live annotation; returns the annotations deleted."""
     async with connection(_get_db_url()) as conn:
-        async with conn.transaction():
-            status = await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
-            await conn.execute(
-                "DELETE FROM annotation_comments WHERE annotation_id = $1", annotation_id
-            )
+        status = await conn.execute(
+            "UPDATE annotations SET deleted_at = timezone('utc', now())"
+            " WHERE id = $1 AND deleted_at IS NULL",
+            annotation_id,
+        )
     return int(status.rsplit(" ", 1)[-1])
 
 
@@ -852,9 +948,37 @@ def _updated_fields(
     return new_body, new_target, new_visible
 
 
+def _authorize_reset(existing: dict, user: dict) -> None:
+    """422/403 unless ``user`` may reset ``existing``'s review (reviewer only).
+
+    Call after ``_authorize_review`` and the version check, so a stale
+    reset answers 409 like any other stale write.  A review stored without
+    ``reviewed_by`` (written by a trusted writer) has no reviewer, so no
+    one may reset it over this route.
+    """
+    provenance = _provenance(existing["body"])
+    if not any(name in provenance for name in REVIEW_FIELDS):
+        raise HTTPException(status_code=422, detail="The annotation has no review to reset")
+    reviewer = provenance.get("reviewed_by")
+    if not isinstance(reviewer, str) or not _can_modify({"created_by": reviewer}, user):
+        raise HTTPException(
+            status_code=403, detail="Only the reviewer may reset this review"
+        )
+
+
 def _reviewed_body(existing: dict, decision: str, user: dict) -> str:
-    """The stored body with the review fields of ``decision`` by ``user``."""
+    """The stored body with the review fields of ``decision`` by ``user``.
+
+    ``reset`` removes the review fields (call ``_authorize_reset`` first).
+    """
     body = json.loads(existing["body"])
+    if decision == REVIEW_RESET:
+        body["provenance"] = {
+            name: value
+            for name, value in _provenance(body).items()
+            if name not in REVIEW_FIELDS
+        }
+        return AnnotationBody(**body).model_dump_json()
     body["provenance"] = {
         **_provenance(body),
         "review_status": REVIEW_ACCEPTED if decision == "accept" else REVIEW_REJECTED,
@@ -930,18 +1054,21 @@ async def review_annotation(
     data: AnnotationReview,
     user: dict = Depends(require_user),
 ) -> AnnotationOut:
-    """Accept or reject a machine-made annotation.
+    """Accept, reject or reset the review of a machine-made annotation.
 
-    Any user who can see the annotation in the authorized study may review
-    it; the creator-only rule still applies to PUT and DELETE.  Only the
-    provenance's review fields change.  A rejected annotation is kept and
-    left out of the list (see ``list_annotations``).
+    Any user who can see the annotation in the authorized study may accept
+    or reject it; only the reviewer may reset a review.  The creator-only
+    rule still applies to PUT and DELETE.  Only the provenance's review
+    fields change.  A rejected annotation is kept and left out of the list
+    (see ``list_annotations``) until it is accepted or reset.
     """
     existing = await _get_existing(annotation_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
     _authorize_review(existing, user)
     _check_version(existing, data.version)
+    if data.decision == REVIEW_RESET:
+        _authorize_reset(existing, user)
     new_body = _reviewed_body(existing, data.decision, user)
     return await _write_version(
         existing, new_body, existing["target"], existing["visible_to"]
@@ -953,7 +1080,11 @@ async def delete_annotation(
     annotation_id: str,
     user: dict = Depends(require_user),
 ) -> None:
-    """Delete an annotation and its comment thread (creator only)."""
+    """Soft-delete an annotation (creator only); its comment thread is kept.
+
+    The creator may restore it (``POST /annotations/{id}/restore``) until the
+    retention purge removes it.
+    """
     existing = await _get_existing(annotation_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Annotation not found")
@@ -965,7 +1096,47 @@ async def delete_annotation(
         raise HTTPException(status_code=404, detail="Annotation not found")
 
 
-# --- batch update, delete and review ----------------------------------------
+@router.post("/{annotation_id}/restore", response_model=AnnotationOut)
+async def restore_annotation(
+    annotation_id: str,
+    data: AnnotationRestore,
+    user: dict = Depends(require_user),
+) -> AnnotationOut:
+    """Bring a deleted annotation back under its id (creator only).
+
+    404 unless the annotation exists and is deleted; ``version`` must be
+    the deleted row's version (409 otherwise).  The restored annotation's
+    version is bumped and its comment thread is listed again.
+    """
+    async with storage_transaction(write=True) as tx:
+        existing = await tx.fetchrow(
+            f"SELECT {_annotation_columns(tx)} FROM annotations a"
+            f" WHERE a.id = $1 AND a.deleted_at IS NOT NULL{tx.for_update}",
+            annotation_id,
+        )
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Deleted annotation not found")
+        _authorize_change(existing, user, "restore")
+        _check_version(existing, data.version)
+        await _restore_row(tx, annotation_id, existing["version"])
+        row = await tx.fetchrow(
+            f"SELECT {_annotation_columns(tx)} FROM annotations a WHERE a.id = $1",
+            annotation_id,
+        )
+    return _row_to_out(row)
+
+
+async def _restore_row(tx: annotation_sql.Transaction, annotation_id: str, version: int) -> int:
+    return await tx.execute(
+        "UPDATE annotations SET deleted_at = NULL, version = version + 1,"
+        f" updated_at = {_annotation_now(tx)}"
+        " WHERE id = $1 AND version = $2 AND deleted_at IS NOT NULL",
+        annotation_id,
+        version,
+    )
+
+
+# --- batch update, delete, review and restore -------------------------------
 
 BATCH_MAX_ITEMS = 100
 
@@ -995,6 +1166,10 @@ class AnnotationBatchDelete(BaseModel):
 
 class AnnotationBatchReview(BaseModel):
     items: list[AnnotationBatchReviewItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
+
+
+class AnnotationBatchRestore(BaseModel):
+    items: list[AnnotationBatchVersionItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
 
 
 def _item_loc(index: int) -> list[Any]:
@@ -1072,17 +1247,21 @@ def _annotation_now(tx: annotation_sql.Transaction) -> str:
     return "timezone('utc', now())" if tx.kind == "postgres" else "datetime('now')"
 
 
-async def _locked_rows(tx: annotation_sql.Transaction, ids: list[str]) -> dict[str, dict]:
-    """The stored rows for ``ids``, locked for this transaction.
+async def _locked_rows(
+    tx: annotation_sql.Transaction, ids: list[str], *, deleted: bool = False
+) -> dict[str, dict]:
+    """The stored live rows for ``ids`` (deleted ones with ``deleted``),
+    locked for this transaction.
 
     Rows are locked in id order, so two batches touching the same rows
     cannot deadlock.
     """
+    state = "a.deleted_at IS NOT NULL" if deleted else LIVE_SQL
     rows: dict[str, dict] = {}
     for annotation_id in sorted(set(ids)):
         row = await tx.fetchrow(
             f"SELECT {_annotation_columns(tx)} FROM annotations a WHERE a.id = $1"
-            f"{tx.for_update}",
+            f" AND {state}{tx.for_update}",
             annotation_id,
         )
         if row is not None:
@@ -1091,7 +1270,7 @@ async def _locked_rows(tx: annotation_sql.Transaction, ids: list[str]) -> dict[s
 
 
 async def _apply_batch(
-    kind: Literal["update", "delete", "review"],
+    kind: Literal["update", "delete", "review", "restore"],
     items: list[Any],
     user: dict,
 ) -> list[AnnotationOut]:
@@ -1103,14 +1282,21 @@ async def _apply_batch(
     """
     _require_unique_ids(items)
     async with storage_transaction(write=True) as tx:
-        rows = await _locked_rows(tx, [item.id for item in items])
+        rows = await _locked_rows(
+            tx, [item.id for item in items], deleted=kind == "restore"
+        )
         conflicts: list[dict[str, Any]] = []
         writes: list[tuple[int, Any, dict, tuple[str, str, str | None] | None]] = []
         for index, item in enumerate(items):
             existing = rows.get(item.id)
             try:
                 if existing is None:
-                    raise HTTPException(status_code=404, detail="Annotation not found")
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Deleted annotation not found"
+                        if kind == "restore"
+                        else "Annotation not found",
+                    )
                 if kind == "review":
                     _authorize_review(existing, user)
                 else:
@@ -1129,6 +1315,8 @@ async def _apply_batch(
                 if kind == "update":
                     fields = _updated_fields(existing, item, user)
                 elif kind == "review":
+                    if item.decision == REVIEW_RESET:
+                        _authorize_reset(existing, user)
                     fields = (
                         _reviewed_body(existing, item.decision, user),
                         existing["target"],
@@ -1154,20 +1342,20 @@ async def _apply_batch(
             )
 
         for index, item, existing, fields in writes:
-            if fields is None:
+            if kind == "restore":
+                changed = await _restore_row(tx, item.id, existing["version"])
+            elif kind == "delete":
                 changed = await tx.execute(
-                    "DELETE FROM annotations WHERE id = $1 AND version = $2",
+                    f"UPDATE annotations SET deleted_at = {_annotation_now(tx)}"
+                    " WHERE id = $1 AND version = $2 AND deleted_at IS NULL",
                     item.id,
                     existing["version"],
-                )
-                await tx.execute(
-                    "DELETE FROM annotation_comments WHERE annotation_id = $1", item.id
                 )
             else:
                 changed = await tx.execute(
                     "UPDATE annotations SET body = $1, target = $2, visible_to = $3,"
                     f" version = version + 1, updated_at = {_annotation_now(tx)}"
-                    " WHERE id = $4 AND version = $5",
+                    " WHERE id = $4 AND version = $5 AND deleted_at IS NULL",
                     *fields,
                     item.id,
                     existing["version"],
@@ -1199,9 +1387,10 @@ async def delete_annotation_batch(
     data: AnnotationBatchDelete,
     user: dict = Depends(require_user),
 ) -> list[AnnotationOut]:
-    """Delete 1–100 annotations (creator only), all or none.
+    """Soft-delete 1–100 annotations (creator only), all or none.
 
-    Answers the deleted annotations as they were stored.
+    Answers the deleted annotations as they were stored (their version is
+    unchanged, and is the one to restore them with).
     """
     return await _apply_batch("delete", data.items, user)
 
@@ -1213,3 +1402,12 @@ async def review_annotation_batch(
 ) -> list[AnnotationOut]:
     """Review 1–100 machine-made annotations under the review rules, all or none."""
     return await _apply_batch("review", data.items, user)
+
+
+@router.post("/batch-restore", response_model=list[AnnotationOut])
+async def restore_annotation_batch(
+    data: AnnotationBatchRestore,
+    user: dict = Depends(require_user),
+) -> list[AnnotationOut]:
+    """Restore 1–100 deleted annotations (creator only), all or none."""
+    return await _apply_batch("restore", data.items, user)

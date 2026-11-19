@@ -157,7 +157,7 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
             f'SELECT component, version FROM "{schema}".annotation_schema_migrations'
         )
         assert {row["component"]: row["version"] for row in versions} == {
-            "annotations": 2,
+            "annotations": 3,
             "agent_actions": 1,
             "agent_retrieval_candidates": 1,
             "agent_retrieval_runs": 1,

@@ -281,7 +281,7 @@ async def test_concurrent_batches_take_one_version():
 # --- batch delete -----------------------------------------------------------
 
 
-async def test_batch_delete_removes_every_item_and_its_thread():
+async def test_batch_delete_hides_every_item_and_keeps_its_thread():
     rows = [await create(str(i), visible_to=[]) for i in range(3)]
     await annotation_comments.create_comment(rows[0].id, CommentIn(body="hi"), user("other"))
 
@@ -292,10 +292,11 @@ async def test_batch_delete_removes_every_item_and_its_thread():
 
     assert [row.id for row in deleted] == [rows[2].id, rows[0].id]
     assert deleted[1].comment_count == 1
+    assert [row.version for row in deleted] == [1, 1]
     assert list(await stored()) == [rows[1].id]
     async with annotations.storage_transaction() as tx:
         left = await tx.fetch("SELECT id FROM annotation_comments WHERE annotation_id = $1", rows[0].id)
-    assert left == []
+    assert len(left) == 1
 
 
 async def test_batch_delete_is_creator_only_and_versioned():
@@ -467,12 +468,13 @@ async def test_threads_follow_the_annotations_study_and_visibility():
     assert hidden.value.status_code == 404
 
 
-async def test_deleting_an_annotation_deletes_its_thread():
+async def test_deleting_an_annotation_keeps_its_thread():
+    """Soft delete keeps the thread for a restore (see test_annotation_undo)."""
     row = await create(visible_to=[])
     await annotation_comments.create_comment(row.id, CommentIn(body="hi"), user("other"))
     await annotations.delete_annotation(row.id, user("owner"))
     async with annotations.storage_transaction() as tx:
-        assert await tx.fetch("SELECT id FROM annotation_comments") == []
+        assert len(await tx.fetch("SELECT id FROM annotation_comments")) == 1
 
 
 def test_a_comment_body_is_capped_and_not_blank():

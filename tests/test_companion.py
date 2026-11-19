@@ -491,7 +491,13 @@ class TestCollaborationRoutes:
         assert response.json()[0]["body"]["provenance"]["reviewed_by"] == "bob@example.org"
 
     @pytest.mark.parametrize(
-        "path", ["/annotations/batch-update", "/annotations/batch-delete", "/annotations/batch-review"]
+        "path",
+        [
+            "/annotations/batch-update",
+            "/annotations/batch-delete",
+            "/annotations/batch-review",
+            "/annotations/batch-restore",
+        ],
     )
     def test_batches_follow_the_identity_and_csrf_rules(self, client, path):
         body = {"items": [{"id": "x", "version": 1, "decision": "accept"}]}
@@ -541,6 +547,101 @@ class TestCollaborationRoutes:
         )
         assert client.delete(f"{base}/{comment['id']}?studyId=study-a", headers=bob).status_code == 204
         assert client.get(base, params={"studyId": "study-a"}, headers=bob).json()["comments"] == []
+
+    def test_reset_review_over_http(self, client):
+        machine = client.post(
+            "/annotations?studyId=study-a",
+            json={**annotation_body(), "body": {"label": "AI", "provenance": {"source": "model"}}},
+            headers=headers(user="loader@example.org"),
+        ).json()
+        bob = headers(user="bob@example.org")
+        review = f"/wsi/annotations/{machine['id']}/review?studyId=study-a"
+        assert client.post(review, json={"decision": "reject", "version": 1}, headers=bob).status_code == 200
+        listing = {"studyId": "study-a", "slide_id": SLIDE_KEY}
+        assert client.get("/annotations", params=listing, headers=bob).json() == []
+
+        other = client.post(review, json={"decision": "reset", "version": 2}, headers=headers())
+        assert other.status_code == 403
+        assert client.post(review, json={"decision": "reset", "version": 1}, headers=bob).status_code == 409
+        bob_no_xhr = {k: v for k, v in bob.items() if k != "X-Requested-With"}
+        assert client.post(review, json={"decision": "reset", "version": 2}, headers=bob_no_xhr).status_code == 403
+        reset = client.post(review, json={"decision": "reset", "version": 2}, headers=bob)
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["version"] == 3
+        assert reset.json()["body"]["provenance"] == {"source": "model"}
+        assert [row["id"] for row in client.get("/annotations", params=listing, headers=bob).json()] == [
+            machine["id"]
+        ]
+        again = client.post(review, json={"decision": "reset", "version": 3}, headers=bob)
+        assert again.status_code == 422
+
+        batch = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": machine["id"], "version": 3, "decision": "accept"}]},
+            headers=headers(),
+        )
+        assert batch.status_code == 200
+        undone = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": machine["id"], "version": 4, "decision": "reset"}]},
+            headers=bob,
+        )
+        assert undone.status_code == 403
+        assert undone.json()["detail"]["index"] == 0
+
+    def test_delete_and_restore_over_http(self, client):
+        row = self._rows(client, 1)[0]
+        bob = headers(user="bob@example.org")
+        thread = f"/annotations/{row['id']}/comments"
+        assert client.post(f"{thread}?studyId=study-a", json={"body": "Agree"}, headers=bob).status_code == 201
+        assert client.delete(f"/wsi/annotations/{row['id']}?studyId=study-a", headers=headers()).status_code == 204
+
+        listing = {"studyId": "study-a", "slide_id": SLIDE_KEY}
+        assert client.get("/annotations", params=listing, headers=headers()).json() == []
+        assert client.get(thread, params={"studyId": "study-a"}, headers=bob).status_code == 404
+        assert client.post(f"{thread}?studyId=study-a", json={"body": "x"}, headers=bob).status_code == 404
+        assert client.delete(f"/annotations/{row['id']}?studyId=study-a", headers=headers()).status_code == 404
+
+        restore = f"/wsi/annotations/{row['id']}/restore?studyId=study-a"
+        assert client.post(restore, json={"version": 1}, headers=bob).status_code == 403
+        assert client.post(restore, json={"version": 1}, headers=NO_XHR).status_code == 403
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/restore?studyId=study-b",
+                json={"version": 1},
+                headers=headers(study="study-b"),
+            ).status_code
+            == 403
+        )
+        assert client.post(restore, json={"version": 2}, headers=headers()).status_code == 409
+        assert client.post(restore, json={}, headers=headers()).status_code == 422
+        restored = client.post(restore, json={"version": 1}, headers=headers())
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["id"] == row["id"]
+        assert restored.json()["version"] == 2
+        assert restored.json()["comment_count"] == 1
+        assert client.post(restore, json={"version": 2}, headers=headers()).status_code == 404
+        listed = client.get("/annotations", params=listing, headers=headers()).json()
+        assert [(item["id"], item["comment_count"]) for item in listed] == [(row["id"], 1)]
+        comments = client.get(thread, params={"studyId": "study-a"}, headers=bob).json()["comments"]
+        assert [item["body"] for item in comments] == ["Agree"]
+
+    def test_batch_restore_over_http(self, client):
+        rows = self._rows(client, 2)
+        items = [{"id": row["id"], "version": 1} for row in rows]
+        deleted = client.post("/annotations/batch-delete?studyId=study-a", json={"items": items}, headers=headers())
+        assert deleted.status_code == 200
+        restored = client.post(
+            "/wsi/annotations/batch-restore?studyId=study-a", json={"items": items[::-1]}, headers=headers()
+        )
+        assert restored.status_code == 200, restored.text
+        assert [(item["id"], item["version"]) for item in restored.json()] == [
+            (rows[1]["id"], 2),
+            (rows[0]["id"], 2),
+        ]
+        again = client.post("/annotations/batch-restore?studyId=study-a", json={"items": items}, headers=headers())
+        assert again.status_code == 404
+        assert again.json()["detail"]["index"] == 0
 
     def test_a_private_annotations_thread_is_hidden_from_others(self, client):
         private = client.post(

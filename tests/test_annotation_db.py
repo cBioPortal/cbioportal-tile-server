@@ -78,14 +78,37 @@ async def test_fresh_annotation_schema_applies_every_version():
 
     await migrate(connection)
 
-    assert ANNOTATIONS_SCHEMA_VERSION == 2
+    assert ANNOTATIONS_SCHEMA_VERSION == 3
     for table in ("annotations", "annotation_comments", "slide_notes"):
         assert _created(connection, table)
-    assert connection.marked == [("annotations", 1), ("annotations", 2)]
+    assert _adds_deleted_at(connection)
+    assert connection.marked == [("annotations", 1), ("annotations", 2), ("annotations", 3)]
+
+
+def _adds_deleted_at(connection: FakeConnection) -> bool:
+    return any(
+        "ALTER TABLE annotations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ" in item
+        for item in connection.statements
+    )
+
+
+def _only_additive(connection: FakeConnection) -> None:
+    """Nothing rewrites or drops what an earlier version stored.
+
+    The one ``ALTER TABLE`` adds the nullable ``deleted_at`` column (no
+    default, so no row is rewritten).
+    """
+    for statement in connection.statements:
+        upper = statement.upper()
+        assert "DROP " not in upper
+        assert "DELETE " not in upper and "UPDATE ANNOTATIONS" not in upper
+        if "ALTER TABLE" in upper:
+            assert "ADD COLUMN IF NOT EXISTS DELETED_AT TIMESTAMPTZ" in upper
+            assert "DEFAULT" not in upper and "NOT NULL" not in upper
 
 
 @pytest.mark.asyncio
-async def test_version_one_schema_upgrades_by_adding_tables_only():
+async def test_version_one_schema_upgrades_additively():
     connection = FakeConnection(version=1)
 
     await migrate(connection)
@@ -94,12 +117,24 @@ async def test_version_one_schema_upgrades_by_adding_tables_only():
     assert not _created(connection, "annotations")
     assert _created(connection, "annotation_comments")
     assert _created(connection, "slide_notes")
-    assert connection.marked == [("annotations", 2)]
-    # Nothing rewrites or drops what version 1 stored.
-    for statement in connection.statements:
-        upper = statement.upper()
-        assert "DROP " not in upper and "ALTER TABLE" not in upper
-        assert "DELETE " not in upper and "UPDATE ANNOTATIONS" not in upper
+    assert _adds_deleted_at(connection)
+    assert connection.marked == [("annotations", 2), ("annotations", 3)]
+    _only_additive(connection)
+
+
+@pytest.mark.asyncio
+async def test_version_two_schema_adds_only_the_soft_delete_column():
+    connection = FakeConnection(version=2)
+
+    await migrate(connection)
+
+    assert _lock_taken_first(connection)
+    for table in ("annotations", "annotation_comments", "slide_notes"):
+        assert not _created(connection, table)
+    assert _adds_deleted_at(connection)
+    assert any("idx_ann_deleted_at" in item for item in connection.statements)
+    assert connection.marked == [("annotations", 3)]
+    _only_additive(connection)
 
 
 @pytest.mark.asyncio
