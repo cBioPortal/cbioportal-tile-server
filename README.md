@@ -452,16 +452,18 @@ request's user; it calls no companion route over HTTP.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see, each with its `comment_count`; rejected machine-made ones only with `include_rejected=true` |
+| GET | `/annotations?studyId=&slide_id=` | The slide's live annotations in the study that the user may see (see [Visibility](#visibility)), each with its `comment_count`; rejected machine-made ones only with `include_rejected=true`; deleted ones never |
 | POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId`; machine provenance only from a trusted writer; `target.selector` must pass the [selector rules](#selector-rules) (`422`) |
 | PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock; `409` when the row changed since it was read, `404` when it was deleted); a sent `target` must pass the [selector rules](#selector-rules) |
 | POST | `/annotations/batch?studyId=` | Create 1–100 annotations in one transaction (all or none), returned in request order; every item's study must be `studyId` |
-| POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject", "version"}` on a machine-made annotation, by any user who can see it (see below) |
-| DELETE | `/annotations/{id}?studyId=` | Delete (creator only), with its comment thread; `404` when it is already gone |
-| POST | `/annotations/batch-update?studyId=` | `{"items": [{"id", "version", "body"?, "target"?, "visible_to"?}]}`: 1–100 updates under the PUT rules, all or none (see [Batches](#batch-update-delete-and-review)) |
-| POST | `/annotations/batch-delete?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 deletes (creator only), all or none |
-| POST | `/annotations/batch-review?studyId=` | `{"items": [{"id", "version", "decision"}]}`: 1–100 reviews under the review rules, all or none |
-| GET | `/annotations/{id}/comments?studyId=[&offset=0][&limit=100]` | A page of the annotation's comment thread, oldest first, for anyone who can see the annotation: `{"annotation_id", "comments", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Comment threads](#comment-threads)) |
+| POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject"\|"reset", "version"}` on a machine-made annotation: accept or reject by any user who can see it, reset by its reviewer only (see [Reviewing](#reviewing-machine-made-annotations)) |
+| DELETE | `/annotations/{id}?studyId=` | Soft-delete (creator only); the comment thread is kept for a restore; `404` when it is missing or already deleted (see [Deleting and restoring](#deleting-and-restoring)) |
+| POST | `/annotations/{id}/restore?studyId=` | `{"version"}`: bring a deleted annotation back under its id (creator only), `version` bumped; `404` unless it is deleted, `409` when `version` is not the deleted row's |
+| POST | `/annotations/batch-update?studyId=` | `{"items": [{"id", "version", "body"?, "target"?, "visible_to"?}]}`: 1–100 updates under the PUT rules, all or none (see [Batches](#batch-update-delete-review-and-restore)) |
+| POST | `/annotations/batch-delete?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 soft deletes (creator only), all or none |
+| POST | `/annotations/batch-review?studyId=` | `{"items": [{"id", "version", "decision"}]}`: 1–100 reviews (`accept`, `reject` or `reset`) under the review rules, all or none |
+| POST | `/annotations/batch-restore?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 restores of deleted annotations (creator only), all or none |
+| GET | `/annotations/{id}/comments?studyId=[&offset=0][&limit=100]` | A page of the annotation's comment thread, oldest first, for anyone who can see the live annotation: `{"annotation_id", "comments", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Comment threads](#comment-threads)) |
 | POST | `/annotations/{id}/comments?studyId=` | Add `{"body"}` to the thread; `422` once the annotation holds 1000 comments (deleted ones included) |
 | PUT | `/annotations/{id}/comments/{cid}?studyId=` | Edit `{"body"}` (author only) |
 | DELETE | `/annotations/{id}/comments/{cid}?studyId=` | Delete (author only; kept, flagged deleted) |
@@ -481,6 +483,21 @@ request's user; it calls no companion route over HTTP.
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness: annotation storage reachable |
 
+#### Visibility
+
+`visible_to` decides who besides the creator sees an annotation (the
+creator always does):
+
+- `null`, **the default when `visible_to` is left out**, keeps it private
+  to its creator;
+- `[]` shares it with everyone who can read the study;
+- a list of group names shares it with those groups.
+
+A loader or client that means to share its annotations with the study must
+send `"visible_to": []` explicitly; one that sends nothing writes rows only
+its own user can list. The creator can change it later with `PUT` (or
+`batch-update`) and `"visible_to": []`.
+
 #### Reviewing machine-made annotations
 
 An annotation is machine-made when its `body.provenance.source` is `agent`,
@@ -495,9 +512,27 @@ can see it in its study may review it, not only its creator:
 - both record `reviewed_by` (the proxy's user) and `reviewed_at` (UTC), keep
   every other field, and bump `version`. `version` must match the stored
   one (`409` otherwise).
+- `reset` undoes the current review: it removes `review_status`,
+  `reviewed_by` and `reviewed_at` from the provenance (the annotation is
+  unreviewed again, and a rejected one is listed again without
+  `include_rejected`), keeps every other field and bumps `version`.
+  **Only the reviewer** (the stored `reviewed_by`) may reset; anyone else,
+  the annotation's creator included, gets `403`. Once another user reviews
+  it, only that user may reset it. A review stored without `reviewed_by`
+  (written by a trusted writer) cannot be reset over this route. An
+  annotation with no review answers `422`. The version check runs first,
+  so a stale reset answers `409`.
 
-A human-made annotation answers `403`; one the user cannot see answers
-`404`. Updating and deleting stay creator-only.
+```http
+POST /annotations/5d0c…/review?studyId=luad_mskcc
+{"decision": "reset", "version": 2}
+
+200 {"id": "5d0c…", "version": 3,
+     "body": {…, "provenance": {"source": "precomputed", "model": "m1"}}, …}
+```
+
+A human-made annotation answers `403`; one the user cannot see (or a
+deleted one) answers `404`. Updating and deleting stay creator-only.
 
 #### Who may write machine provenance
 
@@ -526,20 +561,21 @@ not set it to a machine source:
 Do not list `ANNOTATION_ANONYMOUS_USER` in `ANNOTATION_TRUSTED_WRITERS`:
 with anonymous use on, every request without a user would be trusted.
 
-#### Batch update, delete and review
+#### Batch update, delete, review and restore
 
-`batch-update`, `batch-delete` and `batch-review` take 1–100 `items`, each
-naming an annotation `id` (once per batch) and its current `version`. The
-rows are read and locked, every item is checked under the rule of its
-single-item route (`PUT`, `DELETE`, `/review`), and only then is anything
-written, all in one transaction: either every item is saved or none is.
+`batch-update`, `batch-delete`, `batch-review` and `batch-restore` take
+1–100 `items`, each naming an annotation `id` (once per batch) and its
+current `version`. The rows are read and locked, every item is checked
+under the rule of its single-item route (`PUT`, `DELETE`, `/review`,
+`/restore`), and only then is anything written, all in one transaction:
+either every item is saved or none is.
 
 | Status | When | Body |
 |--------|------|------|
-| `200` | Every item saved | The rows in request order: updated or reviewed (`version` bumped), or, for `batch-delete`, as they were before deletion |
-| `422` | Fewer than 1 or more than 100 items, a repeated `id`, a malformed item (including a `target` the [selector rules](#selector-rules) refuse), or an item the provenance rules refuse | FastAPI's `detail` list; each `loc` is `["body", "items", <index>, ...]` |
-| `404` | An item's annotation does not exist (or, for a review, is not visible to the user) | `{"msg", "index", "id", "loc"}` for the first such item |
-| `403` | An item's annotation is in another study, not the user's (update, delete), or not machine-made (review) | `{"msg", "index", "id", "loc"}` for the first such item |
+| `200` | Every item saved | The rows in request order: updated, reviewed or restored (`version` bumped), or, for `batch-delete`, as they were before deletion (same `version`, the one to restore with) |
+| `422` | Fewer than 1 or more than 100 items, a repeated `id`, a malformed item (including a `target` the [selector rules](#selector-rules) refuse), an item the provenance rules refuse, or a `reset` of an annotation with no review | FastAPI's `detail` list; each `loc` is `["body", "items", <index>, ...]` |
+| `404` | An item's annotation does not exist or is deleted (for a review, also when not visible to the user; for a restore, when it is not deleted) | `{"msg", "index", "id", "loc"}` for the first such item |
+| `403` | An item's annotation is in another study, not the user's (update, delete, restore), not machine-made (review), or a `reset` by someone other than its reviewer | `{"msg", "index", "id", "loc"}` for the first such item |
 | `409` | Any item's `version` is stale | `{"msg", "conflicts": [{"index", "id", "loc", "version", "current_version"}]}` listing every stale item |
 
 Checks run in request order: the first missing, forbidden or invalid item
@@ -596,7 +632,12 @@ note (`body.comment`, which only its creator edits):
 - only a comment's author may edit or delete it, and only while they can
   still see the annotation;
 - a deleted comment is kept, flagged `deleted`, and left out of the thread
-  and of `comment_count`; deleting the annotation deletes its thread;
+  and of `comment_count`;
+- deleting the annotation keeps its thread: while the annotation is
+  deleted, every comment route answers `404` for it (as for a missing
+  one), to its creator too; a restore brings the thread back as it was,
+  and the [retention purge](#deleting-and-restoring) removes it with the
+  annotation;
 - a comment `body` is 1–4000 characters after trimming surrounding
   whitespace (`422` otherwise).
 
@@ -629,9 +670,48 @@ pick a slice of the live comments, oldest first:
 (`has_more` is then `false`). Comments that are deleted between page
 requests shift later pages back by one.
 
-At every start the companion also deletes comments whose annotation no
-longer exists (left by anything that removed annotations outside these
-routes, which delete a thread with its annotation).
+At every start the companion also deletes comments whose annotation row no
+longer exists (left by anything that removed annotation rows outside these
+routes). A deleted annotation keeps its row until the purge, so its thread
+is not swept.
+
+#### Deleting and restoring
+
+`DELETE /annotations/{id}` and `batch-delete` are soft deletes: they set
+the row's `deleted_at` and change nothing else (not `version`, not the
+comment thread). A deleted annotation:
+
+- is left out of `GET /annotations` (even with `include_rejected=true`),
+  and its id answers `404` to `PUT`, `/review`, `DELETE`, every batch but
+  `batch-restore`, and every comment route;
+- still holds its id, so no new annotation can take it, and its comments
+  still count toward the thread's 1000-comment cap;
+- does not affect slide notes or other annotations' `comment_count`.
+
+Its creator brings it back, under the same id and with its thread, with
+`POST /annotations/{id}/restore` (or `batch-restore`), sending the version
+the row had when it was deleted:
+
+```http
+POST /annotations/5d0c…/restore?studyId=luad_mskcc
+{"version": 2}
+
+200 {"id": "5d0c…", "version": 3, "comment_count": 4, "created_by": "alice", …}
+```
+
+The restored annotation is the stored row with `version` bumped and
+`updated_at` set, so a client still holding the pre-delete version gets
+`409` on its next write. A rejected annotation stays rejected. `404` when
+the id is missing, live, or already purged; `403` for anyone but the
+creator or another study; `409` for another `version`.
+
+**Retention purge.** Annotations deleted more than
+`ANNOTATION_DELETED_RETENTION_DAYS` days ago (default `30`) are removed for
+good, with their comment threads, at every start and once a day while the
+companion runs (each worker runs it; it is idempotent). `0` turns the purge
+off and keeps deleted annotations restorable forever. Live annotations are
+never purged. Annotations deleted before soft delete existed (schema
+version 3) were removed outright and cannot be restored.
 
 #### Slide notes and tags
 
@@ -683,16 +763,19 @@ next page, `null` on the last.
 
 | Table | Holds |
 |-------|-------|
-| `annotations` | `id`, `slide_id`, `study_id`, `body` (JSON), `target` (JSON), `created_by`, `visible_to` (JSON list or null), `version`, `created_at`, `updated_at` |
+| `annotations` | `id`, `slide_id`, `study_id`, `body` (JSON), `target` (JSON), `created_by`, `visible_to` (JSON list or null), `version`, `created_at`, `updated_at`, `deleted_at` (null while live); partial index on `deleted_at` for deleted rows |
 | `annotation_comments` | `id`, `annotation_id`, `study_id`, `author`, `body`, `created_at`, `updated_at`, `deleted`; indexed on `(annotation_id, created_at)` |
 | `slide_notes` | `id`, `slide_id`, `study_id`, `text`, `tags` (JSON list), `created_by`, `visible_to`, `version`, `created_at`, `updated_at`; indexed on `(slide_id, study_id)` |
 
 On Postgres, `annotation_schema_migrations` records the version of the
-`annotations` component (now `2`: version 1 created `annotations`, version 2
-added `annotation_comments` and `slide_notes`). Each start takes the schema
+`annotations` component (now `3`: version 1 created `annotations`, version 2
+added `annotation_comments` and `slide_notes`, version 3 added the nullable
+`annotations.deleted_at` and its partial index). Each start takes the schema
 advisory lock and applies only the steps above the recorded version; every
-step only creates tables and indexes, so stored annotations are kept as
-they are. On SQLite, each start creates any missing table and index.
+step only creates tables, nullable columns without a default and indexes,
+so stored annotations are kept as they are (version 3 rewrites no row, and
+every existing row stays live). On SQLite, each start creates any missing
+table, column and index.
 
 ### Companion configuration
 
@@ -713,6 +796,7 @@ they are. On SQLite, each start creates any missing table and index.
 | `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
 | `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
 | `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
+| `ANNOTATION_DELETED_RETENTION_DAYS` | `30` | Days a deleted annotation stays restorable before the purge removes it and its comment thread; `0` keeps them forever (see [Deleting and restoring](#deleting-and-restoring)) |
 | `ANNOTATION_TRUSTED_WRITERS` | — | Comma-separated users (`X-Auth-Request-User`) that may create machine-made annotations and set review fields over HTTP (see [Who may write machine provenance](#who-may-write-machine-provenance)) |
 | `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant; every `/agent` route but `/agent/health` answers `404` while it is off |
 | `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
