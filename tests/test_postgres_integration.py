@@ -70,7 +70,7 @@ async def test_postgres_round_trip_uses_real_timestamp_columns():
                 type="#3b82f6",
             ),
             target=annotation_store.AnnotationTarget(
-                selector={"type": "SvgSelector", "value": "<svg />"}
+                selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}
             ),
         ),
         user_sub,
@@ -193,7 +193,7 @@ async def test_postgres_batch_is_atomic_and_review_bumps_the_version(monkeypatch
                 label=label, provenance={"source": "precomputed"}
             ),
             target=annotation_store.AnnotationTarget(
-                selector={"type": "SvgSelector", "value": "<svg />"}
+                selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}
             ),
             visible_to=[],
         )

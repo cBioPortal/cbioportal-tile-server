@@ -1,7 +1,7 @@
 """Slide-level notes and tags: attached to a slide in a study, not to a shape.
 
 Routes (each with ``?studyId=<study>``):
-  GET    /slide-notes?slide_id=   the slide's notes the user may see, and a tag summary
+  GET    /slide-notes?slide_id=   a page of the slide's notes the user may see, and a tag summary
   POST   /slide-notes             create ``{slide_id, study_id, text?, tags?, visible_to?}``
   PUT    /slide-notes/{id}        update (creator only; ``version`` is an optimistic lock)
   DELETE /slide-notes/{id}        delete (creator only; optional ``version``)
@@ -18,7 +18,16 @@ A note carries ``text`` (at most ``NOTE_TEXT_MAX_CHARS`` characters), up to
 ``TAG_MAX_CHARS`` characters of letters, digits, spaces and ``_ - . : / + #``,
 starting with a letter or digit; runs of whitespace become one space, and
 a tag repeated in another letter case is dropped.  The list's ``tags``
-counts, for each tag, the visible notes that carry it.
+counts, for each tag, all the visible notes that carry it, not only the
+page's.
+
+Paging: the list takes ``offset`` (default 0) and ``limit`` (default
+``NOTE_PAGE_DEFAULT``, at most ``NOTE_PAGE_MAX``) over the visible notes,
+oldest first, and answers ``{slide_id, notes, tags, total, offset, limit,
+has_more, next_offset}``; ``total`` counts the visible notes and
+``next_offset`` is the offset of the next page (null on the last).  A slide
+holds at most ``NOTES_PER_SLIDE_MAX`` notes in a study, from all users; a
+note past that is refused with 422.
 """
 
 from __future__ import annotations
@@ -42,6 +51,13 @@ NOTE_TEXT_MAX_CHARS = 4000
 NOTE_MAX_TAGS = 20
 TAG_MAX_CHARS = 40
 TAG_PATTERN = re.compile(r"^[^\W_][\w .:/+#-]*$")
+# Notes one slide may hold in a study, from all users.
+NOTES_PER_SLIDE_MAX = 1000
+# Notes per page of the list: by default, and at most.
+NOTE_PAGE_DEFAULT = 100
+NOTE_PAGE_MAX = 500
+# Largest accepted ``offset`` (keeps the bound parameter in range).
+PAGE_OFFSET_MAX = 1_000_000
 
 NoteId = Annotated[str, Path(min_length=1, max_length=128)]
 
@@ -132,9 +148,14 @@ class SlideNoteList(BaseModel):
     slide_id: str
     notes: list[SlideNoteOut]
     tags: list[TagCount] = Field(
-        description="Each tag on the listed notes with the number of notes carrying it,"
-        " most used first"
+        description="Each tag on all the visible notes (not only this page) with the"
+        " number of notes carrying it, most used first"
     )
+    total: int = Field(description="Visible notes on the slide")
+    offset: int
+    limit: int
+    has_more: bool = Field(description="Whether notes follow this page")
+    next_offset: int | None = Field(description="``offset`` of the next page; null on the last")
 
 
 def _columns(tx: Transaction) -> str:
@@ -180,6 +201,30 @@ async def _own_note(tx: Transaction, note_id: str, user: dict, verb: str) -> dic
     return row
 
 
+async def _require_room(tx: Transaction, slide_id: str, study_id: str) -> None:
+    """422 once the slide holds ``NOTES_PER_SLIDE_MAX`` notes in the study.
+
+    On Postgres a transaction-scoped advisory lock on the slide and study
+    makes concurrent creates count one at a time; a SQLite write
+    transaction already holds the database's write lock.
+    """
+    if tx.kind == "postgres":
+        await tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"slide_notes\x1f{study_id}\x1f{slide_id}",
+        )
+    stored = await tx.fetchrow(
+        "SELECT COUNT(*) AS n FROM slide_notes WHERE slide_id = $1 AND study_id = $2",
+        slide_id,
+        study_id,
+    )
+    if int(stored["n"]) >= NOTES_PER_SLIDE_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"A slide holds at most {NOTES_PER_SLIDE_MAX} notes",
+        )
+
+
 def _check_version(row: dict, version: int) -> None:
     if row["version"] != version:
         raise HTTPException(
@@ -192,7 +237,13 @@ def _check_version(row: dict, version: int) -> None:
 async def list_slide_notes(
     slide_id: str = Query(..., pattern=annotation_store.SLIDE_KEY_REGEX, description="Opaque slide key"),
     user: dict = Depends(require_user),
+    offset: Annotated[int, Query(ge=0, le=PAGE_OFFSET_MAX, description="Notes to skip")] = 0,
+    limit: Annotated[
+        int, Query(ge=1, le=NOTE_PAGE_MAX, description="Notes per page")
+    ] = NOTE_PAGE_DEFAULT,
 ) -> SlideNoteList:
+    # Visibility by group is decided here, not in SQL, so the page is cut
+    # from all the visible notes; a slide holds at most NOTES_PER_SLIDE_MAX.
     async with annotation_store.storage_transaction() as tx:
         rows = await tx.fetch(
             f"SELECT {_columns(tx)} FROM slide_notes n"
@@ -209,7 +260,18 @@ async def list_slide_notes(
         for row in rows
         if annotation_store._is_visible(row, user["sub"], groups)
     ]
-    return SlideNoteList(slide_id=slide_id, notes=notes, tags=_tag_summary(notes))
+    page = notes[offset : offset + limit]
+    has_more = offset + len(page) < len(notes)
+    return SlideNoteList(
+        slide_id=slide_id,
+        notes=page,
+        tags=_tag_summary(notes),
+        total=len(notes),
+        offset=offset,
+        limit=limit,
+        has_more=has_more,
+        next_offset=offset + len(page) if has_more else None,
+    )
 
 
 @router.post("", response_model=SlideNoteOut, status_code=status.HTTP_201_CREATED)
@@ -220,6 +282,7 @@ async def create_slide_note(
     require_same_study(user, data.study_id, "the note's study")
     note_id = str(uuid.uuid4())
     async with annotation_store.storage_transaction(write=True) as tx:
+        await _require_room(tx, data.slide_id, data.study_id)
         await tx.execute(
             "INSERT INTO slide_notes"
             " (id, slide_id, study_id, text, tags, created_by, visible_to, version,"

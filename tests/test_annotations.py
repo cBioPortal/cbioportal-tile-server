@@ -114,7 +114,7 @@ async def test_annotation_batch_preserves_layer_color_and_provenance():
                     color="#7b61ff",
                     provenance={"source": "agent", "model": "quiltnet_pmb"},
                 ),
-                target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg/>"}),
+                target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}),
             ),
         ]
     )

@@ -48,6 +48,14 @@ stay readable, reviewable and editable by their creator.
 
 ``slide_id`` carries the opaque slide key, never a pathology image ID; any
 other value is rejected so image IDs cannot reach annotation storage.
+
+Selectors: every create and update (single or batch) checks the
+``target.selector`` it is sent against ``app.annotation_selectors`` (422
+otherwise); stored rows are read as they are.
+
+A single-item PUT, review or DELETE whose row was deleted after it was read
+answers 404; one whose row changed answers 409.  At every start,
+``sweep_orphan_comments`` deletes comments whose annotation is gone.
 """
 
 import json
@@ -59,9 +67,10 @@ from typing import Annotated, Any, Literal
 import aiosqlite
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 from . import annotation_sql
+from .annotation_selectors import check_selector
 from .request_identity import require_same_study, require_user
 from .sealed_source import SLIDE_KEY_PATTERN
 from .config import settings
@@ -249,11 +258,22 @@ class AnnotationTarget(BaseModel):
     selector: dict[str, Any]
 
 
+def _checked_target(target: AnnotationTarget) -> AnnotationTarget:
+    """``target`` if its selector passes ``app.annotation_selectors``."""
+    check_selector(target.selector)
+    return target
+
+
+# A target sent for a create or update: checked on write only, so stored
+# rows (read through ``AnnotationTarget``) stay readable.
+CheckedTarget = Annotated[AnnotationTarget, AfterValidator(_checked_target)]
+
+
 class AnnotationIn(BaseModel):
     slide_id: str = Field(..., pattern=SLIDE_KEY_REGEX, description="Opaque slide key")
     study_id: str
     body: AnnotationBody
-    target: AnnotationTarget
+    target: CheckedTarget
     visible_to: list[str] | None = Field(
         default=None,
         description="Keycloak group names that may view this annotation; null = creator only",
@@ -278,7 +298,7 @@ class AnnotationOut(BaseModel):
 
 class AnnotationUpdate(BaseModel):
     body: AnnotationBody | None = None
-    target: AnnotationTarget | None = None
+    target: CheckedTarget | None = None
     visible_to: list[str] | None = None
     version: int = Field(
         ..., description="Must match current version (optimistic lock)"
@@ -294,7 +314,7 @@ class AnnotationReview(BaseModel):
 
 class AnnotationBatchItem(BaseModel):
     body: AnnotationBody
-    target: AnnotationTarget
+    target: CheckedTarget
     visible_to: list[str] | None = None
 
 
@@ -408,6 +428,28 @@ async def init_db(db_path: str | None = None, db_url: str | None = None) -> None
         await close_pool()
         await _init_sqlite(_get_db_path())
         logger.info("Annotation DB ready (sqlite): %s", _get_db_path())
+    await sweep_orphan_comments()
+
+
+async def sweep_orphan_comments() -> int:
+    """Delete comments whose annotation no longer exists; returns how many.
+
+    The delete routes remove a thread with its annotation in one
+    transaction; this catches rows left by anything that deleted
+    annotations another way.  It runs at every start and is idempotent.
+    """
+    try:
+        async with storage_transaction(write=True) as tx:
+            swept = await tx.execute(
+                "DELETE FROM annotation_comments WHERE NOT EXISTS"
+                " (SELECT 1 FROM annotations a WHERE a.id = annotation_comments.annotation_id)"
+            )
+    except Exception:
+        logger.exception("Orphaned annotation comment sweep failed")
+        return 0
+    if swept:
+        logger.info("Deleted %d orphaned annotation comments", swept)
+    return swept
 
 
 async def close_db() -> None:
@@ -622,12 +664,14 @@ async def _update_postgres(
         return row["to_char"] if row else None
 
 
-async def _delete_sqlite(annotation_id: str) -> None:
+async def _delete_sqlite(annotation_id: str) -> int:
+    """Delete the annotation and its thread; returns the annotations deleted."""
     async with aiosqlite.connect(_get_db_path()) as db:
         await _apply_sqlite_pragmas(db)
         await db.execute("BEGIN IMMEDIATE")
         try:
-            await db.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            cursor = await db.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            deleted = cursor.rowcount
             await db.execute(
                 "DELETE FROM annotation_comments WHERE annotation_id = ?", (annotation_id,)
             )
@@ -635,15 +679,18 @@ async def _delete_sqlite(annotation_id: str) -> None:
             await db.rollback()
             raise
         await db.commit()
+    return deleted
 
 
-async def _delete_postgres(annotation_id: str) -> None:
+async def _delete_postgres(annotation_id: str) -> int:
+    """Delete the annotation and its thread; returns the annotations deleted."""
     async with connection(_get_db_url()) as conn:
         async with conn.transaction():
-            await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
+            status = await conn.execute("DELETE FROM annotations WHERE id = $1", annotation_id)
             await conn.execute(
                 "DELETE FROM annotation_comments WHERE annotation_id = $1", annotation_id
             )
+    return int(status.rsplit(" ", 1)[-1])
 
 
 @router.get("", response_model=list[AnnotationOut])
@@ -838,6 +885,13 @@ async def update_annotation(
     return await _write_version(existing, new_body, new_target, new_visible)
 
 
+async def _raise_lost_write(annotation_id: str) -> None:
+    """A single-item write matched no row: 404 if it is gone, else 409."""
+    if await _get_existing(annotation_id) is None:
+        raise HTTPException(status_code=404, detail="Annotation not found")
+    raise HTTPException(status_code=409, detail="Annotation was modified concurrently")
+
+
 async def _write_version(
     existing: dict, new_body: str, new_target: str, new_visible: str | None
 ) -> AnnotationOut:
@@ -853,10 +907,7 @@ async def _write_version(
         new_version,
     )
     if updated_at is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Annotation was modified concurrently",
-        )
+        await _raise_lost_write(existing["id"])
 
     return AnnotationOut(
         id=existing["id"],
@@ -908,10 +959,10 @@ async def delete_annotation(
         raise HTTPException(status_code=404, detail="Annotation not found")
     _authorize_change(existing, user, "delete")
 
-    if _storage_kind() == "postgres":
-        await _delete_postgres(annotation_id)
-    else:
-        await _delete_sqlite(annotation_id)
+    delete = _delete_postgres if _storage_kind() == "postgres" else _delete_sqlite
+    if await delete(annotation_id) == 0:
+        # Deleted by another request since it was read.
+        raise HTTPException(status_code=404, detail="Annotation not found")
 
 
 # --- batch update, delete and review ----------------------------------------

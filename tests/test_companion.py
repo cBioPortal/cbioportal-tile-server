@@ -521,7 +521,7 @@ class TestCollaborationRoutes:
         assert comment["author"] == "bob@example.org"
 
         thread = client.get(base, params={"studyId": "study-a"}, headers=headers())
-        assert [item["body"] for item in thread.json()] == ["Agree"]
+        assert [item["body"] for item in thread.json()["comments"]] == ["Agree"]
         listed = client.get(
             "/wsi/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
         )
@@ -540,7 +540,7 @@ class TestCollaborationRoutes:
             == 403
         )
         assert client.delete(f"{base}/{comment['id']}?studyId=study-a", headers=bob).status_code == 204
-        assert client.get(base, params={"studyId": "study-a"}, headers=bob).json() == []
+        assert client.get(base, params={"studyId": "study-a"}, headers=bob).json()["comments"] == []
 
     def test_a_private_annotations_thread_is_hidden_from_others(self, client):
         private = client.post(
@@ -580,6 +580,68 @@ class TestCollaborationRoutes:
         assert (
             client.delete(f"/wsi/slide-notes/{row['id']}?studyId=study-a&version=2", headers=headers())
         ).status_code == 204
+
+    def test_lists_are_paged_over_http(self, client):
+        row = self._rows(client, 1)[0]
+        base = f"/wsi/annotations/{row['id']}/comments"
+        for i in range(3):
+            client.post(f"{base}?studyId=study-a", json={"body": f"c{i}"}, headers=headers())
+        page = client.get(base, params={"studyId": "study-a", "limit": 2}, headers=headers()).json()
+        assert [c["body"] for c in page["comments"]] == ["c0", "c1"]
+        assert {k: page[k] for k in ("annotation_id", "total", "offset", "limit", "has_more", "next_offset")} == {
+            "annotation_id": row["id"], "total": 3, "offset": 0, "limit": 2, "has_more": True, "next_offset": 2,
+        }
+        rest = client.get(base, params={"studyId": "study-a", "offset": 2, "limit": 2}, headers=headers()).json()
+        assert [c["body"] for c in rest["comments"]] == ["c2"] and rest["next_offset"] is None
+        for bad in ({"limit": 0}, {"limit": 501}, {"offset": -1}, {"offset": 1_000_001}):
+            assert client.get(base, params={"studyId": "study-a", **bad}, headers=headers()).status_code == 422
+
+        for i in range(3):
+            note = {"slide_id": SLIDE_KEY, "study_id": "study-a", "text": f"n{i}", "tags": ["QC"], "visible_to": []}
+            client.post("/wsi/slide-notes?studyId=study-a", json=note, headers=headers())
+        notes = client.get(
+            "/wsi/slide-notes", params={"studyId": "study-a", "slide_id": SLIDE_KEY, "limit": 1}, headers=headers()
+        ).json()
+        assert [n["text"] for n in notes["notes"]] == ["n0"]
+        assert (notes["total"], notes["has_more"], notes["next_offset"]) == (3, True, 1)
+        assert notes["tags"] == [{"tag": "QC", "count": 3}]
+        for bad in ({"limit": 0}, {"limit": 501}, {"offset": -1}):
+            assert client.get(
+                "/wsi/slide-notes", params={"studyId": "study-a", "slide_id": SLIDE_KEY, **bad}, headers=headers()
+            ).status_code == 422
+
+    def test_selectors_are_checked_on_every_write_over_http(self, client):
+        script = {"selector": {"type": "SvgSelector", "value": "<svg><script>alert(1)</script></svg>"}}
+        handler = {"selector": {"type": "SvgSelector", "value": '<svg onload="x"><circle cx="1" cy="1" r="0"/></svg>'}}
+        created = client.post("/wsi/annotations?studyId=study-a", json={**annotation_body(), "target": script}, headers=headers())
+        assert created.status_code == 422
+        assert "may not contain <script>" in created.text
+        batch = client.post(
+            "/wsi/annotations/batch?studyId=study-a",
+            json={"annotations": [annotation_body(), {**annotation_body(), "target": handler}]},
+            headers=headers(),
+        )
+        assert batch.status_code == 422
+        row = self._rows(client, 1)[0]
+        put = client.put(
+            f"/wsi/annotations/{row['id']}?studyId=study-a", json={"version": 1, "target": script}, headers=headers()
+        )
+        assert put.status_code == 422
+        batch_update = client.post(
+            "/wsi/annotations/batch-update?studyId=study-a",
+            json={"items": [{"id": row["id"], "version": 1, "target": handler}]},
+            headers=headers(),
+        )
+        assert batch_update.status_code == 422
+        assert batch_update.json()["detail"][0]["loc"][:4] == ["body", "items", 0, "target"]
+        rect = {"selector": {"type": "FragmentSelector", "conformsTo": "http://www.w3.org/TR/media-frags/", "value": "xywh=pixel:1,2,3,4"}}
+        ok = client.put(
+            f"/wsi/annotations/{row['id']}?studyId=study-a", json={"version": 1, "target": rect}, headers=headers()
+        )
+        assert ok.status_code == 200 and ok.json()["target"] == rect
+        assert client.get(
+            "/wsi/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
+        ).json()[0]["version"] == 2
 
     def test_slide_notes_follow_the_identity_and_csrf_rules(self, client):
         note = {"slide_id": SLIDE_KEY, "study_id": "study-a", "text": "Margin"}

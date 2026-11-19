@@ -44,7 +44,7 @@ def annotation_input(
         slide_id=SLIDE_KEY,
         study_id=study_id,
         body=AnnotationBody(label=label, comment="Own note", type="Polygon", provenance=provenance),
-        target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg/>"}),
+        target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}),
         visible_to=visible_to,
     )
 
@@ -77,7 +77,7 @@ async def test_batch_update_saves_every_item_and_answers_in_request_order():
         update_items(
             {"id": third.id, "version": 1, "body": {"label": "C2"}},
             {"id": first.id, "version": 1, "visible_to": None},
-            {"id": second.id, "version": 1, "target": {"selector": {"type": "Point", "x": 1}}},
+            {"id": second.id, "version": 1, "target": {"selector": {"type": "SvgSelector", "value": "<svg><circle cx=\"1\" cy=\"2\" r=\"0\" /></svg>"}}},
         ),
         user("owner"),
     )
@@ -86,7 +86,7 @@ async def test_batch_update_saves_every_item_and_answers_in_request_order():
     assert [row.version for row in updated] == [2, 2, 2]
     assert updated[0].body.label == "C2"
     assert updated[1].visible_to is None and updated[1].body.label == "A"
-    assert updated[2].target.selector == {"type": "Point", "x": 1}
+    assert updated[2].target.selector == {"type": "SvgSelector", "value": "<svg><circle cx=\"1\" cy=\"2\" r=\"0\" /></svg>"}
     assert all(row.updated_at for row in updated)
     rows = await stored()
     assert rows[third.id].body.label == "C2"
@@ -386,7 +386,8 @@ async def test_a_thread_is_readable_and_writable_by_anyone_who_sees_the_annotati
     assert first.study_id == "study-1" and first.annotation_id == row.id
     assert first.created_at.endswith("Z") and "T" in first.created_at
     thread = await annotation_comments.list_comments(row.id, user("third"))
-    assert [comment.id for comment in thread] == [first.id, second.id]
+    assert [comment.id for comment in thread.comments] == [first.id, second.id]
+    assert (thread.total, thread.has_more, thread.next_offset) == (2, False, None)
 
     listed = await annotations.list_annotations(SLIDE_KEY, user("third"))
     assert listed[0].comment_count == 2
@@ -413,7 +414,7 @@ async def test_only_the_author_edits_or_deletes_a_comment():
     assert edited.body == "v2" and edited.created_at == comment.created_at
 
     await annotation_comments.delete_comment(row.id, comment.id, user("reviewer"))
-    assert await annotation_comments.list_comments(row.id, user("owner")) == []
+    assert (await annotation_comments.list_comments(row.id, user("owner"))).comments == []
     assert (await stored())[row.id].comment_count == 0
     with pytest.raises(HTTPException) as gone:
         await annotation_comments.update_comment(row.id, comment.id, CommentIn(body="v3"), user("reviewer"))
@@ -632,3 +633,212 @@ async def test_slide_note_tags_are_stored_as_json():
     async with annotations.storage_transaction() as tx:
         row = await tx.fetchrow("SELECT tags FROM slide_notes WHERE id = $1", note.id)
     assert json.loads(row["tags"]) == ["a", "b"]
+
+
+# --- paging and caps --------------------------------------------------------
+
+
+async def test_a_thread_is_listed_a_page_at_a_time():
+    row = await create(visible_to=[])
+    made = [
+        await annotation_comments.create_comment(row.id, CommentIn(body=f"c{i}"), user("owner"))
+        for i in range(5)
+    ]
+    await annotation_comments.delete_comment(row.id, made[1].id, user("owner"))
+    live = [made[0].id, *[c.id for c in made[2:]]]
+
+    first = await annotation_comments.list_comments(row.id, user("reader"), offset=0, limit=2)
+    assert [c.id for c in first.comments] == live[:2]
+    assert (first.total, first.offset, first.limit) == (4, 0, 2)
+    assert (first.has_more, first.next_offset) == (True, 2)
+    last = await annotation_comments.list_comments(row.id, user("reader"), offset=2, limit=2)
+    assert [c.id for c in last.comments] == live[2:]
+    assert (last.has_more, last.next_offset) == (False, None)
+    past = await annotation_comments.list_comments(row.id, user("reader"), offset=10, limit=2)
+    assert past.comments == [] and past.total == 4 and past.next_offset is None
+
+    default = await annotation_comments.list_comments(row.id, user("reader"))
+    assert default.limit == annotation_comments.COMMENT_PAGE_DEFAULT
+    assert [c.id for c in default.comments] == live
+
+
+async def test_an_annotation_holds_a_bounded_number_of_comments(monkeypatch):
+    monkeypatch.setattr(annotation_comments, "COMMENTS_PER_ANNOTATION_MAX", 3)
+    row = await create(visible_to=[])
+    other = await create("Other", visible_to=[])
+    made = [
+        await annotation_comments.create_comment(row.id, CommentIn(body=f"c{i}"), user("owner"))
+        for i in range(3)
+    ]
+    # Deleted comments still count, so delete-and-repost cannot grow a thread.
+    await annotation_comments.delete_comment(row.id, made[0].id, user("owner"))
+    with pytest.raises(HTTPException) as full:
+        await annotation_comments.create_comment(row.id, CommentIn(body="more"), user("reader"))
+    assert full.value.status_code == 422
+    assert "at most 3 comments" in full.value.detail
+    # The cap is per annotation.
+    assert await annotation_comments.create_comment(other.id, CommentIn(body="ok"), user("owner"))
+
+
+async def test_concurrent_comments_stop_at_the_cap(monkeypatch):
+    monkeypatch.setattr(annotation_comments, "COMMENTS_PER_ANNOTATION_MAX", 3)
+    row = await create(visible_to=[])
+    results = await asyncio.gather(
+        *(
+            annotation_comments.create_comment(row.id, CommentIn(body=f"c{i}"), user("owner"))
+            for i in range(6)
+        ),
+        return_exceptions=True,
+    )
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    assert len(refused) == 3 and {r.status_code for r in refused} == {422}
+    assert (await annotation_comments.list_comments(row.id, user("owner"))).total == 3
+
+
+async def test_slide_notes_are_listed_a_page_at_a_time_with_a_whole_slide_tag_summary():
+    owner = user("owner")
+    made = [
+        await slide_notes.create_slide_note(
+            note_input(f"n{i}", tags=["QC"] if i % 2 else ["LUAD"], visible_to=[]), owner
+        )
+        for i in range(5)
+    ]
+    # Hidden from the reader: neither listed nor counted.
+    await slide_notes.create_slide_note(note_input("secret", tags=["QC"]), owner)
+
+    first = await slide_notes.list_slide_notes(SLIDE_KEY, user("reader"), offset=0, limit=2)
+    assert [n.id for n in first.notes] == [n.id for n in made[:2]]
+    assert (first.total, first.offset, first.limit, first.has_more, first.next_offset) == (5, 0, 2, True, 2)
+    assert [(t.tag, t.count) for t in first.tags] == [("LUAD", 3), ("QC", 2)]
+    last = await slide_notes.list_slide_notes(SLIDE_KEY, user("reader"), offset=4, limit=2)
+    assert [n.id for n in last.notes] == [made[4].id]
+    assert (last.has_more, last.next_offset) == (False, None)
+    assert [(t.tag, t.count) for t in last.tags] == [("LUAD", 3), ("QC", 2)]
+
+    mine = await slide_notes.list_slide_notes(SLIDE_KEY, owner)
+    assert mine.total == 6 and mine.limit == slide_notes.NOTE_PAGE_DEFAULT
+    assert [(t.tag, t.count) for t in mine.tags] == [("LUAD", 3), ("QC", 3)]
+
+
+async def test_a_slide_holds_a_bounded_number_of_notes(monkeypatch):
+    monkeypatch.setattr(slide_notes, "NOTES_PER_SLIDE_MAX", 3)
+    for i in range(2):
+        await slide_notes.create_slide_note(note_input(f"n{i}"), user("owner"))
+    await slide_notes.create_slide_note(note_input("n2"), user("second"))
+    with pytest.raises(HTTPException) as full:
+        await slide_notes.create_slide_note(note_input("n3"), user("third"))
+    assert full.value.status_code == 422
+    assert "at most 3 notes" in full.value.detail
+    # Per slide and study.
+    assert await slide_notes.create_slide_note(note_input("other", slide_id=OTHER_SLIDE), user("owner"))
+    assert await slide_notes.create_slide_note(note_input("s2", study_id="study-2"), user("owner", study_id="study-2"))
+
+
+async def test_concurrent_notes_stop_at_the_cap(monkeypatch):
+    monkeypatch.setattr(slide_notes, "NOTES_PER_SLIDE_MAX", 3)
+    results = await asyncio.gather(
+        *(slide_notes.create_slide_note(note_input(f"n{i}"), user("owner")) for i in range(6)),
+        return_exceptions=True,
+    )
+    refused = [r for r in results if isinstance(r, HTTPException)]
+    assert len(refused) == 3 and {r.status_code for r in refused} == {422}
+    assert (await slide_notes.list_slide_notes(SLIDE_KEY, user("owner"))).total == 3
+
+
+# --- selectors on write -----------------------------------------------------
+
+SCRIPT_TARGET = {"selector": {"type": "SvgSelector", "value": "<svg><script>alert(1)</script></svg>"}}
+
+
+async def test_a_stored_selector_is_not_rechecked():
+    """A row written before the check stays readable, and editable without its target."""
+    row = await create(visible_to=[])
+    async with annotations.storage_transaction(write=True) as tx:
+        await tx.execute(
+            "UPDATE annotations SET target = $1 WHERE id = $2", json.dumps(SCRIPT_TARGET), row.id
+        )
+    listed = await stored()
+    assert listed[row.id].target.selector == SCRIPT_TARGET["selector"]
+    updated = await annotations.update_annotation(
+        row.id, annotations.AnnotationUpdate(body=AnnotationBody(label="x"), version=1), user("owner")
+    )
+    assert updated.target.selector == SCRIPT_TARGET["selector"]
+    batch = await annotations.update_annotation_batch(
+        update_items({"id": row.id, "version": 2, "body": {"label": "y"}}), user("owner")
+    )
+    assert batch[0].version == 3
+    with pytest.raises(ValidationError):
+        update_items({"id": row.id, "version": 3, "target": SCRIPT_TARGET})
+
+
+# --- lost writes and orphans -----------------------------------------------
+
+
+async def test_a_single_update_of_a_row_deleted_meanwhile_is_404(monkeypatch):
+    row = await create()
+    stale = await annotations._get_existing(row.id)
+    await annotations.delete_annotation(row.id, user("owner"))
+    real = annotations._get_existing
+    reads = iter([stale])
+    monkeypatch.setattr(
+        annotations, "_get_existing", lambda annotation_id: _first_then(reads, real, annotation_id)
+    )
+    with pytest.raises(HTTPException) as gone:
+        await annotations.update_annotation(
+            row.id, annotations.AnnotationUpdate(body=AnnotationBody(label="x"), version=1), user("owner")
+        )
+    assert gone.value.status_code == 404
+
+
+async def test_a_single_update_that_lost_a_race_is_still_409(monkeypatch):
+    row = await create()
+    stale = await annotations._get_existing(row.id)
+    await annotations.update_annotation(
+        row.id, annotations.AnnotationUpdate(body=AnnotationBody(label="first"), version=1), user("owner")
+    )
+    real = annotations._get_existing
+    reads = iter([stale])
+    monkeypatch.setattr(
+        annotations, "_get_existing", lambda annotation_id: _first_then(reads, real, annotation_id)
+    )
+    with pytest.raises(HTTPException) as lost:
+        await annotations.update_annotation(
+            row.id, annotations.AnnotationUpdate(body=AnnotationBody(label="x"), version=1), user("owner")
+        )
+    assert lost.value.status_code == 409
+
+
+async def test_a_single_delete_of_a_row_deleted_meanwhile_is_404(monkeypatch):
+    row = await create()
+    stale = await annotations._get_existing(row.id)
+    await annotations.delete_annotation(row.id, user("owner"))
+
+    async def still_there(annotation_id):
+        return stale
+
+    monkeypatch.setattr(annotations, "_get_existing", still_there)
+    with pytest.raises(HTTPException) as gone:
+        await annotations.delete_annotation(row.id, user("owner"))
+    assert gone.value.status_code == 404
+
+
+async def _first_then(reads, real, annotation_id):
+    for row in reads:
+        return row
+    return await real(annotation_id)
+
+
+async def test_orphaned_comments_are_swept():
+    kept = await create(visible_to=[])
+    await annotation_comments.create_comment(kept.id, CommentIn(body="kept"), user("owner"))
+    async with annotations.storage_transaction(write=True) as tx:
+        await tx.execute(
+            "INSERT INTO annotation_comments (id, annotation_id, study_id, author, body,"
+            " created_at, updated_at, deleted)"
+            f" VALUES ('orphan', 'gone', 'study-1', 'x', 'y', {tx.now}, {tx.now}, FALSE)"
+        )
+    assert await annotations.sweep_orphan_comments() == 1
+    assert await annotations.sweep_orphan_comments() == 0
+    async with annotations.storage_transaction() as tx:
+        rows = await tx.fetch("SELECT annotation_id FROM annotation_comments")
+    assert [r["annotation_id"] for r in rows] == [kept.id]
