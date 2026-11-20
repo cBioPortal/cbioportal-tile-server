@@ -370,13 +370,13 @@ and a short `proxy_cache_valid 200 30s;`, for the reason above.
 ## Companion service
 
 The same image also runs a second, separate application, `app.companion`,
-which serves slide annotations, the research assistant and research
-retrieval. The pixel application (`app.main`) serves none of its routes.
+which serves slide annotations (with comment threads), slide notes, the
+research assistant and research retrieval. The pixel application (`app.main`) serves none of its routes.
 
 | Application | Command | Routes |
 |-------------|---------|--------|
 | Pixels | `gunicorn -c python:app.gunicorn_conf app.main:app` (the image's default `CMD`) | `/tiles`, `/thumbnails`, `/health`, `/ready`, `/metrics` |
-| Companion | `gunicorn -c python:app.gunicorn_conf app.companion:app` | `/annotations`, `/agent`, `/research/v1`, `/health`, `/ready` |
+| Companion | `gunicorn -c python:app.gunicorn_conf app.companion:app` | `/annotations`, `/slide-notes`, `/agent`, `/research/v1`, `/health`, `/ready` |
 
 Both serve the same routes under `/wsi` as well. Run them as separate
 deployments: override the container command for the companion.
@@ -452,11 +452,25 @@ request's user; it calls no companion route over HTTP.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/annotations?studyId=&slide_id=` | The slide's annotations in the study that the user may see |
-| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId` |
-| PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock) |
-| POST | `/annotations/batch?studyId=` | Create a bounded group; every item's study must be `studyId` |
-| DELETE | `/annotations/{id}?studyId=` | Delete (creator only) |
+| GET | `/annotations?studyId=&slide_id=` | The slide's live annotations in the study that the user may see (see [Visibility](#visibility)), each with its `comment_count`; rejected machine-made ones only with `include_rejected=true`; deleted ones never |
+| POST | `/annotations?studyId=` | Create; the body's `study_id` must be `studyId`; machine provenance only from a trusted writer; `target.selector` must pass the [selector rules](#selector-rules) (`422`) |
+| PUT | `/annotations/{id}?studyId=` | Update (creator only; `version` is an optimistic lock; `409` when the row changed since it was read, `404` when it was deleted); a sent `target` must pass the [selector rules](#selector-rules) |
+| POST | `/annotations/batch?studyId=` | Create 1–100 annotations in one transaction (all or none), returned in request order; every item's study must be `studyId` |
+| POST | `/annotations/{id}/review?studyId=` | `{"decision": "accept"\|"reject"\|"reset", "version"}` on a machine-made annotation: accept or reject by any user who can see it, reset by its reviewer only (see [Reviewing](#reviewing-machine-made-annotations)) |
+| DELETE | `/annotations/{id}?studyId=` | Soft-delete (creator only); the comment thread is kept for a restore; `404` when it is missing or already deleted (see [Deleting and restoring](#deleting-and-restoring)) |
+| POST | `/annotations/{id}/restore?studyId=` | `{"version"}`: bring a deleted annotation back under its id (creator only), `version` bumped; `404` unless it is deleted, `409` when `version` is not the deleted row's |
+| POST | `/annotations/batch-update?studyId=` | `{"items": [{"id", "version", "body"?, "target"?, "visible_to"?}]}`: 1–100 updates under the PUT rules, all or none (see [Batches](#batch-update-delete-review-and-restore)) |
+| POST | `/annotations/batch-delete?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 soft deletes (creator only), all or none |
+| POST | `/annotations/batch-review?studyId=` | `{"items": [{"id", "version", "decision"}]}`: 1–100 reviews (`accept`, `reject` or `reset`) under the review rules, all or none |
+| POST | `/annotations/batch-restore?studyId=` | `{"items": [{"id", "version"}]}`: 1–100 restores of deleted annotations (creator only), all or none |
+| GET | `/annotations/{id}/comments?studyId=[&offset=0][&limit=100]` | A page of the annotation's comment thread, oldest first, for anyone who can see the live annotation: `{"annotation_id", "comments", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Comment threads](#comment-threads)) |
+| POST | `/annotations/{id}/comments?studyId=` | Add `{"body"}` to the thread; `422` once the annotation holds 1000 comments (deleted ones included) |
+| PUT | `/annotations/{id}/comments/{cid}?studyId=` | Edit `{"body"}` (author only) |
+| DELETE | `/annotations/{id}/comments/{cid}?studyId=` | Delete (author only; kept, flagged deleted) |
+| GET | `/slide-notes?studyId=&slide_id=[&offset=0][&limit=100]` | A page of the slide's notes the user may see, with a tag summary over all of them: `{"slide_id", "notes", "tags", "total", "offset", "limit", "has_more", "next_offset"}`; `limit` 1–500 (default 100), `offset` 0–1000000 (see [Slide notes and tags](#slide-notes-and-tags)) |
+| POST | `/slide-notes?studyId=` | Create `{"slide_id", "study_id", "text"?, "tags"?, "visible_to"?}`; the body's `study_id` must be `studyId`; `422` once the slide holds 1000 notes in the study (from all users) |
+| PUT | `/slide-notes/{id}?studyId=` | Update `{"version", "text"?, "tags"?, "visible_to"?}` (creator only; `version` is an optimistic lock) |
+| DELETE | `/slide-notes/{id}?studyId=[&version=]` | Delete (creator only; `409` when a given `version` is stale) |
 | GET | `/agent/health` | Assistant status (reads no identity) |
 | POST | `/agent/chat?studyId=` | Assistant turn as server-sent events; the body's `context.study_id` must be `studyId`. `WSI_AGENT_ENABLED` |
 | GET | `/agent/actions?studyId=&session_id=` | The user's proposals for the session in the study |
@@ -468,6 +482,300 @@ request's user; it calls no companion route over HTTP.
 | POST | `/research/v1/mcp?studyId=` | JSON-RPC tools for cBioAgent; `arguments.study_id` must be `studyId` |
 | GET | `/health` | Liveness |
 | GET | `/ready` | Readiness: annotation storage reachable |
+
+#### Visibility
+
+`visible_to` decides who besides the creator sees an annotation (the
+creator always does):
+
+- `null`, **the default when `visible_to` is left out**, keeps it private
+  to its creator;
+- `[]` shares it with everyone who can read the study;
+- a list of group names shares it with those groups.
+
+A loader or client that means to share its annotations with the study must
+send `"visible_to": []` explicitly; one that sends nothing writes rows only
+its own user can list. The creator can change it later with `PUT` (or
+`batch-update`) and `"visible_to": []`.
+
+#### Reviewing machine-made annotations
+
+An annotation is machine-made when its `body.provenance.source` is `agent`,
+`assistant`, `ai`, `model` or `precomputed` (any letter case). Any user who
+can see it in its study may review it, not only its creator:
+
+- `accept` sets `provenance.review_status: "accepted"`;
+- `reject` sets `provenance.review_status: "rejected"`. The row is kept as
+  an audit record of the model's output and the reviewer's decision; the
+  list leaves it out unless `include_rejected=true`, and a later review can
+  accept it again;
+- both record `reviewed_by` (the proxy's user) and `reviewed_at` (UTC), keep
+  every other field, and bump `version`. `version` must match the stored
+  one (`409` otherwise).
+- `reset` undoes the current review: it removes `review_status`,
+  `reviewed_by` and `reviewed_at` from the provenance (the annotation is
+  unreviewed again, and a rejected one is listed again without
+  `include_rejected`), keeps every other field and bumps `version`.
+  **Only the reviewer** (the stored `reviewed_by`) may reset; anyone else,
+  the annotation's creator included, gets `403`. Once another user reviews
+  it, only that user may reset it. A review stored without `reviewed_by`
+  (written by a trusted writer) cannot be reset over this route. An
+  annotation with no review answers `422`. The version check runs first,
+  so a stale reset answers `409`.
+
+```http
+POST /annotations/5d0c…/review?studyId=luad_mskcc
+{"decision": "reset", "version": 2}
+
+200 {"id": "5d0c…", "version": 3,
+     "body": {…, "provenance": {"source": "precomputed", "model": "m1"}}, …}
+```
+
+A human-made annotation answers `403`; one the user cannot see (or a
+deleted one) answers `404`. Updating and deleting stay creator-only.
+
+#### Who may write machine provenance
+
+`provenance.source` decides who may review an annotation, so a browser may
+not set it to a machine source:
+
+- `POST /annotations` and `POST /annotations/batch` answer `422` when an
+  item's `provenance.source` is a machine source, or its provenance carries
+  `review_status`, `reviewed_by` or `reviewed_at`, unless the user is listed
+  in `ANNOTATION_TRUSTED_WRITERS`. A batch with one such item saves none.
+- `PUT /annotations/{id}` answers `422` when the new body names a machine
+  source the stored row does not have (making a human annotation
+  machine-made, or changing one machine source to another). The creator may
+  still edit a machine-made annotation that keeps its source. The review
+  fields always keep their stored values; only the review route sets them.
+- The assistant writes its annotations in-process when a proposal is
+  committed (`/agent/actions/{id}/commit-annotations`), not through these
+  routes, so it needs no entry and stores `source: "agent"` as the
+  committing user.
+- A bulk loader of model output either writes to storage directly or calls
+  these routes as a service identity listed in `ANNOTATION_TRUSTED_WRITERS`
+  (an `X-Auth-Request-User` the portal asserts for it).
+- Stored rows are never re-checked: existing machine-made rows stay
+  listable, reviewable and editable by their creator.
+
+Do not list `ANNOTATION_ANONYMOUS_USER` in `ANNOTATION_TRUSTED_WRITERS`:
+with anonymous use on, every request without a user would be trusted.
+
+#### Batch update, delete, review and restore
+
+`batch-update`, `batch-delete`, `batch-review` and `batch-restore` take
+1–100 `items`, each naming an annotation `id` (once per batch) and its
+current `version`. The rows are read and locked, every item is checked
+under the rule of its single-item route (`PUT`, `DELETE`, `/review`,
+`/restore`), and only then is anything written, all in one transaction:
+either every item is saved or none is.
+
+| Status | When | Body |
+|--------|------|------|
+| `200` | Every item saved | The rows in request order: updated, reviewed or restored (`version` bumped), or, for `batch-delete`, as they were before deletion (same `version`, the one to restore with) |
+| `422` | Fewer than 1 or more than 100 items, a repeated `id`, a malformed item (including a `target` the [selector rules](#selector-rules) refuse), an item the provenance rules refuse, or a `reset` of an annotation with no review | FastAPI's `detail` list; each `loc` is `["body", "items", <index>, ...]` |
+| `404` | An item's annotation does not exist or is deleted (for a review, also when not visible to the user; for a restore, when it is not deleted) | `{"msg", "index", "id", "loc"}` for the first such item |
+| `403` | An item's annotation is in another study, not the user's (update, delete, restore), not machine-made (review), or a `reset` by someone other than its reviewer | `{"msg", "index", "id", "loc"}` for the first such item |
+| `409` | Any item's `version` is stale | `{"msg", "conflicts": [{"index", "id", "loc", "version", "current_version"}]}` listing every stale item |
+
+Checks run in request order: the first missing, forbidden or invalid item
+fails the batch at once, while stale versions are collected and answered
+together, so a client can refetch exactly those rows.
+
+#### Selector rules
+
+The viewer hands `target.selector.value` to Annotorious, which renders an
+`SvgSelector` as SVG markup, so every create and update (single, `batch`
+and `batch-update`) checks the selector it is sent and answers `422`
+(FastAPI's `detail` list, `loc` ending in `target`) unless it is one of the
+shapes the viewer writes. Stored rows are never re-checked: an existing
+annotation stays readable, and a `PUT` or batch item that leaves `target`
+out keeps it.
+
+- The selector object holds `type`, `value` and, optionally, `conformsTo`
+  (an `http(s)` URL), nothing else; `value` is at most 1,000,000
+  characters.
+- `FragmentSelector`: `xywh=x,y,w,h` or `xywh=pixel:x,y,w,h`, four numbers.
+- `SvgSelector`: one `<svg>` element (no attribute but the SVG `xmlns`)
+  holding at least one shape, directly or inside one level of `<g>`
+  (no attribute but `fill-rule`). The shapes and their only attributes:
+
+  | Element | Attributes |
+  |---------|------------|
+  | `<polygon>`, `<polyline>` | `points`: numbers separated by commas or whitespace |
+  | `<path>` | `d`: path commands `M L H V C S Q T A Z` (either case) and numbers |
+  | `<circle>` | `cx`, `cy`, `r` (a point is `r="0"`) |
+  | `<ellipse>` | `cx`, `cy`, `rx`, `ry` |
+  | `<line>` | `x1`, `y1`, `x2`, `y2` |
+  | `<rect>` | `x`, `y`, `width`, `height`, `rx`, `ry` |
+
+  Any shape (and `<g>`) may also carry `fill-rule` (`nonzero` or
+  `evenodd`), as a region with holes does:
+  `<svg><g><path fill-rule="evenodd" d="M … Z M … Z" /></g></svg>`. A
+  number is a decimal with an optional sign and exponent (`NaN`,
+  `Infinity` and units are refused). Shapes may be self-closing or have an
+  empty closing tag.
+- Refused: any other element (`script`, `foreignObject`, `image`, `use`,
+  `a`, `style`, nested `<g>`, ...), any other attribute (`on*`, `style`,
+  `class`, `href`, `xlink:href`, `transform`, ...), text, entities and
+  character references, comments, CDATA, processing instructions and
+  DOCTYPEs.
+
+#### Comment threads
+
+Each annotation has a comment thread, separate from the annotation's own
+note (`body.comment`, which only its creator edits):
+
+- anyone who can see the annotation in the authorized study may read the
+  thread and add to it; an annotation in another study answers `403`, one
+  the user cannot see (`visible_to`) answers `404`, as a missing one does;
+- only a comment's author may edit or delete it, and only while they can
+  still see the annotation;
+- a deleted comment is kept, flagged `deleted`, and left out of the thread
+  and of `comment_count`;
+- deleting the annotation keeps its thread: while the annotation is
+  deleted, every comment route answers `404` for it (as for a missing
+  one), to its creator too; a restore brings the thread back as it was,
+  and the [retention purge](#deleting-and-restoring) removes it with the
+  annotation;
+- a comment `body` is 1–4000 characters after trimming surrounding
+  whitespace (`422` otherwise).
+
+A comment is `{"id", "annotation_id", "study_id", "author", "body",
+"created_at", "updated_at"}`; `author` is `X-Auth-Request-User`.
+
+An annotation holds at most 1000 comments, deleted ones included (so
+deleting and reposting cannot grow a thread without bound); the next `POST`
+answers `422`. The list is paged: `offset` (default `0`, at most
+`1000000`) and `limit` (default `100`, `1`–`500`; `422` outside those)
+pick a slice of the live comments, oldest first:
+
+```json
+{
+  "annotation_id": "5d0c…",
+  "comments": [
+    {"id": "…", "annotation_id": "5d0c…", "study_id": "luad_mskcc", "author": "alice",
+     "body": "Agree", "created_at": "2026-11-18T14:02:11Z", "updated_at": "2026-11-18T14:02:11Z"}
+  ],
+  "total": 1,
+  "offset": 0,
+  "limit": 100,
+  "has_more": false,
+  "next_offset": null
+}
+```
+
+`total` counts the thread's live comments (as `comment_count` does);
+`next_offset` is the `offset` of the next page, `null` on the last
+(`has_more` is then `false`). Comments that are deleted between page
+requests shift later pages back by one.
+
+At every start the companion also deletes comments whose annotation row no
+longer exists (left by anything that removed annotation rows outside these
+routes). A deleted annotation keeps its row until the purge, so its thread
+is not swept.
+
+#### Deleting and restoring
+
+`DELETE /annotations/{id}` and `batch-delete` are soft deletes: they set
+the row's `deleted_at` and change nothing else (not `version`, not the
+comment thread). A deleted annotation:
+
+- is left out of `GET /annotations` (even with `include_rejected=true`),
+  and its id answers `404` to `PUT`, `/review`, `DELETE`, every batch but
+  `batch-restore`, and every comment route;
+- still holds its id, so no new annotation can take it, and its comments
+  still count toward the thread's 1000-comment cap;
+- does not affect slide notes or other annotations' `comment_count`.
+
+Its creator brings it back, under the same id and with its thread, with
+`POST /annotations/{id}/restore` (or `batch-restore`), sending the version
+the row had when it was deleted:
+
+```http
+POST /annotations/5d0c…/restore?studyId=luad_mskcc
+{"version": 2}
+
+200 {"id": "5d0c…", "version": 3, "comment_count": 4, "created_by": "alice", …}
+```
+
+The restored annotation is the stored row with `version` bumped and
+`updated_at` set, so a client still holding the pre-delete version gets
+`409` on its next write. A rejected annotation stays rejected. `404` when
+the id is missing, live, or already purged; `403` for anyone but the
+creator or another study; `409` for another `version`.
+
+**Retention purge.** Annotations deleted more than
+`ANNOTATION_DELETED_RETENTION_DAYS` days ago (default `30`) are removed for
+good, with their comment threads, at every start and once a day while the
+companion runs (each worker runs it; it is idempotent). `0` turns the purge
+off and keeps deleted annotations restorable forever. Live annotations are
+never purged. Annotations deleted before soft delete existed (schema
+version 3) were removed outright and cannot be restored.
+
+#### Slide notes and tags
+
+A slide note belongs to a slide (`slide_id`, the opaque 12-hex slide key)
+in a study, not to a shape. It carries `text` (up to 4000 characters), up
+to 20 `tags`, or both, never neither (`422`).
+
+- **Tags** are 1–40 characters of letters, digits, spaces and `_ - . : / + #`,
+  starting with a letter or digit. Runs of whitespace become one space, and
+  a tag repeated in another letter case is dropped; otherwise a tag is
+  stored as sent.
+- **Visibility** is the annotation model: the creator always sees a note;
+  `visible_to: null` (the default) keeps it private, `[]` shows it to
+  everyone who can read the study, and a list of group names to those
+  groups.
+- **Writes**: only the creator may update or delete a note. `PUT` needs
+  the current `version` and bumps it; `DELETE` checks `version` when it is
+  given. Fields left out of a `PUT` keep their stored values.
+- **Cap**: a slide holds at most 1000 notes in a study, from all users;
+  the next `POST` answers `422`.
+
+`GET /slide-notes` takes `offset` (default `0`, at most `1000000`) and
+`limit` (default `100`, `1`–`500`; `422` outside those) over the notes the
+user may see, oldest first, and answers:
+
+```json
+{
+  "slide_id": "0123456789ab",
+  "notes": [
+    {"id": "…", "slide_id": "0123456789ab", "study_id": "luad_mskcc", "text": "Margin involved",
+     "tags": ["QC", "LUAD"], "created_by": "alice", "visible_to": [], "version": 1,
+     "created_at": "2026-11-18T14:02:11Z", "updated_at": "2026-11-18T14:02:11Z"}
+  ],
+  "tags": [{"tag": "QC", "count": 1}, {"tag": "LUAD", "count": 1}],
+  "total": 1,
+  "offset": 0,
+  "limit": 100,
+  "has_more": false,
+  "next_offset": null
+}
+```
+
+`notes` is the page, oldest first; `total` counts every note the user may
+see, and `tags` counts, for each tag, all those notes that carry it (not
+only the page's), most used first. `next_offset` is the `offset` of the
+next page, `null` on the last.
+
+### Annotation storage schema
+
+| Table | Holds |
+|-------|-------|
+| `annotations` | `id`, `slide_id`, `study_id`, `body` (JSON), `target` (JSON), `created_by`, `visible_to` (JSON list or null), `version`, `created_at`, `updated_at`, `deleted_at` (null while live); partial index on `deleted_at` for deleted rows |
+| `annotation_comments` | `id`, `annotation_id`, `study_id`, `author`, `body`, `created_at`, `updated_at`, `deleted`; indexed on `(annotation_id, created_at)` |
+| `slide_notes` | `id`, `slide_id`, `study_id`, `text`, `tags` (JSON list), `created_by`, `visible_to`, `version`, `created_at`, `updated_at`; indexed on `(slide_id, study_id)` |
+
+On Postgres, `annotation_schema_migrations` records the version of the
+`annotations` component (now `3`: version 1 created `annotations`, version 2
+added `annotation_comments` and `slide_notes`, version 3 added the nullable
+`annotations.deleted_at` and its partial index). Each start takes the schema
+advisory lock and applies only the steps above the recorded version; every
+step only creates tables, nullable columns without a default and indexes,
+so stored annotations are kept as they are (version 3 rewrites no row, and
+every existing row stays live). On SQLite, each start creates any missing
+table, column and index.
 
 ### Companion configuration
 
@@ -488,6 +796,8 @@ request's user; it calls no companion route over HTTP.
 | `COMPANION_MAX_BODY_BYTES` | `4194304` | Largest accepted request body |
 | `N_WORKERS` | `4` | Gunicorn workers; use `1` for the first start on an empty SQLite database |
 | `ANNOTATION_LOCAL_DEVELOPMENT` | `false` | Development only: the user `local-development` may update and delete any annotation |
+| `ANNOTATION_DELETED_RETENTION_DAYS` | `30` | Days a deleted annotation stays restorable before the purge removes it and its comment thread; `0` keeps them forever (see [Deleting and restoring](#deleting-and-restoring)) |
+| `ANNOTATION_TRUSTED_WRITERS` | — | Comma-separated users (`X-Auth-Request-User`) that may create machine-made annotations and set review fields over HTTP (see [Who may write machine provenance](#who-may-write-machine-provenance)) |
 | `WSI_AGENT_ENABLED` | `false` | Enable the server-side research assistant; every `/agent` route but `/agent/health` answers `404` while it is off |
 | `WSI_AGENT_PROVIDER` | `bedrock` | Assistant provider: `bedrock` (production), `openai`, or `databricks` |
 | `BEDROCK_AGENT_MODEL` | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Bedrock model used by the research assistant |
@@ -552,6 +862,9 @@ spec:
           - path: /wsi/annotations
             pathType: Prefix
             backend: {service: {name: wsi-companion, port: {number: 8080}}}
+          - path: /wsi/slide-notes
+            pathType: Prefix
+            backend: {service: {name: wsi-companion, port: {number: 8080}}}
           # When the assistant and research retrieval are enabled:
           - path: /wsi/agent/chat
             pathType: Exact
@@ -585,7 +898,7 @@ Keep `underscores_in_headers` off (the controller default), so
 ### Plain nginx
 
 ```nginx
-location ~ ^/wsi/(annotations|agent|research)(/.*)?$ {
+location ~ ^/wsi/(annotations|slide-notes|agent|research)(/.*)?$ {
     if ($wsi_study = "!") {
         return 400;
     }

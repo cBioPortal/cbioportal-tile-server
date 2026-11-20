@@ -148,6 +148,8 @@ services:
       COMPANION_ALLOWED_ORIGINS: ${COMPANION_ALLOWED_ORIGINS:-}
       # Dev-only: the synthetic local-development user may manage any row.
       ANNOTATION_LOCAL_DEVELOPMENT: ${ANNOTATION_LOCAL_DEVELOPMENT:-false}
+      # Users that may create machine-made annotations over HTTP (a bulk loader).
+      ANNOTATION_TRUSTED_WRITERS: ${ANNOTATION_TRUSTED_WRITERS:-}
 
       # ── Optional WSI research assistant (server-side only) ───────────────
       # Keep the API credential in a secret-mounted file or secret manager;

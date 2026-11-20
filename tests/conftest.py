@@ -50,3 +50,51 @@ def make_mock_slide(width: int = 1024, height: int = 1024, levels: int = 3) -> M
 @pytest.fixture
 def mock_slide():
     return make_mock_slide()
+
+
+@pytest.fixture(
+    params=["sqlite", pytest.param("postgres", marks=pytest.mark.integration)]
+)
+async def annotation_storage(request, tmp_path, monkeypatch):
+    """Annotation storage on SQLite, and on Postgres under ``-m integration``.
+
+    Postgres runs in a fresh schema of ``POSTGRES_TEST_DSN`` per test,
+    dropped afterwards.
+    """
+    import os
+    import uuid
+    from urllib.parse import urlencode
+
+    from app import annotation_db, annotations
+
+    monkeypatch.setattr(annotations.settings, "annotation_database_url", "")
+    monkeypatch.setattr(annotations.settings, "annotation_trusted_writers", ["loader"])
+    if request.param == "sqlite":
+        await annotations.init_db(str(tmp_path / "annotations.db"), db_url="")
+        yield "sqlite"
+        annotations._db_path = ""
+        annotations._db_url = ""
+        return
+
+    import asyncpg
+
+    dsn = os.environ.get("POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.fail("POSTGRES_TEST_DSN is required for the PostgreSQL integration suite")
+    schema = f"ann_test_{uuid.uuid4().hex[:12]}"
+    admin = await asyncpg.connect(dsn)
+    await admin.execute(f'CREATE SCHEMA "{schema}"')
+    # The pool belongs to the event loop that opened it; each test has its own.
+    monkeypatch.setattr(annotation_db, "_pool", None)
+    monkeypatch.setattr(annotation_db, "_pool_dsn", "")
+    separator = "&" if "?" in dsn else "?"
+    scoped = f"{dsn}{separator}{urlencode({'search_path': schema})}"
+    try:
+        await annotations.init_db(db_url=scoped)
+        yield "postgres"
+    finally:
+        await annotations.close_db()
+        annotations._db_path = ""
+        annotations._db_url = ""
+        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.close()

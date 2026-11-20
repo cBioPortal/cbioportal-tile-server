@@ -42,4 +42,4 @@ jobs:
       - name: Run PostgreSQL integration suite
         env:
           POSTGRES_TEST_DSN: postgresql://tile_server:tile_server@127.0.0.1:5432/tile_server_test
-        run: uv run pytest -m integration tests/test_postgres_integration.py
+        run: uv run pytest -m integration

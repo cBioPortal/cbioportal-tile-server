@@ -56,6 +56,8 @@ def annotation_input(
 @pytest.fixture(autouse=True)
 async def sqlite_annotation_db(tmp_path, monkeypatch):
     monkeypatch.setattr(annotations.settings, "annotation_database_url", "")
+    # "loader" stands for a bulk loader's service identity.
+    monkeypatch.setattr(annotations.settings, "annotation_trusted_writers", ["loader"])
     await annotations.init_db(str(tmp_path / "annotations.db"), db_url="")
     yield
     annotations._db_path = ""
@@ -98,7 +100,7 @@ async def test_annotation_crud_round_trip_and_privacy_reset():
 
 @pytest.mark.asyncio
 async def test_annotation_batch_preserves_layer_color_and_provenance():
-    owner = user("owner")
+    owner = user("loader")
     batch = AnnotationBatchIn(
         annotations=[
             annotation_input(),
@@ -112,7 +114,7 @@ async def test_annotation_batch_preserves_layer_color_and_provenance():
                     color="#7b61ff",
                     provenance={"source": "agent", "model": "quiltnet_pmb"},
                 ),
-                target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg/>"}),
+                target=AnnotationTarget(selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}),
             ),
         ]
     )
@@ -234,3 +236,297 @@ def test_annotations_accept_only_opaque_slide_keys(slide_id):
     )
     assert response.status_code == 422
 
+
+
+def machine_input(source: str = "precomputed", visible_to: list[str] | None = None) -> AnnotationIn:
+    data = annotation_input(visible_to=[] if visible_to is None else visible_to)
+    data.body = AnnotationBody(
+        label="Tumor",
+        type="Polygon",
+        layer_name="Model",
+        provenance={"source": source, "model": "luad-patterns"},
+    )
+    return data
+
+
+@pytest.mark.parametrize("source", ["agent", "assistant", "AI", "model", "precomputed"])
+def test_machine_sources_are_reviewable(source):
+    assert annotations.is_machine_made({"provenance": {"source": source}})
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{}, {"provenance": None}, {"provenance": {"source": "import"}}, {"provenance": {"source": 1}}, "not json"],
+)
+def test_other_annotations_are_not_machine_made(body):
+    assert not annotations.is_machine_made(body)
+
+
+@pytest.mark.asyncio
+async def test_any_user_in_the_study_may_accept_a_machine_annotation():
+    created = await annotations.create_annotation(machine_input(), user("loader"))
+
+    accepted = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+    )
+
+    assert accepted.version == 2
+    assert accepted.created_by == "loader"
+    assert accepted.body.label == "Tumor"
+    assert accepted.target == created.target
+    assert accepted.visible_to == []
+    provenance = accepted.body.provenance
+    assert provenance["source"] == "precomputed"
+    assert provenance["model"] == "luad-patterns"
+    assert provenance["review_status"] == "accepted"
+    assert provenance["reviewed_by"] == "reviewer"
+    assert provenance["reviewed_at"].endswith("Z")
+    listed = await annotations.list_annotations(SLIDE_KEY, user("other"))
+    assert [item.body.provenance["review_status"] for item in listed] == ["accepted"]
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_annotation_is_kept_but_not_listed():
+    created = await annotations.create_annotation(machine_input("agent"), user("loader"))
+
+    rejected = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="reject", version=1), user("reviewer")
+    )
+
+    assert rejected.body.provenance["review_status"] == "rejected"
+    assert await annotations.list_annotations(SLIDE_KEY, user("loader")) == []
+    audit = await annotations.list_annotations(SLIDE_KEY, user("loader"), include_rejected=True)
+    assert [item.id for item in audit] == [created.id]
+
+    # A later review may restore it, and its creator may still delete it.
+    restored = await annotations.review_annotation(
+        created.id, annotations.AnnotationReview(decision="accept", version=2), user("second")
+    )
+    assert restored.version == 3
+    assert [item.id for item in await annotations.list_annotations(SLIDE_KEY, user("x"))] == [created.id]
+    await annotations.delete_annotation(created.id, user("loader"))
+
+
+@pytest.mark.asyncio
+async def test_review_refuses_human_annotations_other_studies_and_stale_versions():
+    human = await annotations.create_annotation(annotation_input(visible_to=[]), user("owner"))
+    with pytest.raises(HTTPException) as not_machine:
+        await annotations.review_annotation(
+            human.id, annotations.AnnotationReview(decision="accept", version=1), user("owner")
+        )
+    assert not_machine.value.status_code == 403
+
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    with pytest.raises(HTTPException) as wrong_study:
+        await annotations.review_annotation(
+            machine.id,
+            annotations.AnnotationReview(decision="accept", version=1),
+            user("reviewer", study_id="study-2"),
+        )
+    assert wrong_study.value.status_code == 403
+
+    with pytest.raises(HTTPException) as stale:
+        await annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="reject", version=5), user("reviewer")
+        )
+    assert stale.value.status_code == 409
+
+    with pytest.raises(HTTPException) as missing:
+        await annotations.review_annotation(
+            "missing", annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+        )
+    assert missing.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_review_needs_the_annotation_to_be_visible_to_the_reviewer():
+    private = await annotations.create_annotation(
+        machine_input(visible_to=None).model_copy(update={"visible_to": None}), user("loader")
+    )
+    with pytest.raises(HTTPException) as hidden:
+        await annotations.review_annotation(
+            private.id, annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+        )
+    assert hidden.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_review_does_not_open_edit_or_delete_to_other_users():
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    with pytest.raises(HTTPException) as update:
+        await annotations.update_annotation(machine.id, AnnotationUpdate(version=1), user("reviewer"))
+    assert update.value.status_code == 403
+    with pytest.raises(HTTPException) as delete:
+        await annotations.delete_annotation(machine.id, user("reviewer"))
+    assert delete.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_concurrent_reviews_take_one_version():
+    machine = await annotations.create_annotation(machine_input(), user("loader"))
+    results = await asyncio.gather(
+        annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="accept", version=1), user("a")
+        ),
+        annotations.review_annotation(
+            machine.id, annotations.AnnotationReview(decision="reject", version=1), user("b")
+        ),
+        return_exceptions=True,
+    )
+    assert sum(isinstance(result, AnnotationOut) for result in results) == 1
+    conflicts = [result for result in results if isinstance(result, HTTPException)]
+    assert [conflict.status_code for conflict in conflicts] == [409]
+
+
+def test_a_review_decision_must_be_accept_or_reject():
+    with pytest.raises(ValidationError):
+        annotations.AnnotationReview(decision="delete", version=1)
+
+
+@pytest.mark.asyncio
+async def test_annotation_batch_saves_all_or_none(monkeypatch):
+    owner = user("owner")
+    real_insert = annotations._insert_sqlite_connection
+    calls = 0
+
+    async def failing_second_insert(db, data, user_sub, annotation_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("storage failed")
+        return await real_insert(db, data, user_sub, annotation_id)
+
+    monkeypatch.setattr(annotations, "_insert_sqlite_connection", failing_second_insert)
+    with pytest.raises(RuntimeError):
+        await annotations.create_annotation_batch(
+            AnnotationBatchIn(annotations=[annotation_input(visible_to=[]) for _ in range(3)]), owner
+        )
+    monkeypatch.setattr(annotations, "_insert_sqlite_connection", real_insert)
+
+    assert await annotations.list_annotations(SLIDE_KEY, owner) == []
+
+    created = await annotations.create_annotation_batch(
+        AnnotationBatchIn(annotations=[annotation_input(visible_to=[]) for _ in range(3)]), owner
+    )
+    listed = await annotations.list_annotations(SLIDE_KEY, owner)
+    assert {item.id for item in listed} == {item.id for item in created}
+
+
+# --- provenance trust -------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["agent", "Assistant", "ai", "model", "precomputed"])
+async def test_an_untrusted_user_cannot_create_a_machine_annotation(source):
+    data = machine_input(source)
+    with pytest.raises(HTTPException) as create_error:
+        await annotations.create_annotation(data, user("owner"))
+    assert create_error.value.status_code == 422
+    with pytest.raises(HTTPException) as batch_error:
+        await annotations.create_annotation_batch(
+            AnnotationBatchIn(annotations=[annotation_input(), data]), user("owner")
+        )
+    assert batch_error.value.status_code == 422
+    assert await annotations.list_annotations(SLIDE_KEY, user("owner")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["review_status", "reviewed_by", "reviewed_at"])
+async def test_an_untrusted_user_cannot_create_review_fields(field):
+    data = annotation_input()
+    data.body = AnnotationBody(label="Tumor", provenance={"source": "import", field: "accepted"})
+    with pytest.raises(HTTPException) as error:
+        await annotations.create_annotation(data, user("owner"))
+    assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_human_provenance_is_kept_for_any_user():
+    data = annotation_input()
+    data.body = AnnotationBody(label="Tumor", provenance={"source": "geojson-import"})
+    created = await annotations.create_annotation(data, user("owner"))
+    assert created.body.provenance == {"source": "geojson-import"}
+
+
+@pytest.mark.asyncio
+async def test_the_creator_cannot_turn_an_annotation_machine_made():
+    created = await annotations.create_annotation(annotation_input(), user("owner"))
+    with pytest.raises(HTTPException) as error:
+        await annotations.update_annotation(
+            created.id,
+            AnnotationUpdate(
+                body=AnnotationBody(label="Tumor", provenance={"source": "model"}), version=1
+            ),
+            user("owner"),
+        )
+    assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_a_stored_machine_annotation_stays_editable_by_its_creator():
+    # Rows the assistant wrote in-process as the user, or that a loader put
+    # straight into storage, carry a machine source but an ordinary creator.
+    row = await annotations._create_sqlite(machine_input("precomputed"), "local-development")
+    creator = user("local-development")
+    reviewed = await annotations.review_annotation(
+        row["id"], annotations.AnnotationReview(decision="accept", version=1), user("reviewer")
+    )
+    stored = reviewed.body.provenance
+
+    # Same source, a new label and forged review fields: saved, review kept.
+    updated = await annotations.update_annotation(
+        row["id"],
+        AnnotationUpdate(
+            body=AnnotationBody(
+                label="Tumor bed",
+                layer_name="Model",
+                provenance={
+                    "source": "precomputed",
+                    "model": "luad-patterns",
+                    "review_status": "rejected",
+                    "reviewed_by": "creator",
+                },
+            ),
+            version=2,
+        ),
+        creator,
+    )
+    assert updated.body.label == "Tumor bed"
+    assert updated.body.provenance["review_status"] == "accepted"
+    assert updated.body.provenance["reviewed_by"] == "reviewer"
+    assert updated.body.provenance["reviewed_at"] == stored["reviewed_at"]
+
+    # Another machine source is refused.
+    with pytest.raises(HTTPException) as error:
+        await annotations.update_annotation(
+            row["id"],
+            AnnotationUpdate(
+                body=AnnotationBody(label="Tumor", provenance={"source": "agent"}), version=3
+            ),
+            creator,
+        )
+    assert error.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_a_trusted_writer_may_set_machine_provenance_and_review_fields():
+    data = machine_input("precomputed")
+    data.body.provenance["review_status"] = "accepted"
+    created = await annotations.create_annotation(data, user("loader"))
+    assert created.body.provenance["review_status"] == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_color_letter_case_is_stored_as_sent():
+    data = annotation_input()
+    data.body = AnnotationBody(label="Tumor", color="#AbCdEF", layer_name="Layer A")
+    created = await annotations.create_annotation(data, user("owner"))
+    assert created.body.color == "#AbCdEF"
+    listed = await annotations.list_annotations(SLIDE_KEY, user("owner"))
+    assert listed[0].body.color == "#AbCdEF"
+    updated = await annotations.update_annotation(
+        created.id,
+        AnnotationUpdate(body=AnnotationBody(label="Tumor", color="#FFaa00"), version=1),
+        user("owner"),
+    )
+    assert updated.body.color == "#FFaa00"
