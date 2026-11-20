@@ -1,4 +1,5 @@
-"""Companion service: annotations, the assistant and research retrieval.
+"""Companion service: annotations (with comment threads), slide notes, the
+assistant and research retrieval.
 
 Run it from the same image as the tile server::
 
@@ -21,6 +22,8 @@ no ``Origin`` or one that is the request's own host or listed in
 cross-site page cannot send the custom header.
 """
 
+import asyncio
+import contextlib
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -31,7 +34,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import agent, annotations, research
+from . import agent, annotation_comments, annotations, research, slide_notes
 from .config import settings
 
 logger = logging.getLogger(__name__)
@@ -145,16 +148,22 @@ async def lifespan(app: FastAPI):
     logger.info("Annotation DB ready (%s)", annotations.storage_kind())
     await agent.init_db()
     logger.info("Agent proposal tables ready")
+    # init_db purged once; repeat daily while the service is up.
+    purge = asyncio.create_task(annotations.purge_deleted_annotations_forever())
     try:
         yield
     finally:
+        purge.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await purge
         await annotations.close_db()
 
 
 app = FastAPI(
     title="WSI companion service",
     description=(
-        "Slide annotations, the research assistant and research retrieval for"
+        "Slide annotations, comment threads, slide notes, the research assistant"
+        " and research retrieval for"
         " cBioPortal, behind an authenticating proxy."
     ),
     version="1.0.0",
@@ -162,6 +171,8 @@ app = FastAPI(
 )
 app.add_middleware(CompanionGuard)
 app.include_router(annotations.router)
+app.include_router(annotation_comments.router)
+app.include_router(slide_notes.router)
 app.include_router(agent.router)
 app.include_router(research.router)
 

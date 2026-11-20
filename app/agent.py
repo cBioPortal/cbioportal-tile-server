@@ -2474,7 +2474,8 @@ async def _committed_annotation_rows(
     for annotation_id in ids:
         if isinstance(db, aiosqlite.Connection):
             cursor = await db.execute(
-                "SELECT * FROM annotations WHERE id = ?", (annotation_id,)
+                "SELECT * FROM annotations WHERE id = ? AND deleted_at IS NULL",
+                (annotation_id,),
             )
             row = await cursor.fetchone()
         else:
@@ -2485,7 +2486,7 @@ async def _committed_annotation_rows(
                     version,
                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                     to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
-                FROM annotations WHERE id = $1
+                FROM annotations WHERE id = $1 AND deleted_at IS NULL
                 """,
                 annotation_id,
             )

@@ -196,6 +196,11 @@ class Settings:
     annotation_trusted_writers: list[str] = field(
         default_factory=lambda: _env_csv("ANNOTATION_TRUSTED_WRITERS", "")
     )
+    # Days a deleted annotation (and its comment thread) is kept, restorable,
+    # before the retention purge removes it for good; 0 keeps them forever.
+    annotation_deleted_retention_days: int = field(
+        default_factory=lambda: max(0, _env_int("ANNOTATION_DELETED_RETENTION_DAYS", 30))
+    )
     agent_enabled: bool = field(default_factory=lambda: _env_bool("WSI_AGENT_ENABLED", False))
     agent_provider: str = field(default_factory=lambda: _env_str("WSI_AGENT_PROVIDER", "bedrock"))
     # WSI_AGENT_MODEL names the model for any provider (a Bedrock model ID,

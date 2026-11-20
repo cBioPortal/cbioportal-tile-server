@@ -70,7 +70,7 @@ async def test_postgres_round_trip_uses_real_timestamp_columns():
                 type="#3b82f6",
             ),
             target=annotation_store.AnnotationTarget(
-                selector={"type": "SvgSelector", "value": "<svg />"}
+                selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}
             ),
         ),
         user_sub,
@@ -147,6 +147,8 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
         assert {
             "annotation_schema_migrations",
             "annotations",
+            "annotation_comments",
+            "slide_notes",
             "agent_actions",
             "agent_retrieval_candidates",
             "agent_retrieval_runs",
@@ -155,7 +157,7 @@ async def test_concurrent_migrations_on_empty_schema_all_succeed():
             f'SELECT component, version FROM "{schema}".annotation_schema_migrations'
         )
         assert {row["component"]: row["version"] for row in versions} == {
-            "annotations": 1,
+            "annotations": 3,
             "agent_actions": 1,
             "agent_retrieval_candidates": 1,
             "agent_retrieval_runs": 1,
@@ -191,7 +193,7 @@ async def test_postgres_batch_is_atomic_and_review_bumps_the_version(monkeypatch
                 label=label, provenance={"source": "precomputed"}
             ),
             target=annotation_store.AnnotationTarget(
-                selector={"type": "SvgSelector", "value": "<svg />"}
+                selector={"type": "SvgSelector", "value": "<svg><polygon points=\"1,1 4,1 4,4\" /></svg>"}
             ),
             visible_to=[],
         )

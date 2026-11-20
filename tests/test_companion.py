@@ -381,6 +381,386 @@ class TestAnnotationRoutes:
         )
 
 
+# --- batches, comment threads and slide notes over HTTP ----------------------
+
+
+NO_XHR = {"X-Auth-Request-User": "alice@example.org", "X-Auth-Request-Study": "study-a"}
+
+
+class TestCollaborationRoutes:
+    def _rows(self, client, count: int = 2, user: str = "alice@example.org") -> list[dict]:
+        return [
+            client.post(
+                "/wsi/annotations?studyId=study-a",
+                json=annotation_body(label=f"L{index}"),
+                headers=headers(user=user),
+            ).json()
+            for index in range(count)
+        ]
+
+    def test_batch_update_over_http(self, client):
+        rows = self._rows(client)
+        response = client.post(
+            "/wsi/annotations/batch-update?studyId=study-a",
+            json={
+                "items": [
+                    {"id": rows[1]["id"], "version": 1, "body": {"label": "second"}},
+                    {"id": rows[0]["id"], "version": 1, "visible_to": None},
+                ]
+            },
+            headers=headers(),
+        )
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()] == [rows[1]["id"], rows[0]["id"]]
+        assert response.json()[1]["visible_to"] is None
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_batch_errors_name_the_item(self, client):
+        rows = self._rows(client)
+        too_many = client.post(
+            "/annotations/batch-update?studyId=study-a",
+            json={"items": [{"id": str(i), "version": 1} for i in range(101)]},
+            headers=headers(),
+        )
+        assert too_many.status_code == 422
+        assert too_many.json()["detail"][0]["loc"][:2] == ["body", "items"]
+        empty = client.post("/annotations/batch-delete?studyId=study-a", json={"items": []}, headers=headers())
+        assert empty.status_code == 422
+        bad_item = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": rows[0]["id"], "version": 1, "decision": "maybe"}]},
+            headers=headers(),
+        )
+        assert bad_item.status_code == 422
+        assert bad_item.json()["detail"][0]["loc"][:3] == ["body", "items", 0]
+
+        stale = client.post(
+            "/annotations/batch-update?studyId=study-a",
+            json={"items": [{"id": rows[0]["id"], "version": 1}, {"id": rows[1]["id"], "version": 5}]},
+            headers=headers(),
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["conflicts"] == [
+            {
+                "index": 1,
+                "id": rows[1]["id"],
+                "loc": ["body", "items", 1, "version"],
+                "version": 5,
+                "current_version": 1,
+            }
+        ]
+        forbidden = client.post(
+            "/annotations/batch-delete?studyId=study-a",
+            json={"items": [{"id": rows[0]["id"], "version": 1}]},
+            headers=headers(user="bob@example.org"),
+        )
+        assert forbidden.status_code == 403
+        assert forbidden.json()["detail"]["index"] == 0
+        missing = client.post(
+            "/annotations/batch-delete?studyId=study-a",
+            json={"items": [{"id": rows[0]["id"], "version": 1}, {"id": "nope", "version": 1}]},
+            headers=headers(),
+        )
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["id"] == "nope"
+        listed = client.get(
+            "/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
+        )
+        assert len(listed.json()) == 2
+
+        deleted = client.post(
+            "/annotations/batch-delete?studyId=study-a",
+            json={"items": [{"id": row["id"], "version": 1} for row in rows]},
+            headers=headers(),
+        )
+        assert deleted.status_code == 200
+        assert [row["id"] for row in deleted.json()] == [row["id"] for row in rows]
+
+    def test_batch_review_over_http(self, client):
+        machine = client.post(
+            "/annotations?studyId=study-a",
+            json={**annotation_body(), "body": {"label": "AI", "provenance": {"source": "model"}}},
+            headers=headers(user="loader@example.org"),
+        ).json()
+        response = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": machine["id"], "version": 1, "decision": "accept"}]},
+            headers=headers(user="bob@example.org"),
+        )
+        assert response.status_code == 200
+        assert response.json()[0]["body"]["provenance"]["reviewed_by"] == "bob@example.org"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/annotations/batch-update",
+            "/annotations/batch-delete",
+            "/annotations/batch-review",
+            "/annotations/batch-restore",
+        ],
+    )
+    def test_batches_follow_the_identity_and_csrf_rules(self, client, path):
+        body = {"items": [{"id": "x", "version": 1, "decision": "accept"}]}
+        assert client.post(f"{path}?studyId=study-a", json=body, headers=NO_XHR).status_code == 403
+        assert client.post(f"{path}?studyId=study-b", json=body, headers=headers()).status_code == 403
+        assert (
+            client.post(f"{path}?studyId=study-a&studyId=study-a", json=body, headers=headers()).status_code
+            == 403
+        )
+        assert client.post(f"{path}?studyId=study-a", json=body, headers=headers(user=None)).status_code == 401
+        assert (
+            client.post(
+                f"{path}?studyId=study-a",
+                content="{}",
+                headers=headers(**{"Content-Type": "text/plain"}),
+            ).status_code
+            == 415
+        )
+
+    def test_comment_thread_over_http(self, client):
+        row = self._rows(client, 1)[0]
+        base = f"/wsi/annotations/{row['id']}/comments"
+        bob = headers(user="bob@example.org")
+        created = client.post(f"{base}?studyId=study-a", json={"body": "Agree"}, headers=bob)
+        assert created.status_code == 201
+        comment = created.json()
+        assert comment["author"] == "bob@example.org"
+
+        thread = client.get(base, params={"studyId": "study-a"}, headers=headers())
+        assert [item["body"] for item in thread.json()["comments"]] == ["Agree"]
+        listed = client.get(
+            "/wsi/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
+        )
+        assert listed.json()[0]["comment_count"] == 1
+
+        other = client.put(f"{base}/{comment['id']}?studyId=study-a", json={"body": "x"}, headers=headers())
+        assert other.status_code == 403
+        edited = client.put(f"{base}/{comment['id']}?studyId=study-a", json={"body": "Agreed"}, headers=bob)
+        assert edited.json()["body"] == "Agreed"
+        too_long = client.post(f"{base}?studyId=study-a", json={"body": "x" * 4001}, headers=bob)
+        assert too_long.status_code == 422
+
+        assert client.post(f"{base}?studyId=study-a", json={"body": "x"}, headers=NO_XHR).status_code == 403
+        assert (
+            client.get(base, params={"studyId": "study-b"}, headers=headers(study="study-b")).status_code
+            == 403
+        )
+        assert client.delete(f"{base}/{comment['id']}?studyId=study-a", headers=bob).status_code == 204
+        assert client.get(base, params={"studyId": "study-a"}, headers=bob).json()["comments"] == []
+
+    def test_reset_review_over_http(self, client):
+        machine = client.post(
+            "/annotations?studyId=study-a",
+            json={**annotation_body(), "body": {"label": "AI", "provenance": {"source": "model"}}},
+            headers=headers(user="loader@example.org"),
+        ).json()
+        bob = headers(user="bob@example.org")
+        review = f"/wsi/annotations/{machine['id']}/review?studyId=study-a"
+        assert client.post(review, json={"decision": "reject", "version": 1}, headers=bob).status_code == 200
+        listing = {"studyId": "study-a", "slide_id": SLIDE_KEY}
+        assert client.get("/annotations", params=listing, headers=bob).json() == []
+
+        other = client.post(review, json={"decision": "reset", "version": 2}, headers=headers())
+        assert other.status_code == 403
+        assert client.post(review, json={"decision": "reset", "version": 1}, headers=bob).status_code == 409
+        bob_no_xhr = {k: v for k, v in bob.items() if k != "X-Requested-With"}
+        assert client.post(review, json={"decision": "reset", "version": 2}, headers=bob_no_xhr).status_code == 403
+        reset = client.post(review, json={"decision": "reset", "version": 2}, headers=bob)
+        assert reset.status_code == 200, reset.text
+        assert reset.json()["version"] == 3
+        assert reset.json()["body"]["provenance"] == {"source": "model"}
+        assert [row["id"] for row in client.get("/annotations", params=listing, headers=bob).json()] == [
+            machine["id"]
+        ]
+        again = client.post(review, json={"decision": "reset", "version": 3}, headers=bob)
+        assert again.status_code == 422
+
+        batch = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": machine["id"], "version": 3, "decision": "accept"}]},
+            headers=headers(),
+        )
+        assert batch.status_code == 200
+        undone = client.post(
+            "/annotations/batch-review?studyId=study-a",
+            json={"items": [{"id": machine["id"], "version": 4, "decision": "reset"}]},
+            headers=bob,
+        )
+        assert undone.status_code == 403
+        assert undone.json()["detail"]["index"] == 0
+
+    def test_delete_and_restore_over_http(self, client):
+        row = self._rows(client, 1)[0]
+        bob = headers(user="bob@example.org")
+        thread = f"/annotations/{row['id']}/comments"
+        assert client.post(f"{thread}?studyId=study-a", json={"body": "Agree"}, headers=bob).status_code == 201
+        assert client.delete(f"/wsi/annotations/{row['id']}?studyId=study-a", headers=headers()).status_code == 204
+
+        listing = {"studyId": "study-a", "slide_id": SLIDE_KEY}
+        assert client.get("/annotations", params=listing, headers=headers()).json() == []
+        assert client.get(thread, params={"studyId": "study-a"}, headers=bob).status_code == 404
+        assert client.post(f"{thread}?studyId=study-a", json={"body": "x"}, headers=bob).status_code == 404
+        assert client.delete(f"/annotations/{row['id']}?studyId=study-a", headers=headers()).status_code == 404
+
+        restore = f"/wsi/annotations/{row['id']}/restore?studyId=study-a"
+        assert client.post(restore, json={"version": 1}, headers=bob).status_code == 403
+        assert client.post(restore, json={"version": 1}, headers=NO_XHR).status_code == 403
+        assert (
+            client.post(
+                f"/annotations/{row['id']}/restore?studyId=study-b",
+                json={"version": 1},
+                headers=headers(study="study-b"),
+            ).status_code
+            == 403
+        )
+        assert client.post(restore, json={"version": 2}, headers=headers()).status_code == 409
+        assert client.post(restore, json={}, headers=headers()).status_code == 422
+        restored = client.post(restore, json={"version": 1}, headers=headers())
+        assert restored.status_code == 200, restored.text
+        assert restored.json()["id"] == row["id"]
+        assert restored.json()["version"] == 2
+        assert restored.json()["comment_count"] == 1
+        assert client.post(restore, json={"version": 2}, headers=headers()).status_code == 404
+        listed = client.get("/annotations", params=listing, headers=headers()).json()
+        assert [(item["id"], item["comment_count"]) for item in listed] == [(row["id"], 1)]
+        comments = client.get(thread, params={"studyId": "study-a"}, headers=bob).json()["comments"]
+        assert [item["body"] for item in comments] == ["Agree"]
+
+    def test_batch_restore_over_http(self, client):
+        rows = self._rows(client, 2)
+        items = [{"id": row["id"], "version": 1} for row in rows]
+        deleted = client.post("/annotations/batch-delete?studyId=study-a", json={"items": items}, headers=headers())
+        assert deleted.status_code == 200
+        restored = client.post(
+            "/wsi/annotations/batch-restore?studyId=study-a", json={"items": items[::-1]}, headers=headers()
+        )
+        assert restored.status_code == 200, restored.text
+        assert [(item["id"], item["version"]) for item in restored.json()] == [
+            (rows[1]["id"], 2),
+            (rows[0]["id"], 2),
+        ]
+        again = client.post("/annotations/batch-restore?studyId=study-a", json={"items": items}, headers=headers())
+        assert again.status_code == 404
+        assert again.json()["detail"]["index"] == 0
+
+    def test_a_private_annotations_thread_is_hidden_from_others(self, client):
+        private = client.post(
+            "/annotations?studyId=study-a", json={**annotation_body(), "visible_to": None}, headers=headers()
+        ).json()
+        base = f"/annotations/{private['id']}/comments"
+        bob = headers(user="bob@example.org")
+        assert client.get(base, params={"studyId": "study-a"}, headers=bob).status_code == 404
+        assert client.post(f"{base}?studyId=study-a", json={"body": "x"}, headers=bob).status_code == 404
+
+    def test_slide_notes_over_http(self, client):
+        note = {"slide_id": SLIDE_KEY, "study_id": "study-a", "text": "Margin", "tags": ["QC"], "visible_to": []}
+        created = client.post("/wsi/slide-notes?studyId=study-a", json=note, headers=headers())
+        assert created.status_code == 201
+        row = created.json()
+        assert row["created_by"] == "alice@example.org"
+
+        listing = client.get(
+            "/wsi/slide-notes",
+            params={"studyId": "study-a", "slide_id": SLIDE_KEY},
+            headers=headers(user="bob@example.org"),
+        ).json()
+        assert [item["id"] for item in listing["notes"]] == [row["id"]]
+        assert listing["tags"] == [{"tag": "QC", "count": 1}]
+
+        bob = headers(user="bob@example.org")
+        assert (
+            client.put(f"/slide-notes/{row['id']}?studyId=study-a", json={"version": 1, "text": "x"}, headers=bob)
+        ).status_code == 403
+        updated = client.put(
+            f"/wsi/slide-notes/{row['id']}?studyId=study-a", json={"version": 1, "tags": ["QC", "LUAD"]}, headers=headers()
+        )
+        assert updated.json()["version"] == 2 and updated.json()["tags"] == ["QC", "LUAD"]
+        assert (
+            client.delete(f"/wsi/slide-notes/{row['id']}?studyId=study-a&version=1", headers=headers())
+        ).status_code == 409
+        assert (
+            client.delete(f"/wsi/slide-notes/{row['id']}?studyId=study-a&version=2", headers=headers())
+        ).status_code == 204
+
+    def test_lists_are_paged_over_http(self, client):
+        row = self._rows(client, 1)[0]
+        base = f"/wsi/annotations/{row['id']}/comments"
+        for i in range(3):
+            client.post(f"{base}?studyId=study-a", json={"body": f"c{i}"}, headers=headers())
+        page = client.get(base, params={"studyId": "study-a", "limit": 2}, headers=headers()).json()
+        assert [c["body"] for c in page["comments"]] == ["c0", "c1"]
+        assert {k: page[k] for k in ("annotation_id", "total", "offset", "limit", "has_more", "next_offset")} == {
+            "annotation_id": row["id"], "total": 3, "offset": 0, "limit": 2, "has_more": True, "next_offset": 2,
+        }
+        rest = client.get(base, params={"studyId": "study-a", "offset": 2, "limit": 2}, headers=headers()).json()
+        assert [c["body"] for c in rest["comments"]] == ["c2"] and rest["next_offset"] is None
+        for bad in ({"limit": 0}, {"limit": 501}, {"offset": -1}, {"offset": 1_000_001}):
+            assert client.get(base, params={"studyId": "study-a", **bad}, headers=headers()).status_code == 422
+
+        for i in range(3):
+            note = {"slide_id": SLIDE_KEY, "study_id": "study-a", "text": f"n{i}", "tags": ["QC"], "visible_to": []}
+            client.post("/wsi/slide-notes?studyId=study-a", json=note, headers=headers())
+        notes = client.get(
+            "/wsi/slide-notes", params={"studyId": "study-a", "slide_id": SLIDE_KEY, "limit": 1}, headers=headers()
+        ).json()
+        assert [n["text"] for n in notes["notes"]] == ["n0"]
+        assert (notes["total"], notes["has_more"], notes["next_offset"]) == (3, True, 1)
+        assert notes["tags"] == [{"tag": "QC", "count": 3}]
+        for bad in ({"limit": 0}, {"limit": 501}, {"offset": -1}):
+            assert client.get(
+                "/wsi/slide-notes", params={"studyId": "study-a", "slide_id": SLIDE_KEY, **bad}, headers=headers()
+            ).status_code == 422
+
+    def test_selectors_are_checked_on_every_write_over_http(self, client):
+        script = {"selector": {"type": "SvgSelector", "value": "<svg><script>alert(1)</script></svg>"}}
+        handler = {"selector": {"type": "SvgSelector", "value": '<svg onload="x"><circle cx="1" cy="1" r="0"/></svg>'}}
+        created = client.post("/wsi/annotations?studyId=study-a", json={**annotation_body(), "target": script}, headers=headers())
+        assert created.status_code == 422
+        assert "may not contain <script>" in created.text
+        batch = client.post(
+            "/wsi/annotations/batch?studyId=study-a",
+            json={"annotations": [annotation_body(), {**annotation_body(), "target": handler}]},
+            headers=headers(),
+        )
+        assert batch.status_code == 422
+        row = self._rows(client, 1)[0]
+        put = client.put(
+            f"/wsi/annotations/{row['id']}?studyId=study-a", json={"version": 1, "target": script}, headers=headers()
+        )
+        assert put.status_code == 422
+        batch_update = client.post(
+            "/wsi/annotations/batch-update?studyId=study-a",
+            json={"items": [{"id": row["id"], "version": 1, "target": handler}]},
+            headers=headers(),
+        )
+        assert batch_update.status_code == 422
+        assert batch_update.json()["detail"][0]["loc"][:4] == ["body", "items", 0, "target"]
+        rect = {"selector": {"type": "FragmentSelector", "conformsTo": "http://www.w3.org/TR/media-frags/", "value": "xywh=pixel:1,2,3,4"}}
+        ok = client.put(
+            f"/wsi/annotations/{row['id']}?studyId=study-a", json={"version": 1, "target": rect}, headers=headers()
+        )
+        assert ok.status_code == 200 and ok.json()["target"] == rect
+        assert client.get(
+            "/wsi/annotations", params={"studyId": "study-a", "slide_id": SLIDE_KEY}, headers=headers()
+        ).json()[0]["version"] == 2
+
+    def test_slide_notes_follow_the_identity_and_csrf_rules(self, client):
+        note = {"slide_id": SLIDE_KEY, "study_id": "study-a", "text": "Margin"}
+        assert client.post("/slide-notes?studyId=study-a", json=note, headers=NO_XHR).status_code == 403
+        assert (
+            client.post("/slide-notes?studyId=study-a", json={**note, "study_id": "study-b"}, headers=headers())
+        ).status_code == 403
+        assert client.post("/slide-notes?studyId=study-b", json=note, headers=headers()).status_code == 403
+        assert client.post("/slide-notes", json=note, headers=headers()).status_code == 403
+        assert (
+            client.get("/slide-notes", params={"studyId": "study-a", "slide_id": "470775"}, headers=headers())
+        ).status_code == 422
+        assert (
+            client.post("/slide-notes?studyId=study-a", json={**note, "tags": ["bad;tag"]}, headers=headers())
+        ).status_code == 422
+        assert client.get("/slide-notes", params={"slide_id": SLIDE_KEY}, headers=headers()).status_code == 403
+
+
 # --- CSRF guard ---------------------------------------------------------------
 
 
@@ -523,7 +903,9 @@ def test_the_pixel_app_serves_no_companion_routes():
     from app import main
 
     paths = _paths(main.app)
-    assert not any(path.startswith(("/annotations", "/agent", "/research")) for path in paths)
+    assert not any(
+        path.startswith(("/annotations", "/slide-notes", "/agent", "/research")) for path in paths
+    )
 
 
 def test_the_pixel_app_does_not_answer_annotation_requests():
